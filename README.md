@@ -60,7 +60,7 @@ Requer Windows, CMake, LLVM-MinGW/Clang e mingw32-make no PATH. A primeira prepa
 O script compila o gerador NESRecomp, gera os blocos C usando sua ROM e os seeds em docs/smb3-cycle-seeds.txt e compila o aplicativo. Os arquivos gerados não são versionados. Saída: build/SuperMarioBros3Recomp-v1.4.0.exe.
 
 ```powershell
-.\build-local.ps1 -RomPath "C:\caminho\Super Mario Bros. 3 (USA) (Rev 1).nes" -Verify
+.\build-local.ps1 -RomPath "Nome do jogo.NES" -Verify
 cd build
 .\smb3-ui-verify.exe
 ```

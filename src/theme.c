@@ -201,5 +201,15 @@ void theme_button(const DRAWITEMSTRUCT *item,int selected,int index) {
  SetBkMode(dc,TRANSPARENT);HFONT old=SelectObject(dc,small_font);SetTextColor(dc,active?smb_gold:RGB(126,158,186));RECT n=r;n.left+=12;DrawTextW(dc,number,-1,&n,DT_LEFT|DT_SINGLELINE|DT_VCENTER);
  SelectObject(dc,menu_font);SetTextColor(dc,disabled?RGB(104,119,135):smb_cream);r.left+=44;DrawTextW(dc,text,-1,&r,DT_LEFT|DT_SINGLELINE|DT_VCENTER);SelectObject(dc,old);
 }
-void theme_layout(HWND parent,HWND *buttons,int count){RECT r;GetClientRect(parent,&r);for(int i=0;i<count;i++)if(buttons[i])MoveWindow(buttons[i],MulDiv(60,r.right,1280),MulDiv(268+i*38,r.bottom,720),MulDiv(390,r.right,1280),MulDiv(34,r.bottom,720),TRUE);}
+void theme_layout(HWND parent,HWND *buttons,int count){
+ RECT r;GetClientRect(parent,&r);
+ if(r.right<=0||r.bottom<=0)return;
+ /* Child buttons may paint before the parent after a resize. Prepare their
+  * fonts at the new size before moving or invalidating them. */
+ HDC dc=GetDC(parent);prepare(dc,r.right,r.bottom);ReleaseDC(parent,dc);
+ for(int i=0;i<count;i++)if(buttons[i])SetWindowPos(buttons[i],NULL,
+  MulDiv(60,r.right,1280),MulDiv(268+i*38,r.bottom,720),
+  MulDiv(390,r.right,1280),MulDiv(34,r.bottom,720),
+  SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOCOPYBITS);
+}
 

@@ -286,6 +286,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (w > 0 && h > 0) {
             theme_layout(hwnd, menu_buttons, MENU_COUNT);
             preferences_resize();
+            /* Every element uses client-relative coordinates. Windows' default
+             * resize only invalidates exposed strips and retains old artwork. */
+            RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN);
+            InvalidateRect(hwnd, NULL, FALSE);
         }
         return 0;
     }
@@ -519,6 +523,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd_line, int show_cm
 
     /* Register Window Class */
     WNDCLASSW wc = {0};
+    wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = window_proc;
     wc.hInstance = inst;
     wc.lpszClassName = L"Smb3RecompWindow";
@@ -534,7 +539,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd_line, int show_cm
     int sy = (GetSystemMetrics(SM_CYSCREEN) - win_h) / 2;
 
     main_window = CreateWindowExW(0, L"Smb3RecompWindow",
-                                 L"Super Mario Bros. 3 Recompiled · v1.3.3",
+                                 L"Super Mario Bros. 3 Recompiled · v1.3.4",
                                  WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,
                                  sx, sy, win_w, win_h, NULL, NULL, inst, NULL);
 

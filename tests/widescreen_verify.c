@@ -40,8 +40,3 @@ int main(int argc,char **argv){
  printf("Wide phase: %u frames; max camera %d; 1800 machine hashes identical; native core/HUD and black HUD margins verified\n",active_frames,max_camera);
  return 0;
 }
-
-
-
-
-

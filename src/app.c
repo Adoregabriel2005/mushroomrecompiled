@@ -429,6 +429,12 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
+        /* Settings own the client area; painting the launcher here can bleed
+         * through the child labels when Windows repaints their background. */
+        if (preferences_active()) {
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
         RECT r;
         GetClientRect(hwnd, &r);
         int w = r.right;
@@ -528,8 +534,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd_line, int show_cm
     int sy = (GetSystemMetrics(SM_CYSCREEN) - win_h) / 2;
 
     main_window = CreateWindowExW(0, L"Smb3RecompWindow",
-                                 L"Super Mario Bros. 3 · v1.3.1",
-                                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                 L"Super Mario Bros. 3 Recompiled · v1.3.2",
+                                 WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,
                                  sx, sy, win_w, win_h, NULL, NULL, inst, NULL);
 
     audio_open();

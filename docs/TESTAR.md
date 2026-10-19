@@ -1,4 +1,4 @@
-# Testar o release v1.3.1
+# Testar o release v1.3.2
 
 1. Baixe o ZIP da página Releases e extraia tudo para uma pasta gravável.
 2. Sem ROM cadastrada, abra SuperMarioBros3Recomp.exe. O launcher deve aparecer.
@@ -20,3 +20,9 @@ Não anexe ROM, saves ou arquivos de configuração pessoais. Não existe envio 
 Build experimental. O jogo completo, todos os modos de vídeo e todos os modelos físicos de controle não foram certificados. Há fallback interpretado para uma instrução na fronteira de banco no roteiro conhecido. Testes de tradução compartilham o modelo de hardware, portanto não constituem uma referência independente de console físico.
 
 Para o widescreen v1.3, compare 4:3 e 16:9 na fase 1-1: confirme cenário adicional, pixels sem alongamento e o mesmo HUD entre barras pretas. Salas verticais e telas de mapa/título continuam em formato nativo. Consulte WIDESCREEN.md.
+
+## Conferir versão e vídeo
+
+Extraia a v1.3.2 em uma pasta nova e abra o executável dessa pasta. O título deve mostrar Recompiled e v1.3.2. Em Vídeo, selecione 16:9 · fase ampliada / HUD original e aplique. A indicação 16:9 · esticado pertence à versão antiga.
+
+Nas fases horizontais suportadas, o cenário ocupa a largura maior e o HUD permanece centralizado com barras pretas nas laterais. Abra Configurações com Esc; alterne páginas, redimensione e retorne à página Vídeo. Logo e arte do launcher não devem aparecer sobre os campos.

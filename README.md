@@ -69,8 +69,10 @@ Inspeção auxiliar: `node tools/rom.mjs <ROM.nes> [diretório de extração]`; 
 
 ## Créditos e licenças
 
+![EQUIPE](png.png)
+
 Beta testers: **ALEISTECH** e **RETROCESSO**. Obrigado pelos testes e relatos de problemas.
 
-Jogo, personagens e artes: Nintendo. Projeto de fã, independente e não oficial. [Fontes das artes](docs/ARTES.md).
+Projeto de fã, independente e não oficial. [Fontes das artes](docs/ARTES.md).
 
 O código próprio de integração tem licença MIT. NESRecomp tem licença **PolyForm Noncommercial 1.0.0**; a licença MIT da interface não altera as condições do runtime. Consulte [LICENSE_SCOPE](LICENSE_SCOPE.md) e LICENSES. A ROM e fontes gerados não são publicados; o executável do release contém código e materiais derivados do jogo.

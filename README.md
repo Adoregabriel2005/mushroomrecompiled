@@ -1,21 +1,15 @@
-# Super Mario Bros. 3 — Recompiled
-
-Port experimental de **Super Mario Bros. 3 (NES)** para Windows x64, com recompilação estática via NESRecomp, launcher, controles e save states.
+# SMB3 Recompiled
 
 **A ROM não acompanha o projeto nem o ZIP.** Selecione sua cópia compatível no menu. O jogo inteiro ainda não foi validado.
 
 ## Widescreen com inimigos — v1.4
 
-A [prévia experimental v1.4](https://github.com/Adoregabriel2005/super-mario-bros-3-recomp/releases/tag/v1.4.0-exp) amplia o cenário das fases horizontais para um canvas 16:9, sem esticar tiles ou sprites. O HUD original permanece centralizado, com barras pretas nas laterais. Selecione **Vídeo > Proporção > 16:9**; configurações novas já usam esse modo.
-
-![Fase ampliada com HUD original](docs/images/widescreen.png)
+A versão pra download, amplia o cenário das fases horizontais para um canvas 16:9, sem esticar tiles ou sprites. O HUD original permanece centralizado, com barras pretas nas laterais. Selecione **Vídeo > Proporção > 16:9**; configurações novas já usam esse modo.
 
 O compositor usa o mapa real da fase. A v1.4 amplia a ativação, o descarte horizontal e o desenho dos objetos para a área 16:9; salas verticais e cenas não suportadas ficam no enquadramento nativo. Leia os [limites e testes](docs/WIDESCREEN.md). A v1.2 permanece disponível para comparação.
-Atualização: [v1.4.0 experimental](https://github.com/Adoregabriel2005/super-mario-bros-3-recomp/releases/tag/v1.4.0-exp) amplia a ativação e a permanência dos inimigos para a área 16:9 e desenha seus sprites fora do recorte antigo. Mantém as correções de bordas e menus. Lembra a ROM e inicia diretamente; Esc abre o menu durante a partida.
+Atualização: amplia a ativação e a permanência dos inimigos para a área 16:9 e desenha seus sprites fora do recorte antigo. Mantém as correções de bordas e menus. Lembra a ROM e inicia diretamente; Esc abre o menu durante a partida.
 
 ## Baixar e testar
-
-Baixe o [release Windows portátil](https://github.com/Adoregabriel2005/super-mario-bros-3-recomp/releases/tag/v1.4.0-exp), extraia o ZIP inteiro e abra **SuperMarioBros3Recomp.exe**. Mantenha SDL2.dll e assets ao lado do executável.
 
 1. Escolha **Selecionar ROM**.
 2. Indique **Super Mario Bros. 3 (USA) (Rev 1)**, arquivo `.nes`.
@@ -25,8 +19,6 @@ Baixe o [release Windows portátil](https://github.com/Adoregabriel2005/super-ma
 
 Requer Windows x64 e um dispositivo de vídeo/áudio reconhecido pelo sistema. Não foi feita certificação de requisitos mínimos. Leia o [guia de teste](docs/TESTAR.md) e as [configurações](docs/INTERFACE.md).
 
-![Menu principal](docs/images/menu.png)
-
 ## Interface
 
 O menu usa logo e ilustrações originais de época, com **RECOMPILED** junto ao logo. Configurações dentro da janela: teclado, controle, vídeo, áudio, O jogo, Projeto e Créditos. Aplicar salva as alterações; Descartar preserva as anteriores.
@@ -35,8 +27,6 @@ O menu usa logo e ilustrações originais de época, com **RECOMPILED** junto ao
 - Vídeo: proporção, escala inteira/ajuste/recorte, filtro, scanlines, brilho, resolução e tela cheia sem bordas. 16:9 amplia o cenário e a faixa de ativação dos objetos nas fases horizontais suportadas, mantendo o HUD original.
 - Áudio: volume, mute, dispositivo, 44,1/48/96 kHz e reserva de 20/40/60 ms.
 - Save states: cinco slots; salvar/carregar no menu.
-
-![Configuração de controles](docs/images/controles.png)
 
 | Ação | Teclado padrão | Controle padrão |
 |---|---|---|
@@ -82,7 +72,5 @@ Inspeção auxiliar: `node tools/rom.mjs <ROM.nes> [diretório de extração]`; 
 Beta testers: **ALEISTECH** e **RETROCESSO**. Obrigado pelos testes e relatos de problemas.
 
 Jogo, personagens e artes: Nintendo. Projeto de fã, independente e não oficial. [Fontes das artes](docs/ARTES.md).
-
-Base: [NESRecomp](https://github.com/mstan/nesrecomp), Matthew Stanley e colaboradores; SDL2; SDL_GameControllerDB. Referência de experiência: [Mônica no Castelo do Dragão Recomp](https://github.com/Adoregabriel2005/monica-no-castelo-do-dragao-recomp), de Adoregabriel2005.
 
 O código próprio de integração tem licença MIT. NESRecomp tem licença **PolyForm Noncommercial 1.0.0**; a licença MIT da interface não altera as condições do runtime. Consulte [LICENSE_SCOPE](LICENSE_SCOPE.md) e LICENSES. A ROM e fontes gerados não são publicados; o executável do release contém código e materiais derivados do jogo.

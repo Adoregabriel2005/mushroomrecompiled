@@ -1,37 +1,38 @@
-# Widescreen experimental — v1.3
+# Widescreen experimental — v1.4.0
 
-A opção Vídeo > Proporção > 16:9 amplia a área da fase sem redimensionar horizontalmente os sprites e tiles. O canvas tem 426 × 240 pixels (16:9 arredondado para largura par). Os pixels são escalados uniformemente na janela. O modo novo é o padrão de configurações novas; configurações antigas podem selecionar a opção manualmente.
+Vídeo > Proporção > 16:9 amplia a fase em um canvas 426 × 240, sem esticar sprites ou tiles. A câmera ampla respeita as bordas do mapa. As linhas 192–239 mantêm o HUD original de 256 pixels, centralizado entre duas faixas pretas de 85 pixels.
 
-## HUD
+## Cenário e bordas
 
-As linhas 192–239 são copiadas do framebuffer original de 256 × 240, sem redesenhar ou reorganizar vidas, pontuação, tempo e itens. O HUD fica centralizado entre duas barras pretas de 85 pixels. A expansão só é aplicada acima dessa faixa.
+O compositor lê o mapa completo em SRAM e as tabelas de metatiles da ROM fornecida. CHR, paleta e câmera são observados na scanline 8, antes da troca de gráficos para o HUD. O miolo nativo de 224 pixels é preservado. As faixas de 16 pixels nas extremidades da imagem original são reconstruídas pelo mapa para remover tiles e atributos parcialmente atualizados na VRAM. Sprites dessas faixas são restaurados da OAM capturada.
 
-## Cenário real
+## Ativação e permanência dos objetos
 
-O compositor lê o mapa de blocos completo da fase em SRAM e as tabelas de metatiles da ROM fornecida, em vez de repetir bordas, ampliar um recorte ou desenhar uma decoração genérica. CHR, paleta e câmera são observados na scanline 8, antes da troca de gráficos para o HUD. A câmera ampla é limitada às bordas da fase. O miolo nativo de 224 pixels é preservado. As faixas de 16 pixels das duas bordas originais são reconstruídas a partir do mapa completo, evitando copiar tiles e atributos ainda em atualização na VRAM. Os sprites nessas faixas são restaurados da OAM capturada, respeitando prioridade e seleção dos primeiros oito sprites por linha. O HUD permanece original.
+A partir da v1.4, a simulação do modo amplo também muda: os registros reais da fase são ativados na área ampliada, com margem de 16 pixels à direita e 64 à esquerda para cobrir objetos grandes. Usa os cinco slots principais originais, sem substituir objetos ativos, duplicar índices de spawn ou antecipar controladores de eventos e o cartão de fim de fase. Os registros só são usados após a inicialização da cena.
 
-O componente é de apresentação: não escreve no CPU, no mapa, no mapper ou na física. Sprites já avaliados que cruzam a borda direita podem ser completados fora do recorte original.
+Os objetos novos entram no estado de inicialização do próprio jogo. Movimento, animação, IA e colisões continuam executados pelo código recompilado. As comparações de descarte horizontal passam a usar as bordas da câmera ampla, conservando as margens específicas de cada rotina. A regra vertical de descarte permanece original.
+
+O renderizador gera OAM adicional usando a rotina de estado do objeto em uma cópia isolada da máquina, com a câmera deslocada e a pausa de gameplay ativada. Apenas os sprites resultantes são retidos para desenhar fora da janela nativa. CPU, RAM, mapper e relógio dessa cópia são descartados ao retornar; movimento especulativo não é aplicado à partida. O desenho principal e o HUD continuam originais.
+
+A ativação antecipada e o descarte mais distante mudam a sequência da partida em relação ao modo nativo. A verificação de determinismo compara execução recompilada e interpretada com a mesma política ampla; já não se espera igualdade entre widescreen ligado e desligado.
 
 ## Limites
 
-- A ativação, IA e descarte de inimigos continuam nas regras originais de 256 pixels. Um inimigo fora dessa área pode aparecer apenas quando o jogo o ativar; não é uma simulação ampliada de objetos.
-- Mapas, títulos, bônus, Toad Houses, salas verticais e locais sem largura de fase suficiente mantêm a imagem original centralizada. Não se inventa conteúdo fora do mapa.
-- Efeitos especiais de raster, água e todas as fases ainda não foram validados. O modo é experimental.
-- No modo amplo, o canvas inteiro é ajustado à janela; não se recorta o HUD para preencher uma proporção diferente.
+- A capacidade continua em cinco slots principais: fases cheias podem aguardar um slot livre. Objetos especiais, projéteis e controladores mantêm seus gatilhos originais.
+- Mapas, títulos, bônus, Toad Houses, salas verticais, transições e locais sem largura suficiente mantêm o enquadramento original.
+- Todas as fases, chefes, efeitos de água/raster e combinações de inimigos ainda precisam de validação. O modo é experimental.
+- O canvas inteiro é ajustado à janela, mantendo o HUD e a proporção dos pixels.
+- Desativar 16:9 restaura a política original de spawn e descarte. Objetos já ativados seguem seu estado corrente até o jogo descartá-los.
 
-## Teste
+## Testes
 
 ```powershell
 cd build
 .\smb3-wide-verify.exe "..\Super Mario Bros. 3 (USA) (Rev 1).nes"
 ```
 
-Roteiro entra na fase 1-1 e desloca a câmera. Em 1.800 quadros, 630 foram compostos como fase ampliada e a câmera chegou a 456 pixels. O teste confere byte a byte o HUD e o miolo nativo, a rejeição de cores incorretas injetadas nas duas bordas, as barras pretas e a igualdade de todos os hashes de máquina entre widescreen ligado e desligado. Isso verifica que o compositor não altera a simulação; não comprova todas as fases.
+O roteiro entra em 1-1 e rola a câmera. Confere o HUD, miolo nativo e barras pixel a pixel; injeta lixo nas bordas para conferir o reparo; verifica inimigos ativos fora da área antiga e retidos além do antigo limite de descarte; recusa índices de spawn duplicados. Uma Piranha no primeiro cano deve estar ativa e ter sprites na margem ampla, enquanto a mesma sequência em modo nativo ainda não a ativa.
 
-Capturas de referência: docs/images/widescreen.png e widescreen-start.png. Créditos técnicos: Southbird, Super Mario Bros. 3 Full Disassembly, https://github.com/captainsouthbird/smb3 e http://www.sonicepoch.com/sm3mix/ . O disassembly foi consultado para pesquisa; o compositor lê os dados da cópia local do usuário.
+Também compara 1.800 estados recompilados/interpretados com inimigos ampliados, verifica continuação determinística após save/load e confirma que a geração isolada de sprites não altera a máquina real. Esses testes cobrem o roteiro, sem comprovar todas as fases.
 
-## Limitação original e reparo das bordas — v1.3.3
-
-A recompilação mantém a lógica do jogo e a PPU do runtime. Por isso, a cópia das colunas originais também copiava os artefatos de atualização de tiles e atributos associados ao espelhamento. No modo amplo e nas fases horizontais suportadas, as duas faixas são recompostas pelo mapa completo, sem recortar ou esticar a imagem. O reparo não é aplicado ao modo nativo nem às cenas que usam o enquadramento original. Efeitos especiais e outras fases continuam exigindo validação.
-
-Referência técnica: https://www.nesdev.org/wiki/Mirroring e https://www.nesdev.org/wiki/PPU_attribute_tables .
+Pesquisa técnica: [Southbird — Super Mario Bros. 3 Full Disassembly](https://github.com/captainsouthbird/smb3), especialmente PRG000 e PRG005; [SM3Mix](http://www.sonicepoch.com/sm3mix/). O disassembly foi consultado para pesquisa; dados e gráficos vêm da cópia local do usuário. Sobre artefatos originais: [NESdev Mirroring](https://www.nesdev.org/wiki/Mirroring) e [Attribute tables](https://www.nesdev.org/wiki/PPU_attribute_tables).

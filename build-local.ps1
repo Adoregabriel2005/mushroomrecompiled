@@ -22,5 +22,5 @@ try {
         $verifierPath=(Resolve-Path "$BuildDir/smb3-verify.exe").Path
         Run-Native $verifierPath "`"$rom`"" "$BuildDir/verify"
     }
-    Write-Host "Build: $BuildDir/SuperMarioBros3Recomp-v1.3.4.exe"
+    Write-Host "Build: $BuildDir/SuperMarioBros3Recomp-v1.4.0.exe"
 } finally { Pop-Location }

@@ -8,6 +8,7 @@
 #include "cyc_run.h"
 #include "cyc_state.h"
 #include "widescreen.h"
+#include "wide_enemies.h"
 static bool widescreen;
 
 static bool loaded;
@@ -59,15 +60,16 @@ void glue_reset(void) {
     cyc_power_on(0); cyc_run_power_on(); cyc_audio_enable(sample_rate);
     frames=0; pad1=0;
     smb3_wide_reset();
+    smb3_enemies_reset();
     hw_observe_line=8;
     cyc_run_observer=smb3_wide_capture;
 }
-void glue_step_frame(void) { if (loaded) { cyc_run_frame(); frames++; } }
+void glue_step_frame(void) { if (loaded) { smb3_enemies_tick();cyc_run_frame(); frames++; } }
 void glue_set_pad1(uint8_t p) { pad1=p; cyc_set_controller(0,p); }
 void glue_set_pad2(uint8_t p) { cyc_set_controller(1,p); }
 uint8_t glue_get_pad1(void) { return pad1; }
 const uint32_t *glue_get_framebuffer(void) { return cyc_frame_argb(); }
-void glue_set_widescreen(bool enabled) { widescreen=enabled; }
+void glue_set_widescreen(bool enabled) { widescreen=enabled;smb3_enemies_enable(enabled); }
 const uint32_t *glue_get_present_framebuffer(int *width,int *height) {
     *width=widescreen?SMB3_WIDE_WIDTH:256;*height=240;
     return widescreen?smb3_wide_present(cyc_frame_argb()):cyc_frame_argb();
@@ -108,6 +110,6 @@ bool glue_load_state(const wchar_t *path) {
     bool ok=fread(data,1,(size_t)n,f)==(size_t)n; fclose(f);
     char error[256];
     if (ok) ok=cyc_state_load(data,(size_t)n,error,sizeof error);
-    if (ok) smb3_wide_reset();
+    if (ok) {smb3_wide_reset();smb3_enemies_reset();}
     free(data); return ok;
 }

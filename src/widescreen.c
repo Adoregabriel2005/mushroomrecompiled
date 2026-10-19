@@ -4,6 +4,7 @@
 #include "widescreen.h"
 #include "cyc_core.h"
 #include "cyc_render.h"
+#include "wide_enemies.h"
 #include <string.h>
 
 static uint8_t layouts[15][1024];
@@ -40,6 +41,7 @@ void smb3_wide_capture(void){
  for(int i=0;i<32;i++)colors[i]=cyc_render_color(i);
  memcpy(oam,cyc_render_oam(),sizeof oam);
  captured=true;
+ smb3_enemies_capture();
 }
 static unsigned terrain_pixel(int wx,int wy,int set) {
  if(wx<0||wy<0||wy>=27*16)return 0;
@@ -108,6 +110,25 @@ const uint32_t *smb3_wide_present(const uint32_t *native) {
     * by the complete map. They may contain stale PPU tiles or attributes. */
    for(int y=0;y<192;y++)memcpy(canvas+y*426+origin+16,native+y*256+16,224*sizeof(uint32_t));
    sprite_edges(origin);
+   const Smb3EnemyLayer *layers=smb3_enemies_layers();
+   for(int spr=0;spr<64;spr++)for(int object=0;object<5;object++){
+    if(!layers[object].valid)continue;
+    const uint8_t *s=layers[object].oam+spr*4;
+    int y=s[0]+1,x=layers[object].camera-wide_camera+s[3];
+    if(y>=192)continue;
+    unsigned tile=s[1],attr=s[2],base=(tile&1)*4096+(tile&0xfe)*16;
+    for(int dy=0;dy<16;dy++)for(int dx=0;dx<8;dx++){
+     int px=x+dx,py=y+dy;
+     if(px<0||px>=426||py>=192||(px>=origin&&px<origin+256)||!(cyc_render_line_mask(py)&0x10))continue;
+     unsigned row=(attr&0x80)?15-dy:dy,col=(attr&0x40)?dx:7-dx;
+     unsigned address=base+(row/8)*16+(row&7);
+     unsigned v=((chr[address]>>col)&1)|(((chr[address+8]>>col)&1)<<1);
+     if(!v||sprite_claimed[py*426+px])continue;
+     sprite_claimed[py*426+px]=1;
+     if((attr&0x20)&&opaque[py*426+px])continue;
+     canvas[py*426+px]=colors[16+(attr&3)*4+v];
+    }
+   }
   }
  }
  if(!active)for(int y=0;y<192;y++)memcpy(canvas+y*426+85,native+y*256,256*sizeof(uint32_t));

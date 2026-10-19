@@ -45,3 +45,11 @@ smb3-ui-verify passou: renderização das sete páginas, aplicar/descartar, entr
 Canvas 426 × 240 com expansão real de cenário em fases horizontais e HUD original centralizado, entre barras pretas. Compositor lê mapa em SRAM e gráficos observados antes do IRQ do HUD. Não modifica CPU, física ou lógica de inimigos.
 
 Teste widescreen: 1.800 hashes de máquina idênticos entre modo ligado/desligado; 630 quadros de fase ampliada; câmera até 456 pixels; HUD e barras verificados. Limites e referências em WIDESCREEN.md. A ativação de objetos permanece original; salas verticais e cenas não suportadas ficam em formato nativo.
+
+## v1.4 — inimigos na área ampliada
+
+No modo 16:9, registros normais de objetos são ativados com base na câmera ampla, e o descarte horizontal usa suas bordas. Eventos e o cartão final mantêm seus gatilhos; continuam cinco slots principais. OAM adicional é gerada em cópias isoladas da máquina para desenhar os objetos nas margens ampliadas. Essa geração não altera a partida real; a ativação antecipada altera a sequência de gameplay em relação ao modo nativo.
+
+O teste atual compara 1.800 estados nativos/interpretados com a mesma política ampla, verifica HUD/barras/miolo, reparo das bordas, inimigos adiantados e retidos, índices de spawn únicos e save/load. Um controle sem widescreen comprova a diferença de ativação da primeira Piranha. Cobertura de todas as fases ainda pendente.
+
+Beta testers: ALEISTECH e RETROCESSO, creditados no README e na página Créditos do aplicativo.

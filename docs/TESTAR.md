@@ -1,4 +1,4 @@
-# Testar o release v1.3.4
+# Testar o release v1.4.0
 
 1. Baixe o ZIP da página Releases e extraia tudo para uma pasta gravável.
 2. Sem ROM cadastrada, abra SuperMarioBros3Recomp.exe. O launcher deve aparecer.
@@ -23,6 +23,10 @@ Para o widescreen v1.3, compare 4:3 e 16:9 na fase 1-1: confirme cenário adicio
 
 ## Conferir versão e vídeo
 
-Extraia a v1.3.4 em uma pasta nova e abra o executável dessa pasta. O título deve mostrar Recompiled e v1.3.4. Em Vídeo, selecione 16:9 · fase ampliada / HUD original e aplique. A indicação 16:9 · esticado pertence à versão antiga.
+Extraia a v1.4.0 em uma pasta nova e abra o executável dessa pasta. O título deve mostrar Recompiled e v1.4.0. Em Vídeo, selecione 16:9 · fase ampliada / HUD original e aplique. A indicação 16:9 · esticado pertence à versão antiga.
 
 Nas fases horizontais suportadas, o cenário ocupa a largura maior e o HUD permanece centralizado com barras pretas nas laterais. Abra Configurações com Esc; alterne páginas, redimensione e retorne à página Vídeo. Logo e arte do launcher não devem aparecer sobre os campos.
+
+## Inimigos na área ampla — v1.4
+
+Na fase 1-1 em 16:9, confira o inimigo do primeiro cano na área à direita antes de o cano entrar nos 256 pixels originais. Avance e volte: inimigos devem continuar na faixa lateral, sem desaparecer na antiga borda. Confira colisões, derrota por pulo, cascos, pausa, salvar/carregar e retorno ao mapa. Refaça em 4:3 para comparar os gatilhos originais. Em fases cheias, a capacidade original de cinco objetos principais ainda pode limitar novas ativações. Relate fase, tipo de inimigo e posição da câmera em caso de falha.

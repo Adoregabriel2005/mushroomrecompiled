@@ -5,6 +5,9 @@
 #include "cyc_core.h"
 #include "cyc_png.h"
 #include "widescreen.h"
+#include "wide_enemies.h"
+#include "cyc_run.h"
+#include "cyc_mod.h"
 static unsigned buttons(int f){
  if((f>=180&&f<190)||(f>=360&&f<370))return NES_PAD_START;
  if(f>=720&&f<730)return NES_PAD_RIGHT;
@@ -15,7 +18,7 @@ static unsigned buttons(int f){
 }
 int main(int argc,char **argv){
  if(argc<2||!glue_load_rom(argv[1]))return 1;
- uint64_t hashes[1800];unsigned active_frames=0;int max_camera=0;
+ uint64_t hashes[1800];unsigned active_frames=0,early_frames=0,layer_frames=0,retained_frames=0;int max_camera=0;
  glue_set_widescreen(true);
  for(int f=0;f<1800;f++){
   glue_set_pad1(buttons(f));glue_step_frame();hashes[f]=cyc_mem_state_hash();
@@ -23,6 +26,25 @@ int main(int argc,char **argv){
   int w,h;const uint32_t *out=glue_get_present_framebuffer(&w,&h),*native=glue_get_framebuffer();
   if(w!=426||h!=240)return 2;
   int active=smb3_wide_active(),origin=smb3_wide_origin();if(active){active_frames++;const uint8_t *state=cyc_cpu_ram();int camera=state[0x12]*256+state[0xfd];if(camera>max_camera)max_camera=camera;}
+  if(active){const uint8_t *r=cyc_cpu_ram();int camera=r[0x12]*256+r[0xfd];
+   for(int i=0;i<5;i++)if(r[0x661+i]>=2){
+    int x=r[0x76+i]*256+r[0x91+i];
+    if(x>=camera+256)early_frames++;
+    if(x<camera-48&&x+16>smb3_enemies_camera(r))retained_frames++;
+    for(int j=i+1;j<5;j++)if(r[0x661+j]&&r[0x659+i]<48&&r[0x659+i]==r[0x659+j])return 10;
+   }
+   const Smb3EnemyLayer *layers=smb3_enemies_layers();
+   for(int i=0;i<5;i++)if(layers[i].valid){for(int s=0;s<64;s++)if(layers[i].oam[s*4]<191){layer_frames++;goto layer_counted;}}
+   layer_counted:;
+  }
+  if(f==1140){
+   const uint8_t *r=cyc_cpu_ram();int plant=0;
+   for(int i=0;i<5;i++)if(r[0x661+i]>=2&&r[0x671+i]==0xa6&&r[0x76+i]*256+r[0x91+i]==360&&smb3_enemies_layers()[i].valid)plant=1;
+   if(!plant){fprintf(stderr,"First pipe plant not active/drawn beyond original viewport\n");return 15;}
+   uint64_t before=cyc_mem_state_hash();smb3_enemies_capture();
+   if(cyc_mem_state_hash()!=before){fprintf(stderr,"Sprite drawing changed live machine\n");return 11;}
+   if(!glue_save_state(L"verify-wide-enemies.bin"))return 12;
+  }
   for(int y=192;y<240;y++){
    if(memcmp(out+y*w+85,native+y*256,256*sizeof(uint32_t)))return 3;
    for(int x=0;x<85;x++)if(out[y*w+x]!=0xff000000u||out[y*w+341+x]!=0xff000000u)return 4;
@@ -39,15 +61,31 @@ int main(int argc,char **argv){
    if(memcmp(clean,out,sizeof clean)){fprintf(stderr,"Native garbage leaked through repaired edges at %d\n",f);return 8;}
    out=smb3_wide_present(native);
   }
-  if(f==1140||f==1320||f==1500||f==1680){char name[80];snprintf(name,sizeof name,"wide-output-%d.png",f);cyc_write_png(name,out,w,h);snprintf(name,sizeof name,"wide-reference-%d.png",f);cyc_write_png(name,native,256,240);const uint8_t *r=cyc_cpu_ram();printf("Frame %d: active=%d origin=%d camera=%d,y=%d tileset=%d\n",f,active,origin,r[0x12]*256+r[0xfd],r[0x13]*240+r[0xfc],r[0x70a]);}
+  if(f==1140||f==1320||f==1500||f==1680){char name[80];snprintf(name,sizeof name,"wide-output-%d.png",f);cyc_write_png(name,out,w,h);snprintf(name,sizeof name,"wide-reference-%d.png",f);cyc_write_png(name,native,256,240);const uint8_t *r=cyc_cpu_ram();printf("Frame %d: active=%d origin=%d camera=%d,y=%d tileset=%d\n",f,active,origin,r[0x12]*256+r[0xfd],r[0x13]*240+r[0xfc],r[0x70a]);for(int i=0;i<5;i++)printf(" slot%d state=%d id=%02x x=%d y=%d layer=%d\n",i,r[0x661+i],r[0x671+i],r[0x76+i]*256+r[0x91+i],r[0x88+i]*256+r[0xa3+i],smb3_enemies_layers()[i].valid);}
  }
  if(active_frames<100||max_camera<256){fprintf(stderr,"No gameplay extension\n");return 6;}
- glue_reset();glue_set_widescreen(false);
+ if(!early_frames||!layer_frames||!retained_frames){fprintf(stderr,"No extended activation/drawing/retention: %u/%u/%u\n",early_frames,layer_frames,retained_frames);return 9;}
+ printf("Enemies: %u active samples beyond native right edge; %u with sprite layers; %u retained beyond old left deletion boundary\n",early_frames,layer_frames,retained_frames);
+ if(!glue_load_state(L"verify-wide-enemies.bin"))return 13;
+ for(int f=1141;f<=1170;f++){
+  glue_set_pad1(buttons(f));glue_step_frame();if(cyc_mem_state_hash()!=hashes[f])return 14;
+  int16_t audio[4096];glue_get_audio_samples(audio,4096,1);
+ }
+ puts("Wide enemy save/load: deterministic continuation; isolated sprite drawing leaves live machine unchanged");
+ remove("verify-wide-enemies.bin");
+ glue_reset();glue_set_widescreen(true);cyc_run_native=false;
  for(int f=0;f<1800;f++){
   glue_set_pad1(buttons(f));glue_step_frame();
   if(cyc_mem_state_hash()!=hashes[f]){fprintf(stderr,"Machine changed at %d\n",f);return 7;}
   int16_t audio[4096];glue_get_audio_samples(audio,4096,1);
  }
- printf("Wide phase: %u frames; max camera %d; 1800 machine hashes identical; native center/HUD, black HUD margins and poisoned-edge rejection verified\n",active_frames,max_camera);
+ printf("Wide phase: %u frames; max camera %d; 1800 native/interpreter hashes identical with extended enemies; native center/HUD, black HUD margins and poisoned-edge rejection verified\n",active_frames,max_camera);
+ glue_set_widescreen(false);glue_reset();cyc_run_native=true;
+ for(int f=0;f<=1140;f++){
+  glue_set_pad1(buttons(f));glue_step_frame();int16_t audio[4096];glue_get_audio_samples(audio,4096,1);
+ }
+ const uint8_t *r=cyc_cpu_ram();
+ for(int i=0;i<5;i++)if(r[0x661+i]&&r[0x671+i]==0xa6&&r[0x76+i]*256+r[0x91+i]==360){fprintf(stderr,"Native-mode control unexpectedly spawned early plant\n");return 16;}
+ puts("Native-mode control: first pipe plant remains unspawned at same camera/frame; widescreen activates and draws it");
  return 0;
 }

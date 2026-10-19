@@ -1,4 +1,4 @@
-param([string]$Version='1.3')
+param([string]$Version='1.4.0')
 $ErrorActionPreference='Stop'
 Push-Location $PSScriptRoot
 try {
@@ -26,7 +26,7 @@ Esc pausa e abre o menu para salvar, carregar, continuar, configurar ou sair.
 
 Widescreen: Configurações > Vídeo > Proporção > 16:9.
 O cenário horizontal é ampliado; o HUD original fica no centro com barras pretas.
-A ativação de inimigos continua original. Salas verticais e outras cenas ficam no enquadramento nativo. Consulte docs/WIDESCREEN.md.
+A ativação e o descarte dos objetos acompanham a área ampliada. Salas verticais e outras cenas ficam no enquadramento nativo. Consulte docs/WIDESCREEN.md.
 
 Setas: mover; Z: correr/cauda; X: pular; Shift: Select; Enter: Start.
 Esc: menu do PC; F11: tela cheia. Teclado e gamepad são remapeáveis.

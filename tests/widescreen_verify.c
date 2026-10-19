@@ -27,7 +27,18 @@ int main(int argc,char **argv){
    if(memcmp(out+y*w+85,native+y*256,256*sizeof(uint32_t)))return 3;
    for(int x=0;x<85;x++)if(out[y*w+x]!=0xff000000u||out[y*w+341+x]!=0xff000000u)return 4;
   }
-  for(int y=0;y<192;y++)if(memcmp(out+y*w+origin+8,native+y*256+8,248*sizeof(uint32_t)))return 5;
+  int first=active?16:0,count=active?224:256;
+  for(int y=0;y<192;y++)if(memcmp(out+y*w+origin+first,native+y*256+first,count*sizeof(uint32_t)))return 5;
+  if(active){
+   static uint32_t clean[426*240],corrupted[256*240];
+   memcpy(clean,out,sizeof clean);memcpy(corrupted,native,sizeof corrupted);
+   for(int y=0;y<192;y++)for(int x=0;x<16;x++){
+    corrupted[y*256+x]=0xffff00ffu;corrupted[y*256+240+x]=0xff00ff00u;
+   }
+   out=smb3_wide_present(corrupted);
+   if(memcmp(clean,out,sizeof clean)){fprintf(stderr,"Native garbage leaked through repaired edges at %d\n",f);return 8;}
+   out=smb3_wide_present(native);
+  }
   if(f==1140||f==1320||f==1500||f==1680){char name[80];snprintf(name,sizeof name,"wide-output-%d.png",f);cyc_write_png(name,out,w,h);snprintf(name,sizeof name,"wide-reference-%d.png",f);cyc_write_png(name,native,256,240);const uint8_t *r=cyc_cpu_ram();printf("Frame %d: active=%d origin=%d camera=%d,y=%d tileset=%d\n",f,active,origin,r[0x12]*256+r[0xfd],r[0x13]*240+r[0xfc],r[0x70a]);}
  }
  if(active_frames<100||max_camera<256){fprintf(stderr,"No gameplay extension\n");return 6;}
@@ -37,6 +48,6 @@ int main(int argc,char **argv){
   if(cyc_mem_state_hash()!=hashes[f]){fprintf(stderr,"Machine changed at %d\n",f);return 7;}
   int16_t audio[4096];glue_get_audio_samples(audio,4096,1);
  }
- printf("Wide phase: %u frames; max camera %d; 1800 machine hashes identical; native core/HUD and black HUD margins verified\n",active_frames,max_camera);
+ printf("Wide phase: %u frames; max camera %d; 1800 machine hashes identical; native center/HUD, black HUD margins and poisoned-edge rejection verified\n",active_frames,max_camera);
  return 0;
 }

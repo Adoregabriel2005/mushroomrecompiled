@@ -534,7 +534,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd_line, int show_cm
     int sy = (GetSystemMetrics(SM_CYSCREEN) - win_h) / 2;
 
     main_window = CreateWindowExW(0, L"Smb3RecompWindow",
-                                 L"Super Mario Bros. 3 Recompiled · v1.3.2",
+                                 L"Super Mario Bros. 3 Recompiled · v1.3.3",
                                  WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,
                                  sx, sy, win_w, win_h, NULL, NULL, inst, NULL);
 

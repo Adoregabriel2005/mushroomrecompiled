@@ -10,6 +10,7 @@ static uint8_t layouts[15][1024];
 static uint8_t chr[8192],ram[2048],blocks[8192],oam[256];
 static uint32_t colors[32],canvas[SMB3_WIDE_WIDTH*240];
 static uint8_t opaque[SMB3_WIDE_WIDTH*192];
+static uint8_t sprite_claimed[SMB3_WIDE_WIDTH*192];
 static bool tables_ok,captured,active;
 static int origin;
 
@@ -52,19 +53,30 @@ static unsigned terrain_pixel(int wx,int wy,int set) {
  unsigned pixel=((chr[pattern]>>bit)&1)|(((chr[pattern+8]>>bit)&1)<<1);
  return pixel?((tile>>6)*4+pixel):0;
 }
-/* Only complete already-evaluated OAM sprites that cross the native right
- * edge; spawning/culling rules remain those of the original game. */
+/* Repair the two native edge metatiles from the full level map, rather than
+ * the PPU's partially updated nametable/attribute columns. Restore their
+ * sprites from captured OAM; do not change gameplay or the PPU itself. */
+static bool repaired_column(int x,int x0) {
+ return x<x0+16 || x>=x0+240;
+}
 static void sprite_edges(int x0) {
- for(int slot=63;slot>=0;slot--){
+ memset(sprite_claimed,0,sizeof sprite_claimed);
+ for(int slot=0;slot<64;slot++){
   const uint8_t *s=oam+slot*4;int y=s[0]+1,x=x0+s[3];
-  if(y>=192||s[3]<249)continue;
+  if(y>=192||(s[3]>=16&&s[3]<=232))continue;
   unsigned tile=s[1],attr=s[2],base=(tile&1)*4096+(tile&0xfe)*16;
   for(int dy=0;dy<16;dy++)for(int dx=0;dx<8;dx++){
-   int px=x+dx,py=y+dy;if(px<x0+256||px<0||px>=426||py>=192)continue;
+   int px=x+dx,py=y+dy;
+   if(px<0||px>=426||py>=192||!repaired_column(px,x0)||!(cyc_render_line_mask(py)&0x10))continue;
+   /* Preserve the hardware's first-eight-sprites selection on each row. */
+   int prior=0;for(int i=0;i<slot;i++)if(py>=oam[i*4]+1&&py<oam[i*4]+17)prior++;
+   if(prior>=8)continue;
    unsigned row=(attr&0x80)?15-dy:dy,col=(attr&0x40)?dx:7-dx;
    unsigned address=base+(row/8)*16+(row&7);
    unsigned v=((chr[address]>>col)&1)|(((chr[address+8]>>col)&1)<<1);
-   if(!v||((attr&0x20)&&opaque[py*426+px]))continue;
+   if(!v||sprite_claimed[py*426+px])continue;
+   sprite_claimed[py*426+px]=1;
+   if((attr&0x20)&&opaque[py*426+px])continue;
    canvas[py*426+px]=colors[16+(attr&3)*4+v];
   }
  }
@@ -92,10 +104,9 @@ const uint32_t *smb3_wide_present(const uint32_t *native) {
     opaque[y*426+x]=(pixel&3)!=0;
     canvas[y*426+x]=colors[pixel];
    }
-   /* Native game/sprites remain byte-for-byte, apart from the hardware's
-    * eight-pixel left-column clip now lying inside the wider viewport. */
-   int clip=origin>0&&!(cyc_render_line_mask(8)&2)?8:0;
-   for(int y=0;y<192;y++)memcpy(canvas+y*426+origin+clip,native+y*256+clip,(256-clip)*sizeof(uint32_t));
+   /* Keep the native center, but leave both 16-pixel edge bands supplied
+    * by the complete map. They may contain stale PPU tiles or attributes. */
+   for(int y=0;y<192;y++)memcpy(canvas+y*426+origin+16,native+y*256+16,224*sizeof(uint32_t));
    sprite_edges(origin);
   }
  }

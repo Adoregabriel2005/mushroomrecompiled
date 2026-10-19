@@ -8,7 +8,7 @@ As linhas 192–239 são copiadas do framebuffer original de 256 × 240, sem red
 
 ## Cenário real
 
-O compositor lê o mapa de blocos completo da fase em SRAM e as tabelas de metatiles da ROM fornecida, em vez de repetir bordas, ampliar um recorte ou desenhar uma decoração genérica. CHR, paleta e câmera são observados na scanline 8, antes da troca de gráficos para o HUD. A câmera ampla é limitada às bordas da fase. O conteúdo nativo do jogo é preservado; a faixa de oito pixels que o NES oculta na borda esquerda recebe fundo real quando passa a ficar dentro do campo ampliado.
+O compositor lê o mapa de blocos completo da fase em SRAM e as tabelas de metatiles da ROM fornecida, em vez de repetir bordas, ampliar um recorte ou desenhar uma decoração genérica. CHR, paleta e câmera são observados na scanline 8, antes da troca de gráficos para o HUD. A câmera ampla é limitada às bordas da fase. O miolo nativo de 224 pixels é preservado. As faixas de 16 pixels das duas bordas originais são reconstruídas a partir do mapa completo, evitando copiar tiles e atributos ainda em atualização na VRAM. Os sprites nessas faixas são restaurados da OAM capturada, respeitando prioridade e seleção dos primeiros oito sprites por linha. O HUD permanece original.
 
 O componente é de apresentação: não escreve no CPU, no mapa, no mapper ou na física. Sprites já avaliados que cruzam a borda direita podem ser completados fora do recorte original.
 
@@ -26,6 +26,12 @@ cd build
 .\smb3-wide-verify.exe "..\Super Mario Bros. 3 (USA) (Rev 1).nes"
 ```
 
-Roteiro entra na fase 1-1 e desloca a câmera. Em 1.800 quadros, 630 foram compostos como fase ampliada e a câmera chegou a 456 pixels. O teste confere byte a byte o HUD e o miolo nativo, as barras pretas e a igualdade de todos os hashes de máquina entre widescreen ligado e desligado. Isso verifica que o compositor não altera a simulação; não comprova todas as fases.
+Roteiro entra na fase 1-1 e desloca a câmera. Em 1.800 quadros, 630 foram compostos como fase ampliada e a câmera chegou a 456 pixels. O teste confere byte a byte o HUD e o miolo nativo, a rejeição de cores incorretas injetadas nas duas bordas, as barras pretas e a igualdade de todos os hashes de máquina entre widescreen ligado e desligado. Isso verifica que o compositor não altera a simulação; não comprova todas as fases.
 
 Capturas de referência: docs/images/widescreen.png e widescreen-start.png. Créditos técnicos: Southbird, Super Mario Bros. 3 Full Disassembly, https://github.com/captainsouthbird/smb3 e http://www.sonicepoch.com/sm3mix/ . O disassembly foi consultado para pesquisa; o compositor lê os dados da cópia local do usuário.
+
+## Limitação original e reparo das bordas — v1.3.3
+
+A recompilação mantém a lógica do jogo e a PPU do runtime. Por isso, a cópia das colunas originais também copiava os artefatos de atualização de tiles e atributos associados ao espelhamento. No modo amplo e nas fases horizontais suportadas, as duas faixas são recompostas pelo mapa completo, sem recortar ou esticar a imagem. O reparo não é aplicado ao modo nativo nem às cenas que usam o enquadramento original. Efeitos especiais e outras fases continuam exigindo validação.
+
+Referência técnica: https://www.nesdev.org/wiki/Mirroring e https://www.nesdev.org/wiki/PPU_attribute_tables .

@@ -1,0 +1,579 @@
+/*
+ * game_config.c — TOML-only game config loader
+ *
+ * The old .cfg text format has been removed.  All game projects must use
+ * game.toml.  If a .cfg path is passed, the loader prints a migration
+ * message and returns failure.
+ */
+#include "game_config.h"
+#include "toml.h"
+#include "../../common/nes_cart.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+void game_config_init_empty(GameConfig *cfg) {
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->cycle_accurate = true;
+}
+
+/* ── TOML helpers ────────────────────────────────────────────────────────── */
+
+static uint16_t toml_hex(toml_table_t *tbl, const char *key) {
+    toml_datum_t d = toml_int_in(tbl, key);
+    if (d.ok) return (uint16_t)d.u.i;
+    return 0;
+}
+
+static int toml_int_or(toml_table_t *tbl, const char *key, int def) {
+    toml_datum_t d = toml_int_in(tbl, key);
+    return d.ok ? (int)d.u.i : def;
+}
+
+static uint16_t toml_hex_or(toml_table_t *tbl, const char *key, uint16_t def) {
+    toml_datum_t d = toml_int_in(tbl, key);
+    return d.ok ? (uint16_t)d.u.i : def;
+}
+
+static const char *toml_string_or(toml_table_t *tbl, const char *key, const char *def) {
+    toml_datum_t d = toml_string_in(tbl, key);
+    if (d.ok) return d.u.s;
+    return def;
+}
+
+/* ── TOML loader ─────────────────────────────────────────────────────────── */
+
+static bool game_config_load_toml(GameConfig *cfg, const char *path) {
+    game_config_init_empty(cfg);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+
+    char errbuf[256];
+    toml_table_t *root = toml_parse_file(f, errbuf, sizeof(errbuf));
+    fclose(f);
+    if (!root) {
+        fprintf(stderr, "[GameConfig] TOML parse error: %s\n", errbuf);
+        return false;
+    }
+
+    /* Derive annotations path */
+    {
+        const char *slash = NULL;
+        const char *p = path;
+        while (*p) { if (*p == '/' || *p == '\\') slash = p; p++; }
+        if (slash) {
+            size_t dir_len = (size_t)(slash - path) + 1;
+            if (dir_len + 20 < sizeof(cfg->annotations_path)) {
+                memcpy(cfg->annotations_path, path, dir_len);
+                strcpy(cfg->annotations_path + dir_len, "annotations.csv");
+            }
+        } else {
+            strcpy(cfg->annotations_path, "annotations.csv");
+        }
+    }
+
+    /* [game] */
+    toml_table_t *game = toml_table_in(root, "game");
+    if (game) {
+        toml_datum_t d = toml_string_in(game, "output_prefix");
+        if (d.ok) { strncpy(cfg->output_prefix, d.u.s, sizeof(cfg->output_prefix) - 1); free(d.u.s); }
+    d = toml_string_in(game, "name");
+    if (d.ok) { strncpy(cfg->display_name, d.u.s, sizeof(cfg->display_name) - 1); free(d.u.s); }
+        toml_datum_t paj = toml_bool_in(game, "push_all_jsr");
+        if (paj.ok) cfg->push_all_jsr = paj.u.b;
+        toml_datum_t dps = toml_bool_in(game, "disable_ptr_scan");
+        if (dps.ok) cfg->disable_ptr_scan = dps.u.b;
+        toml_datum_t ds = toml_bool_in(game, "disable_secondary");
+        if (ds.ok) cfg->disable_secondary = ds.u.b;
+        toml_datum_t df = toml_bool_in(game, "deduplicate_functions");
+        if (df.ok) cfg->deduplicate_functions = df.u.b;
+        toml_datum_t ca = toml_bool_in(game, "cycle_accurate");
+        if (ca.ok) cfg->cycle_accurate = ca.u.b;
+        toml_datum_t csf = toml_string_in(game, "cycle_seed_file");
+        if (csf.ok) {
+            const char *slash = NULL;
+            for (const char *p = path; *p; p++) if (*p == '/' || *p == '\\') slash = p;
+            bool absolute = csf.u.s[0] == '/' || csf.u.s[0] == '\\' || (csf.u.s[0] && csf.u.s[1] == ':');
+            int dir_len = (slash && !absolute) ? (int)(slash - path) + 1 : 0;
+            snprintf(cfg->cycle_seed_file, sizeof(cfg->cycle_seed_file), "%.*s%s", dir_len, path, csf.u.s);
+            free(csf.u.s);
+        }
+        toml_datum_t ccf = toml_string_in(game, "cycle_capture_file");
+        if (ccf.ok) {
+            const char *slash = NULL;
+            for (const char *p = path; *p; p++) if (*p == '/' || *p == '\\') slash = p;
+            bool absolute = ccf.u.s[0] == '/' || ccf.u.s[0] == '\\' || (ccf.u.s[0] && ccf.u.s[1] == ':');
+            int dir_len = (slash && !absolute) ? (int)(slash - path) + 1 : 0;
+            snprintf(cfg->cycle_capture_file, sizeof(cfg->cycle_capture_file), "%.*s%s", dir_len, path, ccf.u.s);
+            free(ccf.u.s);
+        }
+        toml_datum_t sf = toml_string_in(game, "symbol_file");
+        if (sf.ok) { strncpy(cfg->symbol_file, sf.u.s, sizeof(cfg->symbol_file) - 1); free(sf.u.s); }
+        toml_datum_t fds = toml_bool_in(game, "fds");
+        if (fds.ok) cfg->fds = fds.u.b;
+        toml_datum_t con = toml_string_in(game, "console");
+        if (con.ok) {
+            if (!strcmp(con.u.s, "nes")) cfg->console = 1;
+            else if (!strcmp(con.u.s, "famicom")) cfg->console = 2;
+            else if (!strcmp(con.u.s, "default")) cfg->console = 0;
+            else {
+                /* Refused by the cycle code generator (cyc_codegen_emit). */
+                fprintf(stderr, "[GameConfig] [game] console = \"%s\": expected nes, famicom or default\n", con.u.s);
+                cfg->console = 0xFF;
+            }
+            free(con.u.s);
+        }
+        toml_array_t *inl = toml_array_in(game, "cycle_inline_jsr");
+        for (int i = 0; inl && i < toml_array_nelem(inl) && cfg->cycle_inline_jsr_count < 64; i++) {
+            toml_datum_t d = toml_string_at(inl, i);
+            if (!d.ok) continue;
+            unsigned target, bytes;
+            if (sscanf(d.u.s, "%x:%u", &target, &bytes) == 2 && target <= 0xFFFF && bytes <= 255) {
+                cfg->cycle_inline_jsr[cfg->cycle_inline_jsr_count].target = (uint16_t)target;
+                cfg->cycle_inline_jsr[cfg->cycle_inline_jsr_count].bytes = (uint8_t)bytes;
+                cfg->cycle_inline_jsr_count++;
+            } else {
+                fprintf(stderr, "[GameConfig] Warning: cycle_inline_jsr entry '%s' is not ADDR:BYTES\n", d.u.s);
+            }
+            free(d.u.s);
+        }
+    }
+
+    /* [fds]: image and bios paths, relative to this file. */
+    toml_table_t *fds = toml_table_in(root, "fds");
+    if (fds) {
+        const char *slash = NULL;
+        for (const char *p = path; *p; p++) if (*p == '/' || *p == '\\') slash = p;
+        const char *keys[2] = { "image", "bios" };
+        char *dest[2] = { cfg->fds_image, cfg->fds_bios };
+        for (int i = 0; i < 2; ++i) {
+            toml_datum_t d = toml_string_in(fds, keys[i]);
+            if (!d.ok) continue;
+            bool absolute = d.u.s[0] == '/' || d.u.s[0] == '\\' || (d.u.s[0] && d.u.s[1] == ':');
+            int dir_len = (slash && !absolute) ? (int)(slash - path) + 1 : 0;
+            snprintf(dest[i], 512, "%.*s%s", dir_len, path, d.u.s);
+            free(d.u.s);
+        }
+        toml_datum_t hle = toml_string_in(fds, "hle");
+        if (hle.ok) {
+            snprintf(cfg->fds_hle, sizeof(cfg->fds_hle), "%s", hle.u.s);
+            free(hle.u.s);
+        }
+    }
+
+    /* [mapper] */
+    toml_table_t *mapper = toml_table_in(root, "mapper");
+    if (mapper) {
+        toml_array_t *bs = toml_array_in(mapper, "bank_switch");
+        if (bs) for (int i = 0; i < toml_array_nelem(bs) && cfg->bank_switch_count < GAME_CFG_MAX_BANK_SWITCHES; i++) {
+            toml_datum_t d = toml_int_at(bs, i);
+            if (d.ok) cfg->bank_switches[cfg->bank_switch_count++].addr = (uint16_t)d.u.i;
+        }
+    }
+
+    /* [[trampoline]] */
+    toml_array_t *tramp = toml_array_in(root, "trampoline");
+    if (tramp) for (int i = 0; i < toml_array_nelem(tramp) && cfg->trampoline_count < GAME_CFG_MAX_TRAMPOLINES; i++) {
+        toml_table_t *t = toml_table_at(tramp, i);
+        if (!t) continue;
+        int idx = cfg->trampoline_count++;
+        cfg->trampolines[idx].addr        = toml_hex(t, "addr");
+        cfg->trampolines[idx].inline_bytes = toml_int_or(t, "inline_bytes", 0);
+        cfg->trampolines[idx].bs_fn_addr  = toml_hex(t, "bs_fn_addr");
+        cfg->trampolines[idx].addr_adjust  = toml_int_or(t, "addr_adjust", 1);
+        const char *breg = toml_string_or(t, "bank_reg", "X");
+        cfg->trampolines[idx].bank_reg    = (breg[0] == 'A' || breg[0] == 'a') ? 'A' : 'X';
+        cfg->trampolines[idx].bank_save_addr = toml_hex_or(t, "bank_save_addr", 0x100);
+        /* kind: "simple" (default) or "mmc3_region" */
+        const char *kind = toml_string_or(t, "kind", "simple");
+        cfg->trampolines[idx].kind = (kind[0] == 'm' || kind[0] == 'M')
+                                     ? TRAMP_MMC3_REGION : TRAMP_SIMPLE;
+        cfg->trampolines[idx].bs_fn_8000    = toml_hex(t, "bs_fn_8000");
+        cfg->trampolines[idx].bs_fn_a000    = toml_hex(t, "bs_fn_a000");
+        cfg->trampolines[idx].bank_save_8000 = toml_hex(t, "bank_save_8000");
+        cfg->trampolines[idx].bank_save_a000 = toml_hex(t, "bank_save_a000");
+    }
+
+    /* [[known_table]] */
+    toml_array_t *ktbl = toml_array_in(root, "known_table");
+    if (ktbl) for (int i = 0; i < toml_array_nelem(ktbl) && cfg->known_table_count < GAME_CFG_MAX_KNOWN_TABLES; i++) {
+        toml_table_t *t = toml_table_at(ktbl, i);
+        if (!t) continue;
+        int idx = cfg->known_table_count++;
+        cfg->known_tables[idx].bank  = toml_int_or(t, "bank", -1);
+        cfg->known_tables[idx].start = toml_hex(t, "start");
+        cfg->known_tables[idx].end   = toml_hex(t, "end");
+    }
+
+    /* [[split_table]] */
+    toml_array_t *stbl = toml_array_in(root, "split_table");
+    if (stbl) for (int i = 0; i < toml_array_nelem(stbl) && cfg->known_split_table_count < GAME_CFG_MAX_SPLIT_TABLES; i++) {
+        toml_table_t *t = toml_table_at(stbl, i);
+        if (!t) continue;
+        int idx = cfg->known_split_table_count++;
+        cfg->known_split_tables[idx].bank     = toml_int_or(t, "bank", -1);
+        cfg->known_split_tables[idx].lo_start = toml_hex(t, "lo_addr");
+        cfg->known_split_tables[idx].hi_start = toml_hex(t, "hi_addr");
+        cfg->known_split_tables[idx].count    = toml_int_or(t, "count", 0);
+        cfg->known_split_tables[idx].stride   = toml_int_or(t, "stride", 1);
+        cfg->known_split_tables[idx].adjust   = toml_int_or(t, "adjust", 1);
+    }
+
+    /* [[inline_dispatch]] */
+    toml_array_t *idisp = toml_array_in(root, "inline_dispatch");
+    if (idisp) for (int i = 0; i < toml_array_nelem(idisp) && cfg->inline_dispatch_count < GAME_CFG_MAX_INLINE_DISPATCHES; i++) {
+        toml_table_t *t = toml_table_at(idisp, i);
+        if (t) cfg->inline_dispatches[cfg->inline_dispatch_count++].addr = toml_hex(t, "addr");
+    }
+
+    /* [[inline_pointer]] */
+    toml_array_t *iptr = toml_array_in(root, "inline_pointer");
+    if (iptr) for (int i = 0; i < toml_array_nelem(iptr) && cfg->inline_pointer_count < GAME_CFG_MAX_INLINE_POINTERS; i++) {
+        toml_table_t *t = toml_table_at(iptr, i);
+        if (!t) continue;
+        int idx = cfg->inline_pointer_count++;
+        cfg->inline_pointers[idx].addr = toml_hex(t, "addr");
+        toml_array_t *zp = toml_array_in(t, "zp");
+        if (zp) {
+            toml_datum_t lo = toml_int_at(zp, 0), hi = toml_int_at(zp, 1);
+            if (lo.ok) cfg->inline_pointers[idx].zp_lo = (uint8_t)lo.u.i;
+            if (hi.ok) cfg->inline_pointers[idx].zp_hi = (uint8_t)hi.u.i;
+        }
+        toml_datum_t call = toml_bool_in(t, "call");
+        cfg->inline_pointers[idx].call = (call.ok && call.u.b) ? 1 : 0;
+    }
+
+    /* [[nop_jsr]] */
+    toml_array_t *nj = toml_array_in(root, "nop_jsr");
+    if (nj) for (int i = 0; i < toml_array_nelem(nj) && cfg->nop_jsr_count < GAME_CFG_MAX_NOP_JSRS; i++) {
+        toml_table_t *t = toml_table_at(nj, i);
+        if (t) cfg->nop_jsrs[cfg->nop_jsr_count++] = toml_hex(t, "addr");
+    }
+
+    /* [[ram_read_hook]] */
+    toml_array_t *rrh = toml_array_in(root, "ram_read_hook");
+    if (rrh) for (int i = 0; i < toml_array_nelem(rrh) && cfg->ram_read_hook_count < GAME_CFG_MAX_RAM_READ_HOOKS; i++) {
+        toml_table_t *t = toml_table_at(rrh, i);
+        if (t) {
+            RamReadHook *h = &cfg->ram_read_hooks[cfg->ram_read_hook_count++];
+            h->addr = toml_hex(t, "addr");
+            toml_datum_t ix = toml_bool_in(t, "indexed");
+            h->indexed = (ix.ok && ix.u.b) ? 1 : 0;
+        }
+    }
+
+    /* [[extra_label]] */
+    toml_array_t *elbl = toml_array_in(root, "extra_label");
+    if (elbl) for (int i = 0; i < toml_array_nelem(elbl) && cfg->extra_label_count < GAME_CFG_MAX_EXTRA_LABELS; i++) {
+        toml_table_t *t = toml_table_at(elbl, i);
+        if (!t) continue;
+        int idx = cfg->extra_label_count++;
+        cfg->extra_labels[idx].addr = toml_hex(t, "addr");
+        cfg->extra_labels[idx].bank = toml_int_or(t, "bank", -1);
+    }
+
+    /* [functions] — preferred bulk format: fixed = [...], bankN = [...] */
+    toml_table_t *funcs = toml_table_in(root, "functions");
+    if (funcs) {
+        toml_array_t *fixed = toml_array_in(funcs, "fixed");
+        if (fixed) for (int i = 0; i < toml_array_nelem(fixed) && cfg->extra_func_count < GAME_CFG_MAX_EXTRA_FUNCS; i++) {
+            toml_datum_t d = toml_int_at(fixed, i);
+            if (d.ok) { int idx = cfg->extra_func_count++; cfg->extra_funcs[idx].addr = (uint16_t)d.u.i; cfg->extra_funcs[idx].bank = -1; }
+        }
+        for (int b = 0; b < 64; b++) {
+            char key[16]; snprintf(key, sizeof(key), "bank%d", b);
+            toml_array_t *ba = toml_array_in(funcs, key);
+            if (!ba) continue;
+            for (int i = 0; i < toml_array_nelem(ba) && cfg->extra_func_count < GAME_CFG_MAX_EXTRA_FUNCS; i++) {
+                toml_datum_t d = toml_int_at(ba, i);
+                if (d.ok) { int idx = cfg->extra_func_count++; cfg->extra_funcs[idx].addr = (uint16_t)d.u.i; cfg->extra_funcs[idx].bank = b; }
+            }
+        }
+    }
+
+    /* [force_interp] — same bulk bank syntax as [functions], but entries are
+     * deliberately kept out of native code so one interpreter island owns
+     * their complete dynamic control-flow region. */
+    toml_table_t *force_interp = toml_table_in(root, "force_interp");
+    if (force_interp) {
+        toml_array_t *fixed = toml_array_in(force_interp, "fixed");
+        if (fixed) for (int i = 0; i < toml_array_nelem(fixed) && cfg->force_interp_count < GAME_CFG_MAX_EXTRA_FUNCS; i++) {
+            toml_datum_t d = toml_int_at(fixed, i);
+            if (d.ok) {
+                int idx = cfg->force_interp_count++;
+                cfg->force_interp_funcs[idx].addr = (uint16_t)d.u.i;
+                cfg->force_interp_funcs[idx].bank = -1;
+            }
+        }
+        for (int b = 0; b < 64; b++) {
+            char key[16]; snprintf(key, sizeof(key), "bank%d", b);
+            toml_array_t *ba = toml_array_in(force_interp, key);
+            if (!ba) continue;
+            for (int i = 0; i < toml_array_nelem(ba) && cfg->force_interp_count < GAME_CFG_MAX_EXTRA_FUNCS; i++) {
+                toml_datum_t d = toml_int_at(ba, i);
+                if (d.ok) {
+                    int idx = cfg->force_interp_count++;
+                    cfg->force_interp_funcs[idx].addr = (uint16_t)d.u.i;
+                    cfg->force_interp_funcs[idx].bank = b;
+                }
+            }
+        }
+    }
+
+    /* [[extra_func]] — individual entries: bank + addr */
+    toml_array_t *ef = toml_array_in(root, "extra_func");
+    if (ef) for (int i = 0; i < toml_array_nelem(ef) && cfg->extra_func_count < GAME_CFG_MAX_EXTRA_FUNCS; i++) {
+        toml_table_t *t = toml_table_at(ef, i);
+        if (!t) continue;
+        int idx = cfg->extra_func_count++;
+        cfg->extra_funcs[idx].addr = toml_hex(t, "addr");
+        cfg->extra_funcs[idx].bank = toml_int_or(t, "bank", -1);
+    }
+
+    /* [[sram_map]] */
+    toml_array_t *smap = toml_array_in(root, "sram_map");
+    if (smap) for (int i = 0; i < toml_array_nelem(smap) && cfg->sram_map_count < GAME_CFG_MAX_SRAM_MAPS; i++) {
+        toml_table_t *t = toml_table_at(smap, i);
+        if (!t) continue;
+        int idx = cfg->sram_map_count++;
+        cfg->sram_maps[idx].sram_start = toml_hex(t, "sram_start");
+        cfg->sram_maps[idx].rom_start  = toml_hex(t, "rom_start");
+        cfg->sram_maps[idx].bank       = toml_int_or(t, "bank", -1);
+        cfg->sram_maps[idx].size       = toml_hex(t, "size");
+    }
+
+    /* [[stack_bail_func]] */
+    toml_array_t *sbf = toml_array_in(root, "stack_bail_func");
+    if (sbf) for (int i = 0; i < toml_array_nelem(sbf) && cfg->stack_bail_func_count < GAME_CFG_MAX_STACK_BAIL_FUNCS; i++) {
+        toml_table_t *t = toml_table_at(sbf, i);
+        if (t) cfg->stack_bail_funcs[cfg->stack_bail_func_count++] = toml_hex(t, "addr");
+    }
+
+    /* [[cond_bail_func]] — functions containing inline bail code that fires conditionally */
+    toml_array_t *cbf = toml_array_in(root, "cond_bail_func");
+    if (cbf) for (int i = 0; i < toml_array_nelem(cbf) && cfg->cond_bail_func_count < GAME_CFG_MAX_STACK_BAIL_FUNCS; i++) {
+        toml_table_t *t = toml_table_at(cbf, i);
+        if (t) cfg->cond_bail_funcs[cfg->cond_bail_func_count++] = toml_hex(t, "addr");
+    }
+
+    /* [[merge_func]] */
+    toml_array_t *mf = toml_array_in(root, "merge_func");
+    if (mf) for (int i = 0; i < toml_array_nelem(mf) && cfg->merge_func_count < GAME_CFG_MAX_MERGE_FUNCS; i++) {
+        toml_table_t *t = toml_table_at(mf, i);
+        if (!t) continue;
+        int idx = cfg->merge_func_count++;
+        cfg->merge_funcs[idx].bank = toml_int_or(t, "bank", -1);
+        uint16_t a1 = toml_hex(t, "addr_lo");
+        uint16_t a2 = toml_hex(t, "addr_hi");
+        cfg->merge_funcs[idx].addr_lo = (a1 < a2) ? a1 : a2;
+        cfg->merge_funcs[idx].addr_hi = (a1 < a2) ? a2 : a1;
+    }
+
+    /* [[merge_range]] — merge ALL function entry points within an address range */
+    toml_array_t *mrng = toml_array_in(root, "merge_range");
+    if (mrng) for (int i = 0; i < toml_array_nelem(mrng) && cfg->merge_range_count < GAME_CFG_MAX_MERGE_RANGES; i++) {
+        toml_table_t *t = toml_table_at(mrng, i);
+        if (!t) continue;
+        int idx = cfg->merge_range_count++;
+        cfg->merge_ranges[idx].bank    = toml_int_or(t, "bank", -1);
+        cfg->merge_ranges[idx].addr_lo = toml_hex(t, "addr_lo");
+        cfg->merge_ranges[idx].addr_hi = toml_hex(t, "addr_hi");
+        toml_datum_t pub = toml_bool_in(t, "public");
+        cfg->merge_ranges[idx].public_wrappers = pub.ok ? pub.u.b : true;
+    }
+
+    /* [[indirect_continuation]] */
+    toml_array_t *icont = toml_array_in(root, "indirect_continuation");
+    if (icont) for (int i = 0; i < toml_array_nelem(icont) &&
+                    cfg->indirect_continuation_count < GAME_CFG_MAX_INDIRECT_CONTINUATIONS; i++) {
+        toml_table_t *t = toml_table_at(icont, i);
+        if (!t) continue;
+        int idx = cfg->indirect_continuation_count++;
+        cfg->indirect_continuations[idx].bank = toml_int_or(t, "bank", -1);
+        cfg->indirect_continuations[idx].jmp_addr = toml_hex(t, "jmp_addr");
+        cfg->indirect_continuations[idx].continuation = toml_hex(t, "continuation");
+    }
+
+    /* [[push_jsr]] */
+    toml_array_t *pj = toml_array_in(root, "push_jsr");
+    if (pj) for (int i = 0; i < toml_array_nelem(pj) && cfg->push_jsr_count < GAME_CFG_MAX_NOP_JSRS; i++) {
+        toml_table_t *t = toml_table_at(pj, i);
+        if (t) cfg->push_jsrs[cfg->push_jsr_count++] = toml_hex(t, "addr");
+    }
+
+    /* [[return_adjust_func]] */
+    toml_array_t *raf = toml_array_in(root, "return_adjust_func");
+    if (raf) for (int i = 0; i < toml_array_nelem(raf) && cfg->return_adjust_func_count < GAME_CFG_MAX_NOP_JSRS; i++) {
+        toml_table_t *t = toml_table_at(raf, i);
+        if (t) cfg->return_adjust_funcs[cfg->return_adjust_func_count++] = toml_hex(t, "addr");
+    }
+
+    /* [[absorb_jsr_ret]] */
+    toml_array_t *ajr = toml_array_in(root, "absorb_jsr_ret");
+    if (ajr) for (int i = 0; i < toml_array_nelem(ajr) && cfg->absorb_jsr_ret_count < GAME_CFG_MAX_NOP_JSRS; i++) {
+        toml_table_t *t = toml_table_at(ajr, i);
+        if (t) cfg->absorb_jsr_rets[cfg->absorb_jsr_ret_count++] = toml_hex(t, "addr");
+    }
+
+    /* [[restore_jsr]] */
+    toml_array_t *rjs = toml_array_in(root, "restore_jsr");
+    if (rjs) for (int i = 0; i < toml_array_nelem(rjs) && cfg->restore_jsr_count < GAME_CFG_MAX_NOP_JSRS; i++) {
+        toml_table_t *t = toml_table_at(rjs, i);
+        if (t) cfg->restore_jsrs[cfg->restore_jsr_count++] = toml_hex(t, "addr");
+    }
+
+    /* [[push_jmp]] — JMP targets that need a dummy push (bail-containing funcs).
+     * Optional `source` field restricts the push to a specific JMP site PC. */
+    toml_array_t *pjm = toml_array_in(root, "push_jmp");
+    if (pjm) for (int i = 0; i < toml_array_nelem(pjm) && cfg->push_jmp_count < GAME_CFG_MAX_NOP_JSRS; i++) {
+        toml_table_t *t = toml_table_at(pjm, i);
+        if (t) {
+            int idx = cfg->push_jmp_count++;
+            cfg->push_jmps[idx].target = toml_hex(t, "addr");
+            cfg->push_jmps[idx].source = toml_hex(t, "source"); /* 0 if absent */
+        }
+    }
+
+    /* [[replace_func]] — functions replaced by extras.c, exclude from codegen */
+    toml_array_t *rf = toml_array_in(root, "replace_func");
+    if (rf) for (int i = 0; i < toml_array_nelem(rf) && cfg->replace_func_count < GAME_CFG_MAX_EXTRA_FUNCS; i++) {
+        toml_table_t *t = toml_table_at(rf, i);
+        if (!t) continue;
+        int idx = cfg->replace_func_count++;
+        cfg->replace_funcs[idx].bank = toml_int_or(t, "bank", -1);
+        cfg->replace_funcs[idx].addr = toml_hex(t, "addr");
+        toml_datum_t scope = toml_string_in(t, "scope");
+        if (scope.ok) {
+            if (strcmp(scope.u.s, "member") == 0) {
+                cfg->replace_funcs[idx].replace_group = false;
+            } else if (strcmp(scope.u.s, "group") == 0) {
+                cfg->replace_funcs[idx].replace_group = true;
+            } else {
+                fprintf(stderr, "[GameConfig] replace_func scope must be 'member' or 'group'\n");
+                free(scope.u.s);
+                toml_free(root);
+                return false;
+            }
+            free(scope.u.s);
+        }
+    }
+
+    /* [[dedup_exclude]]: keep one otherwise equivalent bank identity independent. */
+    toml_array_t *dex = toml_array_in(root, "dedup_exclude");
+    if (dex) for (int i = 0; i < toml_array_nelem(dex) &&
+                  cfg->dedup_exclude_count < GAME_CFG_MAX_DEDUP_EXCLUDES; i++) {
+        toml_table_t *t = toml_table_at(dex, i);
+        if (!t) continue;
+        int idx = cfg->dedup_exclude_count++;
+        cfg->dedup_excludes[idx].bank = toml_int_or(t, "bank", -1);
+        cfg->dedup_excludes[idx].addr = toml_hex(t, "addr");
+    }
+
+    /* [[mod_function_hook]] — narrowly selected function entries that
+     * dispatch trusted, statically linked mod callbacks. Empty by default,
+     * so a project that does not opt in emits no callback and no overhead. */
+    toml_array_t *mfh = toml_array_in(root, "mod_function_hook");
+    if (mfh) for (int i = 0; i < toml_array_nelem(mfh) && cfg->mod_function_hook_count < GAME_CFG_MAX_EXTRA_FUNCS; i++) {
+        toml_table_t *t = toml_table_at(mfh, i);
+        if (!t) continue;
+        int idx = cfg->mod_function_hook_count++;
+        cfg->mod_function_hooks[idx].bank = toml_int_or(t, "bank", -1);
+        cfg->mod_function_hooks[idx].addr = toml_hex(t, "addr");
+        toml_datum_t internal = toml_bool_in(t, "include_internal");
+        cfg->mod_function_hook_internal[idx] = internal.ok && internal.u.b;
+        toml_datum_t id = toml_string_in(t, "id"), bytes = toml_string_in(t, "bytes");
+        toml_datum_t key_len = toml_int_in(t, "length"), key_crc = toml_int_in(t, "crc32");
+        if ((id.ok || bytes.ok || key_len.ok || key_crc.ok) && idx >= GAME_CFG_MAX_MOD_HOOK_KEYS) {
+            fprintf(stderr, "[GameConfig] [[mod_function_hook]] #%d: only the first %d hooks may declare id/bytes\n",
+                    idx, GAME_CFG_MAX_MOD_HOOK_KEYS);
+            if (id.ok) free(id.u.s);
+            if (bytes.ok) free(bytes.u.s);
+            toml_free(root);
+            return false;
+        }
+        bool key_ok = true;
+        if (id.ok) {
+            if (!id.u.s[0] || strlen(id.u.s) >= sizeof(cfg->mod_function_hook_keys[0].id)) key_ok = false;
+            else strcpy(cfg->mod_function_hook_keys[idx].id, id.u.s);
+            free(id.u.s);
+        }
+        if (key_len.ok != key_crc.ok || (bytes.ok && key_len.ok)) key_ok = false;
+        if (key_len.ok && key_ok) {
+            ModHookKey *k = &cfg->mod_function_hook_keys[idx];
+            if (key_len.u.i < 1 || key_len.u.i > GAME_CFG_MOD_HOOK_BYTES || key_crc.u.i < 0 || key_crc.u.i > 0xFFFFFFFFll)
+                key_ok = false;
+            k->len = (uint8_t)key_len.u.i;
+            k->crc32 = (uint32_t)key_crc.u.i;
+        }
+        if (bytes.ok) {
+            /* hex pairs, separated by spaces or not: "A5 0E C9 08" */
+            ModHookKey *k = &cfg->mod_function_hook_keys[idx];
+            uint8_t key[GAME_CFG_MOD_HOOK_BYTES];
+            const char *s = bytes.u.s;
+            while (*s && key_ok) {
+                if (*s == ' ' || *s == '\t') { s++; continue; }
+                int hi = -1, lo = -1;
+                char c0 = s[0], c1 = s[1];
+                hi = c0 >= '0' && c0 <= '9' ? c0 - '0' : c0 >= 'a' && c0 <= 'f' ? c0 - 'a' + 10 : c0 >= 'A' && c0 <= 'F' ? c0 - 'A' + 10 : -1;
+                lo = hi < 0 ? -1 : c1 >= '0' && c1 <= '9' ? c1 - '0' : c1 >= 'a' && c1 <= 'f' ? c1 - 'a' + 10 : c1 >= 'A' && c1 <= 'F' ? c1 - 'A' + 10 : -1;
+                if (hi < 0 || lo < 0 || k->len >= GAME_CFG_MOD_HOOK_BYTES) { key_ok = false; break; }
+                key[k->len++] = (uint8_t)(hi << 4 | lo);
+                s += 2;
+            }
+            if (!k->len) key_ok = false;
+            k->crc32 = nes_crc32(0, key, k->len);
+            free(bytes.u.s);
+        }
+        if (!key_ok) {
+            fprintf(stderr, "[GameConfig] [[mod_function_hook]] addr=0x%04X: id must be 1-63 characters, and the "
+                            "key either bytes (1-%d hex pairs) or length (1-%d) with crc32\n",
+                    cfg->mod_function_hooks[idx].addr, GAME_CFG_MOD_HOOK_BYTES, GAME_CFG_MOD_HOOK_BYTES);
+            toml_free(root);
+            return false;
+        }
+    }
+
+    /* [[data_region]] */
+    toml_array_t *dr = toml_array_in(root, "data_region");
+    if (dr) for (int i = 0; i < toml_array_nelem(dr) && cfg->data_region_count < GAME_CFG_MAX_DATA_REGIONS; i++) {
+        toml_table_t *t = toml_table_at(dr, i);
+        if (!t) continue;
+        int idx = cfg->data_region_count++;
+        cfg->data_regions[idx].bank  = toml_int_or(t, "bank", -1);
+        cfg->data_regions[idx].start = toml_hex(t, "start");
+        cfg->data_regions[idx].end   = toml_hex(t, "end");
+    }
+
+    for (int i = 0; i < cfg->replace_func_count; i++) {
+        if (cfg->replace_funcs[i].replace_group && !cfg->deduplicate_functions) {
+            fprintf(stderr, "[GameConfig] replace_func scope='group' requires "
+                            "[game].deduplicate_functions = true\n");
+            toml_free(root);
+            return false;
+        }
+    }
+
+    toml_free(root);
+    printf("[GameConfig] Loaded TOML: %s (prefix='%s', %d extra funcs, %d forced interp)\n",
+           path, cfg->output_prefix, cfg->extra_func_count, cfg->force_interp_count);
+    return true;
+}
+
+/* ── Public API ───────────────────────────────────────────────────────────── */
+
+static bool has_extension(const char *path, const char *ext) {
+    size_t plen = strlen(path), elen = strlen(ext);
+    return plen > elen && strcmp(path + plen - elen, ext) == 0;
+}
+
+bool game_config_load(GameConfig *cfg, const char *path) {
+    if (has_extension(path, ".cfg")) {
+        fprintf(stderr,
+            "[GameConfig] ERROR: .cfg format is no longer supported.\n"
+            "  Migrate '%s' to game.toml (TOML format).\n"
+            "  See nesrecomp CLAUDE.md for the TOML schema.\n", path);
+        return false;
+    }
+    return game_config_load_toml(cfg, path);
+}

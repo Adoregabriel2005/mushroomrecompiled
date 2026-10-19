@@ -1,0 +1,711 @@
+/*
+ * hw_machine.c - NESRecomp's NES machine around the CPU: the master clock,
+ * hw.h (what the CPU sees of each cycle), the CPU memory map and open bus,
+ * loading a cartridge (the mapper itself is hw_mapper.c), power-on and the
+ * host interface (cyc_core.h).
+ *
+ * See hw_internal.h for the timing model.
+ */
+#include "hw_internal.h"
+
+#include "cyc_core.h"
+#include "cyc_mod.h"
+#include "cyc_ring.h"
+#include "cyc_trace.h"
+#include "hw.h"
+#include "hw_fds.h"
+#include "../../common/nes_fds.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+HwMachine  hw;
+HwExtraTiming hw_extra_timing;
+HwRegionTiming hw_region_timing;
+static CycRegion region_request = CYC_REGION_NTSC;
+static bool cpu_opcode_fetch;
+HwZapper hw_zapper;
+HwCart     hw_cart;
+bool       hw_frame_done;
+int        hw_observe_line = -1;
+bool       hw_observe_hit;
+bool       hw_frame_end_hit;
+int        hw_dma_stalls;
+uint8_t    hw_code_watch[HW_CODE_BYTES];
+bool       hw_isolated;
+uint64_t   hw_isolated_cycles, hw_isolated_budget, hw_isolated_io_writes;
+static void no_code_write(unsigned phys, uint8_t value) { (void)phys; (void)value; }
+void     (*hw_code_write)(unsigned phys, uint8_t value) = no_code_write;
+/* What CPU RAM holds at power-on (cyc_core.h). It belongs to the machine, not
+ * to a host: every host that links this implementation needs it, and the
+ * cosimulation harnesses in tools/cyc are hosts too. tric_core.cpp defines
+ * its own; the two are never linked together. */
+CycRamInit cyc_ram_init = CYC_RAM_PATTERN;
+
+static uint32_t frame_argb[256 * 240];
+static void clock_cpu_devices(void)
+{
+    if (!hw_extra_timing.active) apu_cycle();
+}
+
+/* ------------------------------------------------------------------------- */
+/* Master clock                                                              */
+/* ------------------------------------------------------------------------- */
+
+/* Tick 4: the CPU samples /NMI (the PPU's output) into its edge detector. */
+static inline void sample_nmi(void)
+{
+    cpu_nmi_input(ppu_nmi_output());
+}
+
+static inline void run_tick(unsigned k)
+{
+    /* The cartridge's M2 clock comes at the CPU edge, before a coincident PPU
+     * transition, in the oracle's CPU -> cartridge -> PPU order. MMC5 samples
+     * the PPU /RD pin there, and a counter started by a PPU event on this tick
+     * (the TC0690's delayed IRQ) first counts on the next CPU cycle. */
+    if (k==0 && hw_cart.watch_cpu) hw_cart_cpu_clock();
+    if (k == 4) sample_nmi();
+    else if (k == 7) apu_sample_irq();
+    unsigned q = (hw.align + k) & 3;
+    if (q == 0) ppu_dot();
+    else if (q == 2) ppu_half_dot();
+    if (k == 0) clock_cpu_devices();
+    /* Boards clocked before the CPU's access, after the IRQ sample (FDS). */
+    if (k == 11 && hw_cart.clock_late) hw_cart_cpu_clock_late();
+}
+
+/* PAL transitions use doubled units inside each master tick so the second
+ * half of a /5 PPU dot occurs exactly 2.5 master clocks after its first half.
+ * NTSC retains its existing unrolled /12 clock path. */
+static inline void pal_ppu_edge(unsigned half_phase)
+{
+    if (half_phase == 0) ppu_dot();
+    else if (half_phase == 5) ppu_half_dot();
+}
+
+static inline void run_pal_tick(unsigned k)
+{
+    if (k == 0 && hw_cart.watch_cpu) hw_cart_cpu_clock();
+    /* 2A07 M2 is low for 6.5 clocks (2A03: 4.5); the CPU's sample
+     * positions move two master clocks later relative to M2's falling edge. */
+    if (k == 6) sample_nmi();
+    else if (k == 9) apu_sample_irq();
+    unsigned q = (2u * (hw_region_timing.phase + k)) % 10u;
+    pal_ppu_edge(q);
+    if (k == 0) clock_cpu_devices();
+    pal_ppu_edge(q + 1);
+    if (k == 15 && hw_cart.clock_late) hw_cart_cpu_clock_late();
+}
+
+void hw_clock_run_ticks(int n)
+{
+    if (hw_isolated) return;
+    if (hw_pal()) {
+        /* PPU register reads finish at the CPU's data sample. The $2000
+         * latch delay (2 master clocks) belongs to the PPU and stays 2. */
+        if (n == 7) n = 9;
+        while (n-- > 0) run_pal_tick(hw.tick++);
+    } else while (n-- > 0) run_tick(hw.tick++);
+}
+
+/* run_tick(1) through run_tick(11), unrolled for each alignment: the usual
+ * case, when no register access has run part of the cycle. */
+static void run_ticks_1_to_11(void)
+{
+    switch (hw.align) {
+    case 0:
+        ppu_half_dot();   /* 2 */
+        sample_nmi();     /* 4 */
+        ppu_dot();
+        ppu_half_dot();   /* 6 */
+        apu_sample_irq(); /* 7 */
+        ppu_dot();        /* 8 */
+        ppu_half_dot();   /* 10 */
+        break;
+    case 1:
+        ppu_half_dot();   /* 1 */
+        ppu_dot();        /* 3 */
+        sample_nmi();     /* 4 */
+        ppu_half_dot();   /* 5 */
+        apu_sample_irq(); /* 7 */
+        ppu_dot();
+        ppu_half_dot();   /* 9 */
+        ppu_dot();        /* 11 */
+        break;
+    case 2:
+        ppu_dot();        /* 2 */
+        sample_nmi();     /* 4 */
+        ppu_half_dot();
+        ppu_dot();        /* 6 */
+        apu_sample_irq(); /* 7 */
+        ppu_half_dot();   /* 8 */
+        ppu_dot();        /* 10 */
+        break;
+    default:
+        ppu_dot();        /* 1 */
+        ppu_half_dot();   /* 3 */
+        sample_nmi();     /* 4 */
+        ppu_dot();        /* 5 */
+        apu_sample_irq(); /* 7 */
+        ppu_half_dot();
+        ppu_dot();        /* 9 */
+        ppu_half_dot();   /* 11 */
+        break;
+    }
+    if (hw_cart.clock_late) hw_cart_cpu_clock_late();   /* 11 */
+}
+
+/* run_tick(0) without the CPU's access. */
+static inline void run_tick_0(void)
+{
+    if (hw_cart.watch_cpu) hw_cart_cpu_clock();
+    if (hw.align == 0) ppu_dot();
+    else if (hw.align == 2) ppu_half_dot();
+    clock_cpu_devices();
+}
+
+/* ------------------------------------------------------------------------- */
+/* hw.h                                                                      */
+/* ------------------------------------------------------------------------- */
+
+void hw_cycle_start(uint16_t addr, HwCycleKind kind)
+{
+    hw.cpu_addr = addr;
+    hw.cpu_reading = kind == HW_READ || kind == HW_FETCH;
+    cpu_opcode_fetch = kind == HW_FETCH;
+    hw_dma_stalls = 0;
+    if (hw_isolated) {
+        /* a mod's isolated routine call: memory only, no time (hw_internal.h) */
+        if (++hw_isolated_cycles > hw_isolated_budget) hw_frame_done = true;
+        return;
+    }
+    for (;;) {
+        if (hw_pal()) {
+            while (hw.tick < 16) run_pal_tick(hw.tick++);
+            hw_region_timing.phase = (uint8_t)((hw_region_timing.phase + 1) % 5);
+        } else if (hw.tick == 1) run_ticks_1_to_11();
+        else while (hw.tick < 12) run_tick(hw.tick++);
+        hw.tick = 0;
+        if ((hw_pal() && !cpu_opcode_fetch) || !dma_wants_cycle()) return;
+        /* RDY: a DMA takes this read cycle; the CPU holds its address. */
+        dma_cycle();
+        dma_end_of_cycle();
+        if (cyc_trace_enabled) cyc_trace_cycle_end(false, hw.data_bus);
+        hw.cycles++;
+        if (hw_pal()) run_pal_tick(hw.tick++); else run_tick(hw.tick++);
+        hw_dma_stalls++;
+    }
+}
+
+uint8_t hw_read(uint16_t addr)
+{
+    return hw_bus_read(addr);
+}
+
+/* A cheat's read substitution (cyc_mod.h), applied last so it wins over the
+ * board: a cheat the mapper can undo is not a cheat. Empty for every game that
+ * has not asked for one, so this costs a load and a branch per ROM read. */
+static inline uint8_t hw_rom_read_override(uint16_t addr, uint8_t value)
+{
+    const CycModReadOverride *t = cyc_mod_rom_read_overrides;
+    if (!t) return value;
+    for (unsigned i = 0, n = cyc_mod_rom_read_override_count(); i < n; i++)
+        if (t[i].addr == addr) return t[i].value;
+    return value;
+}
+
+uint8_t hw_read_rom(uint16_t addr, uint8_t value)
+{
+    hw_cart_cpu_read_snoop(addr,value);
+    value = hw_rom_read_override(addr, value);
+    hw.data_driven = 1;
+    hw.data_bus = hw.internal_bus = value;
+    if (cyc_trace_enabled) cyc_trace_access(addr, value, false);
+    return value;
+}
+
+void hw_write(uint16_t addr, uint8_t value)
+{
+    /* an isolated routine that talks to a device (cyc_mod.h): counted, so a
+     * committed call can refuse (its device effects would be lost) */
+    if (hw_isolated && addr >= 0x2000 &&
+        !(hw_cart.mapper == NES_FDS_MAPPER ? addr >= 0x6000 && addr < 0xE000 : addr >= 0x6000 && addr < 0x8000))
+        hw_isolated_io_writes++;
+    hw_bus_write(addr, value);
+}
+
+void hw_cycle_finish(bool instruction_done)
+{
+    if (hw_isolated) return;
+    dma_end_of_cycle();
+    if (cyc_trace_enabled) cyc_trace_cycle_end(instruction_done, hw.data_bus);
+    hw.cycles++;
+    if (hw_pal()) {
+        run_pal_tick(hw.tick++);
+    } else if (hw.tick == 0) {
+        run_tick_0();
+        hw.tick = 1;
+    } else {
+        run_tick(hw.tick++);
+    }
+}
+
+bool hw_irq_line(void) { return hw.irq_line != 0; }
+
+unsigned hw_prg_bank(uint16_t addr) { return hw_cart.prg_off[(addr >> 12) & 7] >> 13; }
+unsigned hw_prg_bank4(uint16_t addr) { return hw_cart.prg_off[(addr >> 12) & 7] >> 12; }
+
+/* ------------------------------------------------------------------------- */
+/* CPU memory map                                                            */
+/* ------------------------------------------------------------------------- */
+
+uint8_t hw_bus_read(uint16_t addr)
+{
+    hw.data_driven = 0;
+    if (addr >= 0x8000) {
+        hw.data_bus = hw_cart_prg_read(addr);
+        hw.data_driven = !(hw_cart.prg_off[addr>>12&7]&MMC5_PRG_OPEN);
+        hw_cart_cpu_read_snoop(addr,hw.data_bus);
+        hw.data_bus = hw_rom_read_override(addr,hw.data_bus);
+    } else if (addr < 0x2000) {
+        hw.data_bus = hw.ram[addr & 0x7FF];
+        hw.data_driven = 1;
+    } else if (addr < 0x4000) {
+        hw.data_bus = ppu_read(addr);
+        hw.data_driven = 1;
+    } else if (addr >= 0x4020) {
+        /* $4020-$7FFF: the cartridge's work RAM, if the board has any and the
+         * mapper has it enabled. Otherwise nothing drives the bus. */
+        uint8_t value = hw.data_bus; /* Partially driven cartridge reads. */
+        if (hw_cart_cpu_read(addr, &value)) {
+            hw.data_bus = value;
+            hw.data_driven = 1;
+        }
+    }
+
+    /* The 2A03 decodes its readable registers from the CPU's address bus and
+     * the low bits of the accessed address, so a DMA reading while the CPU
+     * holds $4015-$4017 can hit them (AccuracyCoin "DMC DMA Bus
+     * Conflicts"). */
+    if (hw.cpu_addr >= 0x4000 && hw.cpu_addr <= 0x401F && (addr < 0x2000 || addr >= 0x4000)) {
+        unsigned reg = addr & 0x1F;
+        if (reg == 0x15) {
+            /* Driven on the internal bus only; the data bus keeps its value. */
+            uint8_t status = apu_read_status();
+            if (cyc_trace_enabled) cyc_trace_access(addr, status, false);
+            return status;
+        }
+        if (reg == 0x16 || reg == 0x17) {
+            uint8_t value = (uint8_t)(apu_read_controller((int)reg - 0x16) | (hw.data_bus & 0xE0));
+            if (hw_zapper.port == reg - 0x15)
+                value = (uint8_t)((hw.data_bus & 0xE0) | (hw_zapper.trigger ? 0x10 : 0) |
+                                  (hw_zapper.dots < hw_zapper.light_until ? 0 : 0x08));
+            if (hw_oam_dma_active() && hw.data_driven) {
+                /* A driven bus masks the controller bit. */
+                if (cyc_trace_enabled) cyc_trace_access(addr, hw.data_bus, false);
+                return hw.data_bus;
+            }
+            hw.data_bus = value;
+        }
+    }
+    hw.internal_bus = hw.data_bus;
+    if (cyc_trace_enabled) cyc_trace_access(addr, hw.data_bus, false);
+    return hw.data_bus;
+}
+
+void hw_bus_write(uint16_t addr, uint8_t value)
+{
+    if (cyc_trace_enabled) cyc_trace_access(addr, value, true);
+    if (hw_cart.mapper==5 && addr<0x4020) hw_cart_cpu_write(addr,value);
+    if (addr < 0x2000) hw_code_store(&hw.ram[addr & 0x7FF], addr & 0x7FF, value);
+    else if (addr < 0x4000) ppu_write(addr, value);
+    else if (addr <= 0x4017) apu_write(addr, value);
+    else if (addr >= 0x4020) hw_cart_cpu_write(addr, value);
+    /* $4018-$401F: the 2A03's test registers, not connected on a console. */
+    hw.data_bus = value;
+    hw.internal_bus = value;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Cartridge, power-on                                                       */
+/* ------------------------------------------------------------------------- */
+
+/* The bank tables index PRG and CHR with a power-of-two mask, which is what a
+ * board's address lines do to a bank number past the end of the ROM. Images
+ * whose size is not a power of two are padded so the mask stays in bounds. */
+static uint32_t round_up_pow2(uint32_t n)
+{
+    uint32_t p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+static uint8_t *alloc_padded(const uint8_t *src, size_t len, uint32_t *out_alloc)
+{
+    uint32_t alloc = round_up_pow2((uint32_t)(len < 4096 ? 4096 : len));
+    uint8_t *p = (uint8_t *)calloc(1, alloc);
+    if (p && src) memcpy(p, src, len);
+    *out_alloc = alloc;
+    return p;
+}
+
+bool hw_prg_modified;
+
+bool cyc_load_ines(const uint8_t *image, size_t size)
+{
+    NesCartInfo info;
+    if (!nes_cart_image(image, size, &info) || !hw_cart_supports(info.mapper) ||
+        !nes_cart_variant_supported(&info)) return false;
+    /* An iNES header cannot describe a disk; the RAM Adapter comes from
+     * cyc_load_fds(). */
+    if (info.mapper == NES_FDS_MAPPER) return false;
+    uint32_t prg_alloc, chr_alloc;
+    uint32_t chr_len = info.chr_size ? info.chr_size : info.chr_ram + info.chr_nvram;
+    /* A board with both CHR ROM and CHR RAM (TQROM) keeps the RAM chip after
+     * the padded ROM, outside the range ROM bank numbers wrap within. */
+    uint32_t mixed_ram = info.chr_size ? info.chr_ram : 0;
+    uint8_t *prg = alloc_padded(image + info.data_offset, info.prg_size, &prg_alloc);
+    uint8_t *chr = alloc_padded(info.chr_size ? image + info.data_offset + info.prg_size : NULL,
+                              chr_len, &chr_alloc);
+    if (chr && mixed_ram) {
+        uint8_t *grown = (uint8_t *)realloc(chr, (size_t)chr_alloc + mixed_ram);
+        if (grown) memset(grown + chr_alloc, 0, mixed_ram);
+        else free(chr);
+        chr = grown;
+    }
+    if (!prg || !chr) { free(prg); free(chr); return false; }
+    free(hw_cart.prg);
+    free(hw_cart.chr);
+    memset(&hw_cart, 0, sizeof(hw_cart));
+    hw_cart.info = info;
+    hw_prg_modified = false;
+    hw_cart.prg = prg;
+    hw_cart.prg_len = info.prg_size;
+    hw_cart.prg_slots = prg_alloc / 4096;
+    hw_cart.chr = chr;
+    hw_cart.chr_len = chr_len;
+    hw_cart.chr_pages = chr_alloc / 1024;
+    hw_cart.chr_ram = !info.chr_size;
+    hw_cart.chr_ram_base = mixed_ram ? chr_alloc : 0;
+    hw_cart.chr_ram_len = mixed_ram ? mixed_ram : hw_cart.chr_ram ? chr_len : 0;
+    hw_cart.mapper = info.mapper;
+    if (info.mapper==153) memset(hw_cart.wram,255,8192);
+    nes_eeprom_init(&hw_cart.eeprom[0],info.mapper==157?256:(info.mapper==16 || info.mapper==159)?info.prg_nvram:0);
+    nes_eeprom_init(&hw_cart.eeprom[1],info.mapper==157?info.prg_nvram:0);
+    hw_cart.wram_len = info.prg_ram + info.prg_nvram;
+    hw_cart.mirroring = info.vertical ? HW_MIRROR_VERTICAL : HW_MIRROR_HORIZONTAL;
+    hw_cart_power_on();
+    return true;
+}
+
+/* The RAM Adapter: the BIOS is the board's whole PRG ROM, fixed at
+ * $E000-$FFFF; the disk sides are the drive's media (hw_fds.c). */
+bool cyc_load_fds(const uint8_t *bios, size_t bios_size, const uint8_t *image, size_t image_size,
+                  const CycFdsOptions *options)
+{
+    CycFdsOptions defaults;
+    if (!options) { cyc_fds_default_options(&defaults); options = &defaults; }
+    if (!bios || bios_size != NES_FDS_BIOS_BYTES) return false;
+    uint32_t prg_alloc, chr_alloc;
+    uint8_t *prg = alloc_padded(bios, bios_size, &prg_alloc);
+    uint8_t *chr = alloc_padded(NULL, NES_FDS_CHR_RAM_BYTES, &chr_alloc);
+    if (!prg || !chr || !cyc_fds_load_media(image, image_size, options)) { free(prg); free(chr); return false; }
+    free(hw_cart.prg);
+    free(hw_cart.chr);
+    memset(&hw_cart, 0, sizeof(hw_cart));
+    nes_fds_cart_info(&hw_cart.info);
+    hw_prg_modified = false;
+    hw_cart.prg = prg;
+    hw_cart.prg_len = NES_FDS_BIOS_BYTES;
+    hw_cart.prg_slots = prg_alloc / 4096;
+    hw_cart.chr = chr;
+    hw_cart.chr_len = NES_FDS_CHR_RAM_BYTES;
+    hw_cart.chr_pages = chr_alloc / 1024;
+    hw_cart.chr_ram = 1;
+    hw_cart.chr_ram_len = NES_FDS_CHR_RAM_BYTES;
+    hw_cart.mapper = NES_FDS_MAPPER;
+    hw_cart.wram_len = NES_FDS_PRG_RAM_BYTES;
+    hw_cart.mirroring = HW_MIRROR_VERTICAL;
+    hw_cart_power_on();
+    return true;
+}
+
+const uint8_t *cyc_cart_ram(size_t *len)
+{
+    *len = hw_cart.has_wram ? hw_cart.wram_len : 0;
+    return hw_cart.has_wram ? hw_cart.wram : NULL;
+}
+
+const uint8_t *cyc_ppu_ciram(size_t *len) { *len = hw_cart.info.four_screen ? 4096 : 2048; return ppu.ciram; }
+const uint8_t *cyc_ppu_palette(void) { return ppu.palette; }
+const uint8_t *cyc_ppu_oam(void) { return ppu.oam; }
+const uint8_t *cyc_chr_ram(size_t *len)
+{
+    *len = hw_cart.chr_ram_len;
+    return hw_cart.chr_ram_len ? hw_cart.chr + hw_cart.chr_ram_base : NULL;
+}
+
+void cyc_power_on(uint8_t ppu_alignment)
+{
+    static bool palette_ready;
+    if (!palette_ready) {
+        hw_palette_init();
+        palette_ready = true;
+    }
+    memset(&hw, 0, sizeof(hw));
+    memset(&hw_extra_timing, 0, sizeof(hw_extra_timing));
+    memset(&hw_region_timing, 0, sizeof(hw_region_timing));
+    hw_region_timing.region = (uint8_t)region_request;
+    hw_region_timing.phase = hw_pal() ? ppu_alignment % 5 : 0;
+    memset(&hw_zapper, 0, sizeof(hw_zapper));
+    hw_zapper.x = hw_zapper.y = -1;
+    hw.align = ppu_alignment & 3;
+    /* Traced sessions share this process when returning to the lobby. A new
+     * power-on must not inherit the previous match's diagnostic history:
+     * these fields are included in cycle snapshots and rollback digests. */
+    cyc_trace_hash = 0;
+    cyc_trace_cycle = 0;
+    cyc_ring_reset();
+    /* CPU RAM at power-on: runs of $F0 and $0F (the pattern AccuracyCoin's
+     * power-on page shows on the reference console; not defined by the
+     * hardware). --ram-init selects zeros or ones instead, to compare a
+     * program that reads uninitialized RAM against another emulator. */
+    for (int i = 0; i < 0x800; i++) {
+        bool bit1_clear = (i & 2) == 0, upper = (i & 0x1F) >= 0x10;
+        hw.ram[i] = cyc_ram_init == CYC_RAM_ZEROS ? 0x00
+                  : cyc_ram_init == CYC_RAM_ONES  ? 0xFF
+                  : bit1_clear != upper ? 0xF0 : 0x0F;
+    }
+    hw_cart_power_on();
+    ppu_power_on();
+    apu_power_on();
+    hw_frame_done = false;
+    hw_dma_stalls = 0;
+
+    /* Tick 0 of the first CPU cycle has no CPU access, and the PPU clock
+     * starts at its alignment phase: its first dot is not on this tick. The
+     * cartridge's first M2 clock comes with the first CPU cycle, as in the
+     * oracle; a free-running divider (the N163 sound generator) keeps the
+     * oracle's phase, which CPU-readable RAM exposes. */
+    if (hw_pal()) {
+        unsigned q = 2u * hw_region_timing.phase;
+        /* As on NTSC, no first-dot transition precedes the reset cycle. */
+        if (q + 1 == 5) ppu_half_dot();
+    } else if (hw.align == 2) ppu_half_dot();
+    apu_cycle();
+    hw.tick = 1;
+}
+
+#include "../../common/nes_nvram.h"
+static NesNvram nvram_region(unsigned region) { return nes_nvram_region(&hw_cart.info,hw_cart.wram,hw_cart.chr,hw_cart.eeprom,hw_cart.exram,region); }
+bool cyc_scan_barcode(const char *digits, unsigned cycles_per_module) {
+    return hw_cart.mapper==157 && nes_barcode_scan(&hw_cart.barcode,digits,cycles_per_module,hw.cycles);
+}
+size_t cyc_nvram_size(unsigned region) { NesNvram n=nvram_region(region); return n.size[0]+n.size[1]+n.size[2]; }
+bool cyc_nvram_export(unsigned region, void *buffer, size_t size) {
+    return nes_nvram_transfer(nvram_region(region),buffer,size,false);
+}
+bool cyc_nvram_import(unsigned region, const void *buffer, size_t size) {
+    return nes_nvram_transfer(nvram_region(region),(void *)buffer,size,true);
+}
+
+uint32_t cyc_prg_hash(void)
+{
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < hw_cart.prg_len; i++) h = (h ^ hw_cart.prg[i]) * 16777619u;
+    return h;
+}
+
+const char *cyc_hw_name(void) { return "nesrecomp"; }
+
+/* ------------------------------------------------------------------------- */
+/* Host I/O                                                                  */
+/* ------------------------------------------------------------------------- */
+
+const uint8_t *cyc_cpu_ram(void) { return hw.ram; }
+
+bool cyc_debug_peek(uint16_t addr, uint8_t *value)
+{
+    if (addr < 0x2000) { *value = hw.ram[addr & 0x7FF]; return true; }
+    if (addr >= 0x8000) {
+        uint32_t offset = hw_cart.prg_off[(addr >> 12) & 7] | (addr & 4095);
+        if (offset & MMC5_PRG_OPEN) return false;
+        *value = (offset & MMC5_PRG_RAM) ? hw_cart.wram[offset & 0x1ffff] : hw_cart.prg[offset];
+        return true;
+    }
+    if (addr >= 0x6000 && hw_cart.has_wram && hw_cart.wram_len) {
+        *value = hw_cart.mapper == NES_FDS_MAPPER ? hw_cart.wram[addr - 0x6000]
+                                                   : hw_cart.wram[(hw_cart.wram_bank + (addr & 0x1FFF)) % hw_cart.wram_len];
+        return true;
+    }
+    return false;
+}
+
+void cyc_set_controller(int port, uint8_t buttons) { hw_set_controller(port, buttons); }
+
+uint64_t cyc_cycle_count(void) { return hw.cycles; }
+
+bool cyc_set_region(CycRegion region)
+{
+    if ((region != CYC_REGION_NTSC && region != CYC_REGION_PAL) ||
+        (region == CYC_REGION_PAL && cyc_is_fds())) return false;
+    region_request = region;
+    return true;
+}
+CycRegion cyc_region(void) { return (CycRegion)hw_region_timing.region; }
+CycRegion cyc_cart_region(void) { return hw_cart.info.nes2 && hw_cart.info.timing == 1 ? CYC_REGION_PAL : CYC_REGION_NTSC; }
+double cyc_cpu_hz(void) { return hw_pal() ? 26601712.5 / 16.0 : 21477272.0 / 12.0; }
+double cyc_frame_seconds(void) { return hw_pal() ? (341.0 * 312.0 * 5.0) / 26601712.5 : 1.0 / 60.0988; }
+
+/* The added lines are blank (rendering is off above scanline 239) and the APU
+ * is paused across them, so they are inert for any mapper whose IRQ is not
+ * clocked by the PPU -- such a board just sees CPU time the game can spend
+ * before its NMI, which is the whole point of the enhancement.
+ *
+ * MMC3 (4) counts rising edges of PPU A12 (mmc3_clock_irq), so it is affected
+ * by what the PPU does on those lines and stays supported for its own sake.
+ * MMC1 (1) has no IRQ counter. Its serial register responds to CPU writes
+ * (bit 7 resets that register), so it needs no PPU-clocked IRQ adjustment.
+ *
+ * Only consulted when extra_scanlines is non-zero: at stock timing (0) this
+ * changes nothing for any game. */
+bool cyc_extra_scanlines_supported(void) { return hw_cart.mapper == 1 || hw_cart.mapper == 4; }
+unsigned cyc_extra_scanlines(void) { return hw_extra_timing.extra_scanlines; }
+
+bool cyc_zapper_attach(unsigned port)
+{
+    if (port > 2) return false;
+    memset(&hw_zapper, 0, sizeof(hw_zapper));
+    hw_zapper.port = (uint8_t)port;
+    hw_zapper.x = hw_zapper.y = -1;
+    return true;
+}
+
+void cyc_set_zapper(int x, int y, bool trigger)
+{
+    bool inside = x >= 0 && x < 256 && y >= 0 && y < 240;
+    hw_zapper.x = inside ? (int16_t)x : -1;
+    hw_zapper.y = inside ? (int16_t)y : -1;
+    hw_zapper.trigger = trigger;
+}
+
+void cyc_zapper_state(CycZapperState *out)
+{
+    out->port = hw_zapper.port;
+    out->x = hw_zapper.x; out->y = hw_zapper.y;
+    out->trigger = hw_zapper.trigger != 0;
+    out->light = hw_zapper.dots < hw_zapper.light_until;
+}
+
+void hw_zapper_pixel(int x, int y, uint16_t color)
+{
+    if (!hw_zapper.port || hw_zapper.x < 0 || abs(x - hw_zapper.x) > 4 || abs(y - hw_zapper.y) > 4) return;
+    uint32_t rgb = hw_palette_argb[color & 0x1FF];
+    unsigned brightness = (77 * ((rgb >> 16) & 255) + 150 * ((rgb >> 8) & 255) + 29 * (rgb & 255)) >> 8;
+    /* Optical approximation: small aperture, 20-scanline decay. Only PPU
+     * pixels can charge it; crosshairs and compositors cannot. Polarity and
+     * scanline locality: NESdev Zapper research, Mesen2 Input/Zapper.h. */
+    if (brightness >= 85) hw_zapper.light_until = hw_zapper.dots + 20u * 341u;
+}
+bool cyc_set_extra_scanlines(unsigned lines)
+{
+    if (lines > 262 || (lines && !cyc_extra_scanlines_supported())) return false;
+    hw_extra_timing.extra_scanlines = (uint16_t)lines;
+    return true;
+}
+
+const uint16_t *cyc_frame_index(void) { return hw_frame_index; }
+
+const uint32_t *cyc_frame_argb(void)
+{
+    for (int i = 0; i < 256 * 240; i++) frame_argb[i] = hw_palette_argb[hw_frame_index[i] & 0x1FF];
+    return frame_argb;
+}
+
+bool cyc_audio_enable(int sample_rate)
+{
+    apu_audio_enable(sample_rate > 0, sample_rate);
+    return sample_rate > 0;
+}
+
+size_t cyc_audio_read(int16_t *out, size_t max) { return apu_audio_read(out, max); }
+
+void cyc_set_console(CycConsole console) { apu_set_console((int)console); }
+
+CycConsole cyc_console(void) { return (CycConsole)apu_console(); }
+
+const char *cyc_console_name(CycConsole console)
+{
+    return console == CYC_CONSOLE_NES ? "nes" : console == CYC_CONSOLE_FAMICOM ? "famicom" : "default";
+}
+
+/* ------------------------------------------------------------------------- */
+/* Comparison                                                                */
+/* ------------------------------------------------------------------------- */
+
+uint64_t cyc_mem_state_hash(void)
+{
+    uint64_t h = cyc_mem_hash(hw.cycles, hw.ram, ppu.ciram, hw_cart.info.four_screen ? 4096 : 2048, ppu.oam, ppu.palette,
+                        hw_cart.chr_ram_len ? hw_cart.chr + hw_cart.chr_ram_base : NULL, hw_cart.chr_ram_len, hw_cart.has_wram ? hw_cart.wram : NULL, hw_cart.wram_len,
+                        hw_frame_index);
+    for (unsigned chip=0;chip<2;++chip)
+        for (unsigned i=0;i<hw_cart.eeprom[chip].size;++i) h=cyc_trace_mix(h,hw_cart.eeprom[chip].data[i]);
+    if (hw_cart.mapper==5) for (unsigned i=0;i<1024;++i) h=cyc_trace_mix(h,hw_cart.exram[i]);
+    if (hw_cart.mapper==19) for (unsigned i=0;i<128;++i) h=cyc_trace_mix(h,hw_cart.exram[i]);
+    if (hw_cart.mapper==NES_FDS_MAPPER) h=fds_media_hash(h);
+    return h;
+}
+
+void cyc_mem_state_dump(void *file)
+{
+    cyc_mem_dump(file, hw.cycles, hw.ram, ppu.ciram, hw_cart.info.four_screen ? 4096 : 2048, ppu.oam, ppu.palette,
+                 hw_cart.chr_ram_len ? hw_cart.chr + hw_cart.chr_ram_base : NULL, hw_cart.chr_ram_len, hw_cart.has_wram ? hw_cart.wram : NULL, hw_cart.wram_len, hw_frame_index);
+    /* Cartridge-internal RAM that cyc_mem_state_hash also covers. */
+    unsigned n = hw_cart.mapper==5 ? 1024 : hw_cart.mapper==19 ? 128 : 0;
+    for (unsigned i = 0; i < n; ++i)
+        fprintf((FILE *)file, "%s%02X%s", i % 32 ? " " : i ? "\nexram " : "exram ", hw_cart.exram[i], i + 1 == n ? "\n" : "");
+}
+
+uint64_t cyc_hw_state_hash(void)
+{
+    uint64_t h = (uint64_t)ppu.scanline | (uint64_t)ppu.dot << 16 | (uint64_t)hw.tick << 32 |
+                 (uint64_t)hw.align << 40;
+    uint64_t acc = 0;
+    acc = acc * 131 + hw.cpu_addr;
+    acc = acc * 131 + hw.cpu_reading;
+    acc = acc * 131 + hw.data_bus;
+    acc = acc * 131 + hw.internal_bus;
+    acc = acc * 131 + hw.data_driven;
+    acc = acc * 131 + hw.irq_line;
+    h = cyc_trace_mix(h, acc);
+    if (hw_extra_timing.extra_scanlines || hw_extra_timing.active)
+        h = cyc_trace_mix(h, (uint64_t)hw_extra_timing.extra_scanlines |
+                         (uint64_t)hw_extra_timing.line << 16 | (uint64_t)hw_extra_timing.active << 32);
+    if (hw_zapper.port) {
+        h = cyc_trace_mix(h, hw_zapper.dots);
+        h = cyc_trace_mix(h, hw_zapper.light_until);
+        h = cyc_trace_mix(h, (uint16_t)hw_zapper.x | (uint64_t)(uint16_t)hw_zapper.y << 16 |
+                         (uint64_t)hw_zapper.port << 32 | (uint64_t)hw_zapper.trigger << 40);
+    }
+    if (hw_pal()) h = cyc_trace_mix(h, hw_region_timing.region | (uint64_t)hw_region_timing.phase << 8);
+    h = hw_cart_state_hash(h);
+    h = ppu_state_hash(h);
+    return apu_state_hash(h);
+}
+
+void cyc_hw_state_dump(void *file)
+{
+    FILE *f = (FILE *)file;
+    fprintf(f, "hw.tick %02X\nhw.align %02X\nhw.cycles %llu\nhw.cpu_addr %04X\nhw.cpu_reading %02X\n"
+               "hw.data_bus %02X\nhw.internal_bus %02X\nhw.data_driven %02X\nhw.irq_line %02X\n",
+            hw.tick, hw.align, (unsigned long long)hw.cycles, hw.cpu_addr, hw.cpu_reading, hw.data_bus,
+            hw.internal_bus, hw.data_driven, hw.irq_line);
+    if (hw_pal()) fprintf(f, "region.pal 1\nregion.phase %u\n", hw_region_timing.phase);
+    hw_cart_state_dump(file);
+    fprintf(f, "extra.scanlines %u\nextra.line %u\nextra.active %u\n",
+            hw_extra_timing.extra_scanlines, hw_extra_timing.line, hw_extra_timing.active);
+    ppu_state_dump(file);
+    apu_state_dump(file);
+}

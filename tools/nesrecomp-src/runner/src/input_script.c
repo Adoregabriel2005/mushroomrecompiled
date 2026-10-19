@@ -1,0 +1,584 @@
+/*
+ * input_script.c — NES input script playback and recording
+ */
+#include "input_script.h"
+#include "foreign_controller.h"
+#include "nes_runtime.h"
+#include "savestate.h"
+#include "save_ram.h"
+#include <SDL.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+int g_turbo = 0;
+
+/* ---- Button name table ---- */
+static const struct { const char *name; uint8_t mask; } s_buttons[] = {
+    {"A",      0x80}, {"B",      0x40},
+    {"SELECT", 0x20}, {"START",  0x10},
+    {"UP",     0x08}, {"DOWN",   0x04},
+    {"LEFT",   0x02}, {"RIGHT",  0x01},
+};
+#define NUM_BUTTONS (sizeof(s_buttons)/sizeof(s_buttons[0]))
+
+static uint8_t parse_button(const char *name) {
+    for (int i = 0; i < (int)NUM_BUTTONS; i++)
+        if (strcmp(name, s_buttons[i].name) == 0) return s_buttons[i].mask;
+    fprintf(stderr, "[Script] Unknown button: %s\n", name);
+    return 0;
+}
+
+static SDL_Scancode parse_host_key(const char *name) {
+    static const struct {
+        const char *name;
+        SDL_Scancode scancode;
+    } keys[] = {
+        {"KP0", SDL_SCANCODE_KP_0}, {"KP1", SDL_SCANCODE_KP_1},
+        {"KP2", SDL_SCANCODE_KP_2}, {"KP3", SDL_SCANCODE_KP_3},
+        {"KP4", SDL_SCANCODE_KP_4}, {"KP5", SDL_SCANCODE_KP_5},
+        {"KP6", SDL_SCANCODE_KP_6}, {"KP7", SDL_SCANCODE_KP_7},
+        {"KP8", SDL_SCANCODE_KP_8}, {"KP9", SDL_SCANCODE_KP_9},
+        {"KP_PLUS", SDL_SCANCODE_KP_PLUS},
+        {"KP_MINUS", SDL_SCANCODE_KP_MINUS},
+    };
+    for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
+        if (strcmp(name, keys[i].name) == 0) return keys[i].scancode;
+    return SDL_SCANCODE_UNKNOWN;
+}
+
+/* ---- Command types ---- */
+typedef enum {
+    CMD_WAIT, CMD_HOLD, CMD_RELEASE,
+    CMD_TURBO_ON, CMD_TURBO_OFF,
+    CMD_SCREENSHOT, CMD_LOG, CMD_EXIT,
+    CMD_WAIT_RAM8, CMD_WAIT_FOREIGN_STATE, CMD_ASSERT_RAM8,
+    CMD_WRITE_RAM8, CMD_WRITE_SRAM8, CMD_WRITE_PPU8,
+    CMD_DUMP_RAM,
+    CMD_SAVE_STATE, CMD_LOAD_STATE,
+    CMD_TRIGGER, CMD_TRIGGER_OFF,
+    CMD_KEY_TAP,
+} CmdType;
+
+typedef struct {
+    CmdType type;
+    int     iarg;          /* WAIT: frames; EXIT: code; RAM commands: addr; foreign wait: frame */
+    uint8_t player;        /* logical seat, zero-based */
+    uint8_t barg;          /* buttons/value; foreign wait: optional-frame-present */
+    char    sarg[128];     /* filename, message, state path, or host key name */
+} Cmd;
+
+#define MAX_CMDS 4096
+static Cmd    s_cmds[MAX_CMDS];
+static int    s_cmd_count  = 0;
+static int    s_cmd_cursor = 0;
+static int    s_wait_left  = 0;
+static int    s_exit_code  = -1;
+/* Timed-out waits and failed asserts mean the script desynced from the game.
+ * A run that would otherwise exit 0 exits SCRIPT_FAILED_EXIT_CODE instead, so
+ * harnesses never mistake a desynced script for a pass. */
+#define SCRIPT_FAILED_EXIT_CODE 3
+static int    s_failures   = 0;
+static char   s_first_failure[160] = {0};
+static int    s_loaded     = 0;
+static int    s_trigger_override = 0; /* 1 = script controls zapper trigger */
+static uint8_t s_buttons_held = 0;
+static uint8_t s_extra_buttons[3];
+static char   s_shot_pending[128] = {0};
+static int    s_auto_shot_num = 1;
+static char   s_shot_prefix[32] = {0};
+
+/* For bounded predicate waits (RAM and foreign-controller state). */
+static uint64_t s_wait_predicate_start_frame = UINT64_MAX;
+#define WAIT_PREDICATE_TIMEOUT_FRAMES (30 * 60)  /* 30 seconds at 60fps */
+
+static void note_failure(uint64_t frame, const char *what) {
+    if (!s_failures++)
+        snprintf(s_first_failure, sizeof(s_first_failure), "%s at frame %llu",
+                 what, (unsigned long long)frame);
+}
+
+/* Final exit code for a script that finished with `requested`. */
+static int script_exit_code(int requested) {
+    if (requested != 0 || !s_failures) return requested;
+    fprintf(stderr, "[Script] FAILED: %d wait timeout(s)/assert failure(s); first: %s\n",
+            s_failures, s_first_failure);
+    return SCRIPT_FAILED_EXIT_CODE;
+}
+
+static void trim(char *s) {
+    char *p = s + strlen(s) - 1;
+    while (p >= s && isspace((unsigned char)*p)) *p-- = '\0';
+    while (*s && isspace((unsigned char)*s)) memmove(s, s+1, strlen(s));
+}
+
+int script_load(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "[Script] Cannot open: %s\n", path); return 0; }
+
+    char line[256];
+    s_cmd_count = 0;
+    while (fgets(line, sizeof(line), f) && s_cmd_count < MAX_CMDS) {
+        /* Strip comment */
+        char *hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+        trim(line);
+        if (!line[0]) continue;
+
+        Cmd c = {0};
+        char tok[64], arg1[128], arg2[128];
+        int n = sscanf(line, "%63s %127s %127s", tok, arg1, arg2);
+        if (n < 1) continue;
+
+        /* Uppercase tok */
+        for (char *p = tok; *p; p++) *p = (char)toupper((unsigned char)*p);
+
+        if (strcmp(tok, "WAIT") == 0 && n >= 2) {
+            c.type = CMD_WAIT; c.iarg = atoi(arg1);
+        } else if (strcmp(tok, "HOLD") == 0 && n >= 2) {
+            for (char *p = arg1; *p; p++) *p = (char)toupper((unsigned char)*p);
+            c.type = CMD_HOLD; c.barg = parse_button(arg1);
+            if (n >= 3) { int p=atoi(arg2); if(p<1 || p>4) { fclose(f); return 0; } c.player=(uint8_t)(p-1); }
+        } else if (strcmp(tok, "RELEASE") == 0 && n >= 2) {
+            for (char *p = arg1; *p; p++) *p = (char)toupper((unsigned char)*p);
+            c.type = CMD_RELEASE; c.barg = parse_button(arg1);
+            if (n >= 3) { int p=atoi(arg2); if(p<1 || p>4) { fclose(f); return 0; } c.player=(uint8_t)(p-1); }
+        } else if (strcmp(tok, "TURBO") == 0 && n >= 2) {
+            for (char *p = arg1; *p; p++) *p = (char)toupper((unsigned char)*p);
+            c.type = (strcmp(arg1, "ON") == 0) ? CMD_TURBO_ON : CMD_TURBO_OFF;
+        } else if (strcmp(tok, "SCREENSHOT") == 0) {
+            c.type = CMD_SCREENSHOT;
+            if (n >= 2) strncpy(c.sarg, arg1, sizeof(c.sarg)-1);
+        } else if (strcmp(tok, "LOG") == 0) {
+            c.type = CMD_LOG;
+            /* Capture rest of line after "LOG " */
+            const char *rest = strstr(line, " ");
+            if (rest) strncpy(c.sarg, rest+1, sizeof(c.sarg)-1);
+        } else if (strcmp(tok, "EXIT") == 0) {
+            c.type = CMD_EXIT; c.iarg = (n >= 2) ? atoi(arg1) : 0;
+        } else if (strcmp(tok, "WAIT_RAM8") == 0 && n >= 3) {
+            c.type = CMD_WAIT_RAM8;
+            c.iarg = (int)strtol(arg1, NULL, 16) & 0x7FF;
+            c.barg = (uint8_t)strtol(arg2, NULL, 16);
+        } else if (strcmp(tok, "WAIT_FOREIGN_STATE") == 0 && n >= 2) {
+            char *end = NULL;
+            c.type = CMD_WAIT_FOREIGN_STATE;
+            strncpy(c.sarg, arg1, sizeof(c.sarg)-1);
+            if (n >= 3) {
+                long state_frame = strtol(arg2, &end, 0);
+                if (end == arg2 || *end != '\0' || state_frame < 0 ||
+                    state_frame > 0x7FFFFFFFL) {
+                    fprintf(stderr, "[Script] Invalid foreign state frame: %s\n", arg2);
+                    continue;
+                }
+                c.iarg = (int)state_frame;
+                c.barg = 1;
+            }
+        } else if (strcmp(tok, "ASSERT_RAM8") == 0 && n >= 3) {
+            c.type = CMD_ASSERT_RAM8;
+            c.iarg = (int)strtol(arg1, NULL, 16) & 0x7FF;
+            c.barg = (uint8_t)strtol(arg2, NULL, 16);
+            if (n >= 4) {
+                /* message is everything after addr and value */
+                const char *p = line;
+                for (int skip = 0; skip < 3 && *p; p++)
+                    if (*p == ' ') { skip++; while(*p == ' ') p++; break; }
+                strncpy(c.sarg, p, sizeof(c.sarg)-1);
+            }
+        } else if (strcmp(tok, "WRITE_RAM8") == 0 && n >= 3) {
+            c.type = CMD_WRITE_RAM8;
+            c.iarg = (int)strtol(arg1, NULL, 16) & 0x7FF;
+            c.barg = (uint8_t)strtol(arg2, NULL, 16);
+        } else if (strcmp(tok, "DUMP_RAM") == 0 && n >= 3) {
+            c.type = CMD_DUMP_RAM;
+            c.iarg = (int)strtol(arg1, NULL, 16) & 0x7FF;
+            c.barg = (uint8_t)strtol(arg2, NULL, 16); /* length (up to 256) */
+            if (n >= 4) strncpy(c.sarg, arg2, sizeof(c.sarg)-1);
+        } else if (strcmp(tok, "WRITE_SRAM8") == 0 && n >= 3) {
+            c.type = CMD_WRITE_SRAM8;
+            c.iarg = (int)strtol(arg1, NULL, 16) & 0x1FFF;
+            c.barg = (uint8_t)strtol(arg2, NULL, 16);
+        } else if (strcmp(tok, "WRITE_PPU8") == 0 && n >= 3) {
+            c.type = CMD_WRITE_PPU8;
+            c.iarg = (int)strtol(arg1, NULL, 16) & 0x0FFF;
+            c.barg = (uint8_t)strtol(arg2, NULL, 16);
+        } else if (strcmp(tok, "SAVE_STATE") == 0 && n >= 2) {
+            c.type = CMD_SAVE_STATE;
+            strncpy(c.sarg, arg1, sizeof(c.sarg)-1);
+        } else if (strcmp(tok, "LOAD_STATE") == 0 && n >= 2) {
+            c.type = CMD_LOAD_STATE;
+            strncpy(c.sarg, arg1, sizeof(c.sarg)-1);
+        } else if (strcmp(tok, "TRIGGER") == 0) {
+            c.type = CMD_TRIGGER;
+            /* Optional: TRIGGER x y (pixel coords, default 128 120 = center) */
+            if (n >= 3) {
+                c.iarg = atoi(arg1);       /* x */
+                c.barg = (uint8_t)atoi(arg2); /* y */
+            } else {
+                c.iarg = 128; c.barg = 120;
+            }
+        } else if (strcmp(tok, "TRIGGER_OFF") == 0) {
+            c.type = CMD_TRIGGER_OFF;
+        } else if (strcmp(tok, "KEY_TAP") == 0 && n >= 2) {
+            for (char *p = arg1; *p; p++)
+                *p = (char)toupper((unsigned char)*p);
+            c.type = CMD_KEY_TAP;
+            snprintf(c.sarg, sizeof(c.sarg), "%s", arg1);
+        } else {
+            fprintf(stderr, "[Script] Unknown command: %s\n", tok);
+            continue;
+        }
+        s_cmds[s_cmd_count++] = c;
+    }
+    fclose(f);
+    printf("[Script] Loaded %d commands from %s\n", s_cmd_count, path);
+    s_loaded = 1;
+    s_cmd_cursor = 0;
+    s_wait_left  = 0;
+    s_wait_predicate_start_frame = UINT64_MAX;
+    s_exit_code  = -1;
+    s_failures   = 0;
+    s_first_failure[0] = '\0';
+    s_buttons_held = 0;
+    memset(s_extra_buttons,0,sizeof(s_extra_buttons));
+    return 1;
+}
+
+void script_tick(uint64_t frame, const uint8_t *ram) {
+    if (!s_loaded || s_exit_code >= 0) return;
+
+    /* Process commands until we need to block */
+    while (s_cmd_cursor < s_cmd_count) {
+        Cmd *c = &s_cmds[s_cmd_cursor];
+
+        if (c->type == CMD_WAIT) {
+            if (s_wait_left == 0) {
+                if (c->iarg == 0) { s_cmd_cursor++; continue; }
+                s_wait_left = c->iarg;
+            }
+            s_wait_left--;
+            if (s_wait_left > 0) return;
+            s_wait_left = 0;
+            s_cmd_cursor++;
+            continue;
+        }
+
+        if (c->type == CMD_WAIT_RAM8) {
+            if (s_wait_predicate_start_frame == UINT64_MAX)
+                s_wait_predicate_start_frame = frame;
+            uint8_t actual = ram[c->iarg & 0x7FF];
+            if (actual == c->barg) {
+                printf("[Script] WAIT_RAM8 $%03X==%02X satisfied at frame %llu\n",
+                       c->iarg, c->barg, (unsigned long long)frame);
+                s_wait_predicate_start_frame = UINT64_MAX;
+                s_cmd_cursor++;
+                continue;
+            }
+            if (frame - s_wait_predicate_start_frame > WAIT_PREDICATE_TIMEOUT_FRAMES) {
+                fprintf(stderr, "[Script] WAIT_RAM8 $%03X==%02X TIMEOUT (got %02X)\n",
+                        c->iarg, c->barg, actual);
+                note_failure(frame, "WAIT_RAM8 timeout");
+                s_wait_predicate_start_frame = UINT64_MAX;
+                s_cmd_cursor++;
+            }
+            return;
+        }
+
+        if (c->type == CMD_WAIT_FOREIGN_STATE) {
+            const ForeignController *controller = nes_foreign_active();
+            ForeignState *foreign = nes_foreign_state();
+            const char *actual_name = NULL;
+            int matches = 0;
+
+            if (s_wait_predicate_start_frame == UINT64_MAX)
+                s_wait_predicate_start_frame = frame;
+            if (controller && foreign && controller->state_name)
+                actual_name = controller->state_name(foreign->state);
+            matches = actual_name && strcmp(actual_name, c->sarg) == 0 &&
+                      (!c->barg || foreign->state_frame == (unsigned)c->iarg);
+            if (matches) {
+                printf("[Script] WAIT_FOREIGN_STATE %s%s satisfied at frame %llu"
+                       " (state_frame=%u)\n",
+                       c->sarg, c->barg ? " with exact frame" : "",
+                       (unsigned long long)frame, foreign->state_frame);
+                s_wait_predicate_start_frame = UINT64_MAX;
+                s_cmd_cursor++;
+                continue;
+            }
+            if (frame - s_wait_predicate_start_frame > WAIT_PREDICATE_TIMEOUT_FRAMES) {
+                fprintf(stderr, "[Script] WAIT_FOREIGN_STATE %s%s TIMEOUT"
+                        " (got %s frame %u)\n",
+                        c->sarg, c->barg ? " with exact frame" : "",
+                        actual_name ? actual_name : "<inactive>",
+                        foreign ? foreign->state_frame : 0u);
+                note_failure(frame, "WAIT_FOREIGN_STATE timeout");
+                s_wait_predicate_start_frame = UINT64_MAX;
+                s_cmd_cursor++;
+            }
+            return;
+        }
+
+        /* All other commands execute immediately */
+        switch (c->type) {
+            case CMD_HOLD:
+                if (c->player) s_extra_buttons[c->player-1] |= c->barg;
+                else s_buttons_held |= c->barg;
+                printf("[Script] HOLD %02X P%d (held=%02X)\n", c->barg, c->player+1,
+                       c->player ? s_extra_buttons[c->player-1] : s_buttons_held);
+                break;
+            case CMD_RELEASE:
+                if (c->player) s_extra_buttons[c->player-1] &= ~c->barg;
+                else s_buttons_held &= ~c->barg;
+                printf("[Script] RELEASE %02X P%d (held=%02X)\n", c->barg, c->player+1,
+                       c->player ? s_extra_buttons[c->player-1] : s_buttons_held);
+                break;
+            case CMD_TURBO_ON:
+                g_turbo = 1;
+                printf("[Script] TURBO ON\n");
+                break;
+            case CMD_TURBO_OFF:
+                g_turbo = 0;
+                printf("[Script] TURBO OFF\n");
+                break;
+            case CMD_SCREENSHOT: {
+                char name[128];
+                if (c->sarg[0])
+                    strncpy(name, c->sarg, sizeof(name)-1);
+                else
+                    snprintf(name, sizeof(name), "%snes_script_%03d.png", s_shot_prefix, s_auto_shot_num++);
+                snprintf(s_shot_pending, sizeof(s_shot_pending), "%s", name);
+                printf("[Script] SCREENSHOT -> %s\n", s_shot_pending);
+                break;
+            }
+            case CMD_LOG:
+                printf("[Script] %s\n", c->sarg);
+                break;
+            case CMD_SAVE_STATE:
+                printf("[Script] SAVE_STATE %s at frame %llu\n",
+                       c->sarg, (unsigned long long)frame);
+                savestate_save(c->sarg);
+                break;
+            case CMD_LOAD_STATE:
+                printf("[Script] LOAD_STATE %s at frame %llu\n",
+                       c->sarg, (unsigned long long)frame);
+                savestate_load(c->sarg);
+                /* Loading rewinds the runner's frame counter. Do not arm a
+                 * following predicate against this tick's stale pre-load
+                 * `frame`, because unsigned timeout arithmetic would fire on
+                 * the very next restored frame. Resume command processing on
+                 * that next frame instead. */
+                s_wait_predicate_start_frame = UINT64_MAX;
+                s_cmd_cursor++;
+                return;
+            case CMD_EXIT:
+                printf("[Script] EXIT %d at frame %llu\n",
+                       c->iarg, (unsigned long long)frame);
+                extern int g_nes_expected_exit;
+                g_nes_expected_exit = 1;
+                s_exit_code = script_exit_code(c->iarg);
+                return;
+            case CMD_ASSERT_RAM8: {
+                uint8_t actual = ram[c->iarg & 0x7FF];
+                if (actual != c->barg) {
+                    fprintf(stderr, "[Script] ASSERT FAIL: $%03X expected %02X got %02X %s\n",
+                            c->iarg, c->barg, actual, c->sarg);
+                    note_failure(frame, "ASSERT_RAM8 failure");
+                } else
+                    printf("[Script] ASSERT OK: $%03X==%02X %s\n",
+                           c->iarg, c->barg, c->sarg);
+                break;
+            }
+            case CMD_WRITE_RAM8:
+                g_ram[c->iarg & 0x7FF] = c->barg;
+                printf("[Script] WRITE_RAM8 $%03X=%02X\n", c->iarg, c->barg);
+                break;
+            case CMD_WRITE_SRAM8:
+                if (g_sram[c->iarg & 0x1FFF] != c->barg) {
+                    g_sram[c->iarg & 0x1FFF] = c->barg;
+                    save_ram_mark_dirty();
+                }
+                printf("[Script] WRITE_SRAM8 $%04X=%02X\n", 0x6000 + c->iarg, c->barg);
+                break;
+            case CMD_WRITE_PPU8:
+                g_ppu_nt[c->iarg & 0x0FFF] = c->barg;
+                printf("[Script] WRITE_PPU8 $%03X=%02X\n", c->iarg, c->barg);
+                break;
+            case CMD_DUMP_RAM: {
+                int start = c->iarg & 0x7FF;
+                int len = c->barg ? c->barg : 0x100;
+                printf("[Script] DUMP_RAM $%03X-%03X:", start, start + len - 1);
+                for (int i = 0; i < len && (start + i) < 0x800; i++) {
+                    if (i % 16 == 0) printf("\n  $%03X:", start + i);
+                    printf(" %02X", ram[start + i]);
+                }
+                printf("\n");
+                break;
+            }
+            case CMD_TRIGGER:
+                g_zapper_trigger = 1;
+                g_zapper_x = c->iarg;
+                g_zapper_y = c->barg;
+                s_trigger_override = 1;
+                printf("[Script] TRIGGER at (%d,%d)\n", g_zapper_x, g_zapper_y);
+                break;
+            case CMD_TRIGGER_OFF:
+                g_zapper_trigger = 0;
+                s_trigger_override = 0;
+                printf("[Script] TRIGGER_OFF\n");
+                break;
+            case CMD_KEY_TAP: {
+                SDL_Scancode scancode = parse_host_key(c->sarg);
+                SDL_Event key_event;
+                if (scancode == SDL_SCANCODE_UNKNOWN) {
+                    fprintf(stderr, "[Script] Unknown host key: %s\n", c->sarg);
+                    note_failure(frame, "KEY_TAP unknown key");
+                    break;
+                }
+                memset(&key_event, 0, sizeof(key_event));
+                key_event.type = SDL_KEYDOWN;
+                key_event.key.state = SDL_PRESSED;
+                key_event.key.keysym.scancode = scancode;
+                key_event.key.keysym.sym = SDL_GetKeyFromScancode(scancode);
+                int pushed = SDL_PushEvent(&key_event) == 1;
+                key_event.type = SDL_KEYUP;
+                key_event.key.state = SDL_RELEASED;
+                pushed = (SDL_PushEvent(&key_event) == 1) && pushed;
+                if (!pushed) {
+                    /* A dropped tap would leave the run silently untested. */
+                    fprintf(stderr, "[Script] KEY_TAP %s not delivered: %s\n",
+                            c->sarg, SDL_GetError());
+                    note_failure(frame, "KEY_TAP not delivered");
+                    break;
+                }
+                printf("[Script] KEY_TAP %s\n", c->sarg);
+                break;
+            }
+            default: break;
+        }
+        s_cmd_cursor++;
+    }
+
+    /* Reached end of script with no EXIT — treat as EXIT 0 */
+    if (s_cmd_cursor >= s_cmd_count) {
+        printf("[Script] Script complete at frame %llu\n", (unsigned long long)frame);
+        extern int g_nes_expected_exit;
+        g_nes_expected_exit = 1;
+        s_exit_code = script_exit_code(0);
+    }
+}
+
+int script_get_buttons(void) {
+    if (!s_loaded) return -1;
+    return (int)(uint8_t)s_buttons_held;
+}
+
+int script_check_exit(void) {
+    return s_exit_code;
+}
+
+int script_has_trigger_override(void) {
+    return s_trigger_override;
+}
+
+int script_wants_screenshot(char *buf, int buflen) {
+    if (!s_shot_pending[0]) return 0;
+    /* If path is absolute (starts with drive letter: or /), use as-is */
+    if (s_shot_pending[1] == ':' || s_shot_pending[0] == '/' || s_shot_pending[0] == '\\')
+        snprintf(buf, buflen, "%s", s_shot_pending);
+    else {
+        /* Relative names land in NESRECOMP_SHOT_DIR (default C:/temp), so
+         * concurrent runs can keep their captures apart. */
+        const char *dir = getenv("NESRECOMP_SHOT_DIR");
+        if (!dir || !dir[0]) dir = "C:/temp";
+        size_t n = strlen(dir);
+        int sep = dir[n-1] == '/' || dir[n-1] == '\\';
+        snprintf(buf, buflen, "%s%s%s", dir, sep ? "" : "/", s_shot_pending);
+    }
+    s_shot_pending[0] = '\0';
+    return 1;
+}
+
+void script_set_screenshot_prefix(const char *prefix) {
+    if (prefix)
+        snprintf(s_shot_prefix, sizeof(s_shot_prefix), "%s", prefix);
+    else
+        s_shot_prefix[0] = '\0';
+}
+
+/* ---- Recording ---- */
+static FILE    *s_rec_file      = NULL;
+static uint8_t  s_rec_prev_btn  = 0;
+static int      s_rec_prev_turbo = 0;
+static uint64_t s_rec_last_frame = 0;
+static int      s_rec_opened    = 0;
+
+void record_open(const char *path) {
+    s_rec_file = fopen(path, "w");
+    if (!s_rec_file) { fprintf(stderr, "[Record] Cannot open: %s\n", path); return; }
+    fprintf(s_rec_file, "# NES input recording\n");
+    fflush(s_rec_file);
+    s_rec_opened = 1;
+    printf("[Record] Recording to %s\n", path);
+}
+
+void record_close(void) {
+    if (!s_rec_file) return;
+    fprintf(s_rec_file, "EXIT 0\n");
+    fflush(s_rec_file);
+    fclose(s_rec_file);
+    s_rec_file = NULL;
+}
+
+void record_loadstate(uint64_t frame, const char *path) {
+    if (!s_rec_file) return;
+    uint64_t delta = frame - s_rec_last_frame;
+    fprintf(s_rec_file, "WAIT %llu\n", (unsigned long long)delta);
+    fprintf(s_rec_file, "LOAD_STATE %s\n", path);
+    fflush(s_rec_file);
+    s_rec_last_frame = frame;
+}
+
+/* Call immediately after savestate_load() to re-sync the recording's frame
+ * baseline to the restored frame count, preventing uint64_t underflow on
+ * the next record_tick() delta calculation. */
+void record_sync_frame(uint64_t frame) {
+    s_rec_last_frame = frame;
+}
+
+void record_tick(uint64_t frame, uint8_t buttons, int turbo) {
+    if (!s_rec_file) return;
+
+    uint8_t changed_btn   = buttons ^ s_rec_prev_btn;
+    int     changed_turbo = (turbo != s_rec_prev_turbo);
+
+    if (!changed_btn && !changed_turbo) return;
+
+    /* On first change (or after a gap) emit a WAIT */
+    uint64_t delta = frame - s_rec_last_frame;
+    if (delta > 0 || !s_rec_opened) {
+        fprintf(s_rec_file, "WAIT %llu\n", (unsigned long long)delta);
+        s_rec_opened = 0;
+    }
+    s_rec_last_frame = frame;
+
+    if (changed_turbo) {
+        fprintf(s_rec_file, "TURBO %s\n", turbo ? "ON" : "OFF");
+        s_rec_prev_turbo = turbo;
+    }
+
+    for (int i = 0; i < (int)NUM_BUTTONS; i++) {
+        if (!(changed_btn & s_buttons[i].mask)) continue;
+        if (buttons & s_buttons[i].mask)
+            fprintf(s_rec_file, "HOLD %s\n", s_buttons[i].name);
+        else
+            fprintf(s_rec_file, "RELEASE %s\n", s_buttons[i].name);
+    }
+    s_rec_prev_btn = buttons;
+    fflush(s_rec_file);
+}
+
+int script_get_player_buttons(int player) {
+    if (!s_loaded || player<1 || player>4) return -1;
+    return player==1 ? s_buttons_held : s_extra_buttons[player-2];
+}

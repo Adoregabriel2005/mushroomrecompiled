@@ -1,0 +1,43 @@
+# Local inputs and generated game code
+*.nes
+*.sav
+*.save
+*.bin
+/generated/
+/build/
+/releases/
+/roms/*
+!/roms/.gitkeep
+/node_modules/
+/.vscode/
+/.agents/
+/.codex/
+config.ini
+verify-frame*.png
+ui-*.png
+cycle-misses.txt
+# Binary toolchains/dependencies are fetched or attached to releases
+*.exe
+*.dll
+*.lib
+*.a
+*.obj
+*.pdb
+*.zip
+/tools/*
+!/tools/run-hidden.ps1
+!/tools/nesrecomp-src/
+/tools/nesrecomp-src/*
+!/tools/nesrecomp-src/common/
+!/tools/nesrecomp-src/recompiler/
+!/tools/nesrecomp-src/runner/
+!/tools/nesrecomp-src/LICENSE
+!/tools/nesrecomp-src/README.md
+/tools/nesrecomp-src/runner/external/
+# Only used, attributed artwork belongs in the public source package
+/assets/*
+!/assets/official-logo.png
+!/assets/official-key-art.png
+!/assets/official-cover.png
+!/assets/gamecontrollerdb.txt
+!/assets/app.ico

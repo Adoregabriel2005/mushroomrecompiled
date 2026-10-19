@@ -1,0 +1,454 @@
+<p align="center">
+  <img src="docs/assets/nesrecomp-logo.png" alt="NESRecomp" width="640">
+</p>
+
+# NESRecomp
+
+A static 6502 recompiler framework for NES games. Translates NES ROM machine code to C, which is then compiled to native machine code for direct execution on modern PCs.
+
+The default cycle backend translates ROM instructions to C that performs each
+CPU bus cycle against the NES hardware model. A generated interpreter handles
+code outside the compiled ROM views. The retained legacy backend uses direct
+C calls for guest subroutines and remains available explicitly.
+
+## How to use NESRecomp
+
+### Use the Windows CLI
+
+1. Open the [Releases](https://github.com/mstan/nesrecomp/releases) page.
+2. Download `nesrecomp-cli-windows-x86_64.zip`. Do not download GitHub's
+   "Source code" archives.
+3. Extract the zip to its own folder.
+4. Open PowerShell in that folder.
+5. Run:
+
+```powershell
+.\nesrecomp.exe build `
+  --rom "C:\Games\MyGame.nes" `
+  --output "C:\Projects\MyGameRecomp"
+```
+
+No BIOS file is needed. The output folder contains generated C source, a
+proposed `game.toml`, CMake files, and build scripts.
+
+To check that the generated source compiles:
+
+```powershell
+cd "C:\Projects\MyGameRecomp"
+.\build.ps1
+```
+
+This builds a static library. It does not create a playable game by itself.
+Each game still needs game-specific configuration and runner integration. Use
+one of the [Game Projects](#game-projects) as a starting point for a full port.
+Cycle output uses `generated/<name>_cyc*.c`. To generate the retained older
+backend, add `--legacy` (or `--backend legacy`). An explicit
+`[game] cycle_accurate = false` also selects legacy unless overridden with
+`--backend cycle`.
+
+If you already have a `game.toml`, pass it to the build command:
+
+```powershell
+.\nesrecomp.exe build `
+  --rom "C:\Games\MyGame.nes" `
+  --game "C:\Projects\MyGamePort\game.toml" `
+  --output "C:\Projects\MyGameRecomp"
+```
+
+NESRecomp does not include game ROMs.
+
+## Platform Support
+
+| Platform | Status |
+|----------|--------|
+| Windows (x64, MSVC) | Primary / mature |
+| macOS (Apple Silicon + Intel) | **Experimental — newly added** |
+| Other UNIX (Linux) | Likely works via the same POSIX path; less tested |
+
+macOS support is recent and should be considered experimental. The toolchain
+(recompiler + runner) builds cleanly with Apple Clang and games run natively —
+The Legend of Zelda, for example, plays well. Individual titles may show minor
+behavioral quirks that don't appear on Windows (Super Mario Bros. has some known
+timing/demo differences); please file an issue if you hit one. The macOS/POSIX
+port was contributed by [**Nat Budin (@nbudin)**](https://github.com/nbudin) in
+[#10](https://github.com/mstan/nesrecomp/pull/10) — thank you! 🙏
+
+## Game Projects
+
+| Game | Mapper | Status | Repository |
+|------|--------|--------|------------|
+| Super Mario Bros. | NROM (0) | Fully playable | [SuperMarioBrosNESRecomp](https://github.com/mstan/SuperMarioBrosNESRecomp) |
+| Duck Hunt | NROM (0) | Fully playable (mouse-as-Zapper) | [DuckHuntNESRecomp](https://github.com/mstan/DuckHuntNESRecomp) |
+| Dr. Mario | MMC1 (1) | Playable (1P tested) | [DrMarioNesRecomp](https://github.com/mstan/DrMarioNesRecomp) |
+| The Legend of Zelda | MMC1 (1) | Believed 100% playable | [LegendOfZeldaNESRecomp](https://github.com/mstan/LegendOfZeldaNESRecomp) |
+| Metroid | MMC1 (1) | Starting area playable, early foundation | [MetroidNESRecomp](https://github.com/mstan/MetroidNESRecomp) |
+| Faxanadu | MMC1 (1) | Fully playable, text override showcase | [FaxanaduRecomp](https://github.com/mstan/FaxanaduRecomp) |
+| Yoshi | MMC1 (1) | Believed fully playable | [YoshiNESRecomp](https://github.com/mstan/YoshiNESRecomp) |
+| Yoshi's Cookie | MMC3 (4) | Believed 100% playable | [YoshisCookieRecomp](https://github.com/mstan/YoshisCookieRecomp) |
+| Mega Man 3 | MMC3 (4) | Work in progress — title/menu/early stages playable | [Megaman3NESRecomp](https://github.com/mstan/Megaman3NESRecomp) |
+| Gumshoe | GxROM (66) | Playable end-to-end (mouse-as-Zapper, one HUD cosmetic bug) | [GumshoeNESRecomp](https://github.com/mstan/GumshoeNESRecomp) |
+
+### Mapper Support
+
+| Mapper | Name | Supported | Games |
+|--------|------|-----------|-------|
+| 0 | NROM | Yes | Super Mario Bros., Duck Hunt |
+| 1 | MMC1 / SxROM | Yes | Zelda, Metroid, Dr. Mario, Faxanadu, Yoshi |
+| 2 | UxROM | Not yet | — |
+| 3 | CNROM | Not yet | — |
+| 4 | MMC3 / TxROM | Yes | Yoshi's Cookie, Mega Man 3 |
+| 7 | AxROM | Not yet | — |
+| 9 | MMC2 / PxROM | Not yet | — |
+| 66 | GxROM | Yes | Gumshoe |
+
+Mappers 0, 1, 4, and 66 cover roughly 78% of the licensed NES library.
+
+### Voxel 3D presentation
+
+NESRecomp includes an opt-in, presentation-only Voxel 3D renderer for game
+projects that can describe their live tile map and sprites. It reconstructs
+solid tile geometry, camera-facing sprite cards, depth sorting, contact
+shadows, HUD preservation, and adjustable pitch, yaw, roll, zoom, and sprite
+scale. The software scene compositor consumes the normal NES frame and game
+metadata; it does not patch the player's ROM or change save data.
+
+[The Legend of Zelda](https://github.com/mstan/LegendOfZeldaNESRecomp) uses the
+renderer as an orbitable tabletop diorama, while
+[Super Mario Bros.](https://github.com/mstan/SuperMarioBrosNESRecomp) uses it
+as a forward-facing first-person experiment. Games opt in through trusted mod
+packages, so ordinary builds and launches remain on the stock rendering path
+unless the player enables Voxel 3D. See
+[`docs/VOXEL_RENDERER.md`](docs/VOXEL_RENDERER.md) for the host API and
+[`docs/MOD_PACKAGES.md`](docs/MOD_PACKAGES.md) for package integration.
+
+### Text Override System
+
+NESRecomp includes a runtime text replacement system that allows modifying in-game
+text without editing the ROM. The runner exposes writable PRG ROM bank accessors
+(`runner_get_prg_bank_rw()`) that game plugins use to patch string data at load time.
+
+[FaxanaduRecomp](https://github.com/mstan/FaxanaduRecomp) is the first game to
+exercise this feature, implementing a JSON-driven override system with:
+- Multiple encoding registries (ASCII, tile-based dialogue fonts)
+- PRG ROM patching for all rendering paths (direct PPU writes, DMA queues)
+- Hot-reload — edit `text_overrides.json` while the game is running and changes
+  apply within ~1 second
+
+This enables localization, retranslation, and accessibility improvements without
+ROM hacking. See `override_text.h` in FaxanaduRecomp for the full API.
+
+## Architecture
+
+```
+NES ROM (.nes)
+    |
+    v
+nesrecomp.exe build + optional game.toml
+    |
+    v
+generated/<game>_cyc.c       (compiled ROM-view dispatch)
+generated/<game>_cyc_b*.c    (6502 instructions expressed as CPU cycles)
+    |
+    v
+Game executable (linked with runner library + SDL2)
+```
+
+### Key Components
+
+| Component | Purpose |
+|-----------|---------|
+| `recompiler/src/cyc_codegen.c` | Default cycle-code emitter and generated fallback interpreter |
+| `runner/cyc/` | Cycle CPU, PPU, APU, mappers, host and enhancement adapters |
+| `runner/cyc/project.cmake` | Default game integration and build-time generation |
+| `recompiler/src/code_generator.c` | 6502-to-C emitter |
+| `recompiler/src/function_finder.c` | Static analysis: discovers functions via BFS from vectors |
+| `runner/src/runtime.c` | NES memory map, PPU register stubs, mapper |
+| `runner/src/ppu_renderer.c` | Background + sprite rendering (8x8 and 8x16) |
+| `runner/src/main_runner.c` | SDL2 window, NMI loop, frame timing |
+| `runner/src/debug_server.c` | TCP debug server with ring buffer |
+
+### Configuration Format
+
+Game configuration is **TOML** (`game.toml`). The legacy plain-text `.cfg` format
+has been removed — passing a `.cfg` path now prints a migration message and
+exits. All in-tree game projects already use `game.toml`; see Dr. Mario's
+`game.toml` or Faxanadu's for working examples.
+
+### Configurable Controls
+
+A `keybinds.ini` file is auto-generated next to the game executable on first run. Player 1 keyboard bindings and both players' gamepad bindings are configurable. Edit the INI file and restart the game to apply changes.
+
+**Keyboard** — the `[player1]` section maps each NES button to an SDL key name. Player 2 uses an explicitly assigned gamepad or netplay peer rather than sharing Player 1's keyboard. The default Player 1 Select key is `\`; Tab and F1–F12 are reserved runtime hotkeys.
+
+**Gamepad** — game controllers are supported cross-platform via SDL's
+`SDL_GameController` API (Xbox, PlayStation/DualSense, Switch Pro, and generic
+pads; on Windows this uses XInput under the hood). The first connected pad is
+NES port 1, the second is port 2, and hotplug is handled — plug in or unplug at
+any time. Keyboard and gamepad input are merged, so both work simultaneously and
+no configuration is required to start playing.
+
+`[gamepad1]` / `[gamepad2]` sections make the mapping fully editable. Each NES
+button takes a comma-separated list of SDL controller button names (so multiple
+physical buttons can drive one NES button). Defaults:
+
+```ini
+[gamepad1]
+a = a,b          ; both right-hand face buttons act as NES A
+b = x,y          ; both left-hand face buttons act as NES B
+select = back
+start = start
+up = dpup
+down = dpdown
+left = dpleft
+right = dpright
+deadzone = 16000 ; left-stick threshold (0-32767)
+analog = true    ; left analog stick also drives the d-pad
+```
+
+Valid button names: `a b x y back start guide leftshoulder rightshoulder
+leftstick rightstick dpup dpdown dpleft dpright` (use `none` to unbind).
+
+### Display
+
+| Hotkey | Action |
+|--------|--------|
+| `Tab` | Toggle turbo (fast-forward) |
+| `F1`–`F12` | Load state slot 1–12 |
+| `Shift+F1`–`Shift+F12` | Save state slot 1–12 |
+| `Alt+Enter` | Toggle fullscreen (borderless desktop) |
+
+State slots are stored in the `savestates` directory next to the game executable.
+
+The picture preserves the NES aspect ratio with integer (whole-pixel) scaling
+and nearest-neighbor filtering, so it letterboxes rather than stretching and
+stays crisp at any window or screen size.
+
+### Fallback Discovery Logs
+
+Interpreter fallback discovery is durable by default. The runner appends two
+files next to the game executable:
+
+- `dispatch_misses.log` contains one manifest-ready `extra_func` line for each
+  first-seen bank/address pair.
+- `fallback_telemetry.jsonl` contains an immediately flushed
+  `dispatch_discovery` record for each first sighting, plus approximately
+  once-per-second samples of interpreter instructions, runs, native handoffs,
+  per-target call counts, and per-entry instruction hotspots (including
+  save-state continuation entries). A final `session_end` record is appended
+  on a normal exit. Discovery records and completed samples survive a later
+  crash.
+
+Both logs append across play sessions. Set `NESRECOMP_FALLBACK_LOG` to a custom
+JSONL path, or to `off`, to override the telemetry file. Per-dispatch disk
+writes are intentionally limited to first sightings; repeated hot targets are
+aggregated into periodic samples so observation does not create gameplay
+slowdown.
+
+### game.toml Directives
+
+The full schema lives in `recompiler/src/game_config.c`; the most commonly used
+sections are summarized below.
+
+| Section | Purpose |
+|---------|---------|
+| `[game]` | Output prefix, symbol file path, and recompiler flags (`push_all_jsr`, `disable_ptr_scan`, `deduplicate_functions`, ...) |
+| `[mapper] bank_switch = [...]` | Addresses of MMC1/mapper bank-switch routines |
+| `[[inline_dispatch]] addr` | Indexed dispatch via inline address table after JSR |
+| `[[inline_pointer]] addr, zp = [lo, hi], call` | JSR reads 2 inline bytes into zero page; `call` also invokes the resulting target |
+| `[[extra_func]] bank, addr` | Force-create a function entry at this address |
+| `[[extra_label]] bank, addr` | Secondary entry point within an existing function |
+| `[[sram_map]] sram_start, rom_start, bank, size` | SRAM-to-ROM code mapping |
+| `[[nop_jsr]] addr` | Skip this JSR entirely (stack-manipulation routines incompatible with recompilation) |
+| `[[data_region]] bank, start, end` | Exclude byte range from pointer scanner (known data, not code) |
+| `[functions] fixed = [...], bankN = [...]` | Bulk `extra_func` lists keyed by bank |
+| `[force_interp] fixed = [...], bankN = [...]` | Seed entries that always execute as interpreter islands |
+
+Numeric values may be given in hex (`0xC000`) or decimal. Address-only directives
+are TOML arrays of tables; per-bank lists under `[functions]` and
+`[force_interp]` accept plain integer arrays.
+
+### Optional Cross-Bank Function Deduplication
+
+Banked games can opt into a conservative post-processing pass that shares
+identical generated function bodies:
+
+```toml
+[game]
+deduplicate_functions = true
+```
+
+The pass is disabled by default because its benefit depends on the game. It
+merges functions only when their generated C is byte-for-byte equal after
+normalizing the function's own symbol; bank constants, callees, mapper state,
+fallback behavior, and all other emitted code must still match. The lowest
+bank/address is retained as the shared implementation, while every original
+public function symbol remains available through a thin forwarding wrapper.
+
+Each run writes `generated/<prefix>_function_groups.json` with the proof hash,
+representative, group members, and estimated duplicate body bytes. Review this
+manifest and compare generated-source or build sizes before enabling the option
+for a game: some titles save substantially, while titles without proven groups
+may see no reduction. `[[dedup_exclude]]` can keep a member independent, and
+`[[replace_func]] scope = "group"` can replace an entire proven group. See
+[`MODDING.md`](MODDING.md#shared-cross-bank-functions) for those directives and
+external replacement examples.
+
+### Function Discovery: Table-Run Scanner
+
+The recompiler discovers functions in two phases:
+
+1. **BFS from vectors**: Walk RESET/NMI/IRQ, follow JSR/JMP, discover all statically reachable functions.
+2. **Pointer table scanner**: Find dynamically-dispatched functions (enemy AI handlers, state machine callbacks) that are only reachable via indirect jumps at runtime.
+
+The table-run scanner finds pointer tables by looking for runs of 4+ consecutive 16-bit LE values in $8000-$BFFF where each target passes a deep-decode validation (7+ valid 6502 instructions without hitting an illegal opcode, or clean termination via RTS/JMP).
+
+It scans both:
+- **Switchable banks** (tables embedded in the same bank as handlers)
+- **Fixed bank → switchable** (dispatch tables in the fixed bank pointing to switchable bank handlers)
+
+This catches dispatch patterns that use indirect addressing (`(ZP),Y`, stack-based) where no direct `abs,X`/`abs,Y` code reference to the table exists.
+
+Set `NESRECOMP_LEGACY_FUNCTION_FINDER=1` to disable the newer heuristic discovery passes and fall back to the older BFS-first finder behavior for comparison runs.
+
+**Harmful vs harmless false positives**: The deep-decode check eliminates "harmful" false positives (data misidentified as code, which would generate invalid C). "Harmless" false positives (valid code in another bank's context) are accepted — they generate unused but compilable functions. Adding `data_region` entries for known data areas eliminates remaining edge cases where structured data happens to decode as 7+ valid instructions.
+
+**Expected results** (validated against Zelda with exhaustive disassembly ground truth):
+- ~80-93% recall of dispatch table targets, 0 harmful false positives
+- Remaining targets (small inline tables, direct-call-only functions) require `extra_func` entries
+
+### extra_func vs extra_label
+
+- **`extra_func`**: Creates a standalone function. Use for addresses NOT inside any existing function.
+- **`extra_label`**: Creates a secondary entry point within the parent function that contains this address. The parent emits a `_body(int _entry)` function with switch/goto dispatch. Use for addresses that fall inside existing functions (e.g., SRAM-mapped subroutines within a larger code block).
+
+This distinction is critical when importing complete disassembly function lists. Adding an address as `extra_func` when it's inside an existing function **splits that function**, breaking internal gotos and causing freezes. `extra_label` preserves the parent's control flow while making the address callable from the dispatch table.
+
+### Undocumented 6502 Opcodes
+
+The NMOS 6502 has 256 possible opcodes but only 151 are officially documented. The remaining 105 have deterministic behavior on the physical chip because the internal decode logic combines signals from multiple "official" instruction paths. NESRecomp's decoder (`cpu6502_decoder.c`) recognizes every undocumented opcode with the correct size and cycle count; the code generator emits real semantics for the ones that NES games actually use, and treats the rest as sized NOPs (the instruction stream stays byte-aligned, but side effects are lost).
+
+**Emitted with full semantics:**
+
+| Opcode | Name | Behavior |
+|--------|------|----------|
+| LAX | Load A+X | `A = X = mem`, sets N/Z. Used by *Elite*, *Super Cars*, etc. |
+| SAX | Store A&X | `mem = A & X`. No flags, no register changes. |
+| DOP / TOP (NOP*) | 2-/3-byte NOP-with-read | Performs the operand read (so `$2002` PPUSTATUS latch clears correctly) and discards the result. Immediate variants skip the operand byte without a read. |
+
+**Recognized but currently emitted as sized NOPs (skipped, side effects lost):**
+
+DCP, ISC, SLO, RLA, SRE, RRA, ANC, ALR, ARR, AXS, KIL, plus the rarely-seen
+SHX/SHY/SHA/TAS/LAS family. A game that depends on, for example, `DCP zp` to
+decrement-and-compare in one step will misbehave. None of the games currently
+in this project rely on these — when one does, fill in the missing emit logic
+in `code_generator.c` alongside LAX/SAX (the decoder already provides the
+addressing mode and operand size).
+
+**Dispatch safety:** the function finder rejects candidate function entry
+points whose first byte decodes as `MN_ILLEGAL`, so byte values in the illegal
+range that appear inside data tables don't get misidentified as code and
+executed.
+
+## Build NESRecomp from source
+
+CMake 3.20+ is required. The recompiler itself is pure C11 with no external
+dependencies; game runners additionally need SDL2.
+
+### Windows (Visual Studio 2022)
+
+```bash
+# Build the recompiler
+cmake -S recompiler -B build/recompiler -G "Visual Studio 17 2022" -A x64
+cmake --build build/recompiler --config Release
+
+# Recompile a game ROM
+build/recompiler/Release/NESRecomp.exe <rom.nes> --game <path/to/game.toml>
+```
+
+To build the same self-contained Windows zip published on the Releases page,
+install Python 3.12 and PyInstaller, then run:
+
+```powershell
+py -3.12 -m pip install pyinstaller
+py -3.12 tools/build_cli.py
+```
+
+The zip is written to `build/cli-release/`.
+
+### macOS / Linux
+
+```bash
+# Install prerequisites (macOS / Homebrew shown; use your distro's packages on Linux)
+brew install cmake sdl2 ninja
+
+# Build the recompiler
+cmake -S recompiler -B build/recompiler -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build/recompiler
+
+# Recompile a game ROM (note: no .exe suffix)
+build/recompiler/NESRecomp <rom.nes> --game <path/to/game.toml>
+```
+
+Game projects build the same way on macOS/Linux — from the game directory, run
+its `setup.sh` to fetch the pinned nesrecomp, then:
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+cmake --build build
+```
+
+## Adding a New Game
+
+See [CLAUDE.md](CLAUDE.md) for detailed instructions. In short:
+
+1. Copy [FaxanaduRecomp](https://github.com/mstan/FaxanaduRecomp) as a boilerplate
+2. Create `game.toml` with mapper, bank switch, and dispatch configuration
+3. Create `extras.c` implementing the `game_extras.h` hook interface
+4. Run `NESRecomp.exe <rom.nes> --game game.toml` to generate C code
+5. Build with CMake, linking against the runner library and SDL2
+
+## Cycle-Accurate Mode
+
+Cycle-accurate generation is the default. `--cycle-accurate` explicitly selects
+it; `--legacy` selects the retained function/frame backend. An explicit
+`[game] cycle_accurate = false` also selects legacy, and a command-line backend
+selection takes precedence over the file. A missing key uses cycle mode.
+It emits one block per
+ROM instruction with every CPU cycle's bus activity spelled out, against
+NESRecomp's own cycle-accurate 6502; the fallback interpreter is generated from
+the same templates. The CPU, PPU, APU, DMAs and mappers are NESRecomp's own
+(`runner/cyc/hw_*.c`), and TriCNES's complete machine is kept only as a test
+oracle. The runner is `runner/cyc`.
+
+See [the mapper catalog](runner/cyc/MAPPERS.md) for supported cartridge boards.
+A block is generated per
+(PRG bank, CPU address) pair and entered only while the cartridge has that bank
+mapped there, since the bytes a block folded to constants depend on it. A
+recompiled AccuracyCoin passes 144/144, and scripted playthroughs of Super Mario
+Bros. 3 (MMC3), Mega Man 2 (MMC1), Mega Man (UxROM) and Donkey Kong Original
+Edition (CNROM) run at 100% native; all of them match the oracle on every bus
+access at all four CPU/PPU alignments. AxROM and GxROM have not been run with a
+game in the original qualification. See [runner/cyc/README.md](runner/cyc/README.md); AccuracyCoin is set
+up as a test in `runner/cyc/tests/accuracycoin`.
+
+## Acknowledgements
+
+- [**TriCNES**](https://github.com/100thCoin/TriCNES) by Chris Siebert (MIT) —
+  the PPU/APU model behind cycle-accurate mode and its reference oracle
+  (`runner/cyc/tric_core.cpp`).
+
+- [**Nat Budin (@nbudin)**](https://github.com/nbudin) — macOS / POSIX build
+  support ([#10](https://github.com/mstan/nesrecomp/pull/10)): POSIX `ucontext`
+  coroutine backend, cross-platform directory creation, and the compiler-flag
+  groundwork that made native macOS builds possible.
+
+---
+
+<p align="center">
+  <sub><b>R.A.I.D. — Retro AI Development</b> · a Discord for AI-assisted retro reverse-engineering, decomp &amp; recomp</sub>
+</p>
+
+<p align="center">
+  <a href="https://discord.gg/Ad9BwSzctP"><img src=".github/raid-discord.png" alt="Join the Retro AI Development (R.A.I.D.) Discord" width="200"></a>
+</p>

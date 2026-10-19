@@ -1,0 +1,67 @@
+/*
+ * mod_audio.h -- small host-side PCM overlay mixer for trusted game mods.
+ *
+ * Clips are immutable mono signed-16 PCM at the NES runner's 44100 Hz output
+ * rate. Registration copies the caller's samples, so a game may release its
+ * loader buffer immediately. Playback is mixed into the same frame as the NES
+ * APU; it never opens a second audio device and therefore stays synchronized
+ * with the runner's existing volume and clock-domain bridge.
+ *
+ * All functions are called on the emulation thread. The audio callback only
+ * consumes the already-mixed bridge output and never touches this state.
+ */
+#pragma once
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef int NESModAudioClip;
+
+#define NES_MOD_AUDIO_CLIP_INVALID 0
+#define NES_MOD_AUDIO_SAMPLE_RATE 44100
+
+/* Copies `frame_count` mono samples and returns a positive handle, or zero. */
+NESModAudioClip nes_mod_audio_register_pcm_s16_mono(
+    const int16_t *samples, uint32_t frame_count);
+
+/* Stops voices using the clip and releases its copied sample data. */
+void nes_mod_audio_unregister(NESModAudioClip clip);
+
+/* Starts a one-shot. gain_percent is clamped to 0..200. Returns 1 on success. */
+int nes_mod_audio_play(NESModAudioClip clip, int gain_percent);
+
+/* Starts (or updates) the one persistent loop associated with `clip`.
+ * Calling this repeatedly is deliberately idempotent: a host can reconcile
+ * serialized gameplay state every tick without creating duplicate loops.
+ * The loop starts at sample zero when it did not already exist. */
+int nes_mod_audio_play_loop(NESModAudioClip clip, int gain_percent);
+
+/* Stops the persistent loop for `clip`, leaving one-shots of the same clip
+ * alone. This is safe for an invalid or already-stopped handle. */
+void nes_mod_audio_stop_loop(NESModAudioClip clip);
+
+/* Stops every overlay voice without unregistering clips. Save-state loads use
+ * this to discard host delivery state instead of replaying a stale call. */
+void nes_mod_audio_stop_all(void);
+
+/* A live stream, for mods that synthesize audio as it plays (for example an
+ * emulated sound chip driven by gameplay). `render` fills `frame_count` mono
+ * samples at NES_MOD_AUDIO_SAMPLE_RATE, which the mixer adds to the frame;
+ * `reset` (optional) silences the source and runs from nes_mod_audio_stop_all.
+ * There is one stream slot; setting a new stream replaces the old one, and
+ * passing NULL removes it. */
+typedef void (*NESModAudioStreamRender)(void *user, int16_t *samples,
+                                        int frame_count);
+typedef void (*NESModAudioStreamReset)(void *user);
+void nes_mod_audio_set_stream(NESModAudioStreamRender render,
+                              NESModAudioStreamReset reset, void *user);
+
+/* Runner-internal producer step: saturating-add active overlays into `dst`. */
+void nes_mod_audio_mix(int16_t *dst, int frame_count);
+
+#ifdef __cplusplus
+}
+#endif

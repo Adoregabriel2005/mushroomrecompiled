@@ -1,0 +1,2207 @@
+/*
+ * debug_server.c — TCP debug server for NES recomp (shared runner)
+ *
+ * Single-threaded, non-blocking TCP server polled once per frame.
+ * JSON-over-newline protocol on localhost:4370.
+ *
+ * Game-specific commands are dispatched via game_handle_debug_cmd() hook.
+ * Game-specific frame data is filled via game_fill_frame_record() hook.
+ *
+ * Modeled after:
+ *   segagenesisrecomp-v2/sonicthehedgehog/runner/cmd_server.c
+ *   snesrecomp-v2/src/debug_server.c
+ */
+#include "debug_server.h"
+#include "savestate.h"
+#include "game_extras.h"
+#include "nes_runtime.h"
+#include "input_script.h"
+#include "interp.h"
+#include "save_ram.h"
+#include "foreign_controller.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <stdint.h>
+
+/* ---- Platform sockets ---- */
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  pragma comment(lib, "ws2_32.lib")
+   typedef SOCKET sock_t;
+#  define SOCK_INVALID INVALID_SOCKET
+#  define sock_close closesocket
+#  define SOCK_WOULDBLOCK WSAEWOULDBLOCK
+   static int sock_error(void) { return WSAGetLastError(); }
+#else
+#  include <sys/socket.h>
+#  include <netinet/in.h>
+#  include <arpa/inet.h>
+#  include <unistd.h>
+#  include <fcntl.h>
+#  include <errno.h>
+   typedef int sock_t;
+#  define SOCK_INVALID (-1)
+#  define sock_close close
+#  define SOCK_WOULDBLOCK EWOULDBLOCK
+   static int sock_error(void) { return errno; }
+#endif
+
+#include <SDL.h>  /* for SDL_PollEvent in pause loop */
+
+/* Render-IRQ diagnostic (defined in ppu_renderer.c) */
+extern int      g_render_irq_fired;
+extern int      g_render_irq_scanline;
+extern uint8_t  g_render_irq_ppuctrl_before;
+extern uint8_t  g_render_irq_ppuctrl_after;
+extern uint8_t  g_render_irq_scrollx_after;
+extern uint8_t  g_render_irq_scrolly_after;
+extern uint8_t  g_render_post_irq_ppuctrl_row;
+extern int      g_render_post_irq_chr_base;
+extern int      g_render_post_irq_origin_y;
+extern int      g_render_post_irq_phys_nt;
+extern int      g_render_post_irq_use_hud;
+extern int      g_render_post_irq_split_y;
+
+/* ---- Server state ---- */
+static sock_t s_listen  = SOCK_INVALID;
+static sock_t s_client  = SOCK_INVALID;
+static int    s_port    = 4370;
+
+#define RECV_BUF_SIZE 8192
+static char s_recv_buf[RECV_BUF_SIZE];
+static int  s_recv_len = 0;
+
+/* ---- Pause / step ---- */
+static volatile int s_paused     = 0;
+static int          s_step_count = 0;   /* frames remaining in step mode */
+static uint32_t     s_run_to     = 0;   /* target frame for run_to_frame (0=disabled) */
+
+/* ---- Input override ---- */
+static int s_input_override = -1;  /* -1 = no override */
+static int s_input_frames   = 0;   /* frames remaining for auto-clear (0=permanent) */
+
+/* ---- Ring buffer (heap-allocated, ~540MB for full-state snapshots) ---- */
+static NESFrameRecord *s_frame_history = NULL;
+static uint64_t        s_history_count = 0;
+
+/* ---- Verify-mode pending state ----
+ * Caller (a game's verify_mode.c) calls debug_server_set_verify_result()
+ * after running the diff for the current frame. record_frame() consumes
+ * these and writes them into the new record at frame end. The deferred
+ * pattern avoids any assumption about whether set_verify_result() runs
+ * before or after the frame's record_frame() in the host loop. */
+static int            s_pending_verify_set        = 0;
+static int            s_pending_verify_pass       = -1;
+static int            s_pending_verify_diff_count = 0;
+static FrameDiffEntry s_pending_verify_diffs[MAX_FRAME_DIFFS];
+static int            s_pending_verify_n_diffs    = 0;
+
+/* ---- Recomp stack (extern if available) ---- */
+#ifdef RECOMP_STACK_TRACKING
+extern const char *g_recomp_stack[];
+extern int         g_recomp_stack_top;
+extern const char *g_last_recomp_func;
+#else
+static const char *g_last_recomp_func = "(no stack tracking)";
+#endif
+
+/* ---- Watchdog externs (defined in game's watchdog.c or extras.c) ---- */
+/* Every game must define these three globals (use zero/NULL for stubs). */
+extern int         g_watchdog_triggered;
+extern uint32_t    g_watchdog_frame;
+extern const char *g_watchdog_stack_dump;
+
+/* ---- Platform helpers ---- */
+static void set_nonblocking(sock_t s)
+{
+#ifdef _WIN32
+    u_long mode = 1;
+    ioctlsocket(s, FIONBIO, &mode);
+#else
+    int flags = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, flags | O_NONBLOCK);
+#endif
+}
+
+/* ---- JSON helpers (hand-parsed, no library) ---- */
+
+static const char *json_get_str(const char *json, const char *key,
+                                 char *out, int out_sz)
+{
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return NULL;
+    p += strlen(pattern);
+    while (*p == ' ' || *p == ':') p++;
+    if (*p == '"') {
+        p++;
+        int i = 0;
+        while (*p && *p != '"' && i < out_sz - 1)
+            out[i++] = *p++;
+        out[i] = '\0';
+        return out;
+    }
+    /* Unquoted value (number etc) */
+    {
+        int i = 0;
+        while (*p && *p != ',' && *p != '}' && *p != ' ' && i < out_sz - 1)
+            out[i++] = *p++;
+        out[i] = '\0';
+        return out;
+    }
+}
+
+static int json_get_int(const char *json, const char *key, int def)
+{
+    char buf[64];
+    if (!json_get_str(json, key, buf, sizeof(buf))) return def;
+    return atoi(buf);
+}
+
+static uint32_t hex_to_u32(const char *s)
+{
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    return (uint32_t)strtoul(s, NULL, 16);
+}
+
+/* ---- Send helpers (public API) ---- */
+
+/* Temporarily switch socket to blocking, send all bytes, restore non-blocking.
+ * This avoids WOULDBLOCK retry loops that can re-enter the game loop via
+ * SDL_Delay and corrupt state (e.g. watchdog firing during send). */
+static void send_all_blocking(sock_t sock, const char *data, int len)
+{
+#ifdef _WIN32
+    u_long mode = 0;  /* blocking */
+    ioctlsocket(sock, FIONBIO, &mode);
+#else
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
+#endif
+
+    int sent = 0;
+    while (sent < len) {
+        int n = send(sock, data + sent, len - sent, 0);
+        if (n > 0) { sent += n; continue; }
+        break;  /* error — give up */
+    }
+
+#ifdef _WIN32
+    mode = 1;  /* non-blocking */
+    ioctlsocket(sock, FIONBIO, &mode);
+#else
+    fcntl(sock, F_SETFL, flags);
+#endif
+}
+
+void debug_server_send_line(const char *json)
+{
+    if (s_client == SOCK_INVALID) return;
+    int len = (int)strlen(json);
+    send_all_blocking(s_client, json, len);
+    send_all_blocking(s_client, "\n", 1);
+}
+
+void debug_server_send_fmt(const char *fmt, ...)
+{
+    char buf[16384];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    debug_server_send_line(buf);
+}
+
+/* Internal short aliases */
+#define send_line  debug_server_send_line
+#define send_fmt   debug_server_send_fmt
+
+static void send_ok(int id)
+{
+    send_fmt("{\"id\":%d,\"ok\":true}", id);
+}
+
+static void send_err(int id, const char *msg)
+{
+    send_fmt("{\"id\":%d,\"ok\":false,\"error\":\"%s\"}", id, msg);
+}
+
+/* ---- RAM access helpers ---- */
+
+/* Read a byte from the NES address space (mirroring g_ram/g_sram/PPU) */
+static uint8_t read_byte(uint32_t addr)
+{
+    if (addr < 0x0800)
+        return g_ram[addr];
+    if (addr < 0x2000)
+        return g_ram[addr & 0x07FF];  /* RAM mirrors */
+    if (addr >= 0x6000 && addr < 0x8000)
+        return g_sram[addr - 0x6000];
+    /* PPU nametable */
+    if (addr >= 0x2000 && addr < 0x3000)
+        return g_ppu_nt[addr - 0x2000];
+    /* PPU palette */
+    if (addr >= 0x3F00 && addr < 0x3F20)
+        return g_ppu_pal[addr - 0x3F00];
+    /* OAM (via separate array) */
+    if (addr >= 0xFE00 && addr < 0xFF00)
+        return g_ppu_oam[addr - 0xFE00];
+    return 0;
+}
+
+static void write_byte(uint32_t addr, uint8_t val)
+{
+    if (addr < 0x0800)
+        g_ram[addr] = val;
+    else if (addr < 0x2000)
+        g_ram[addr & 0x07FF] = val;
+    else if (addr >= 0x6000 && addr < 0x8000) {
+        uint8_t *slot = &g_sram[addr - 0x6000];
+        if (*slot != val) {
+            *slot = val;
+            save_ram_mark_dirty();
+        }
+    }
+}
+
+/* ---- Command handlers ---- */
+
+static void handle_ping(int id, const char *json)
+{
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,\"frame\":%llu}",
+             id, (unsigned long long)g_frame_count);
+}
+
+static void handle_frame(int id, const char *json)
+{
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,\"frame\":%llu,\"last_func\":\"%s\"}",
+             id, (unsigned long long)g_frame_count, g_last_recomp_func);
+}
+
+static void handle_get_registers(int id, const char *json)
+{
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"A\":\"0x%02X\",\"X\":\"0x%02X\",\"Y\":\"0x%02X\","
+             "\"S\":\"0x%02X\",\"P\":\"0x%02X\","
+             "\"N\":%d,\"V\":%d,\"D\":%d,\"I\":%d,\"Z\":%d,\"C\":%d,"
+             "\"bank\":%d,\"frame\":%llu}",
+             id, g_cpu.A, g_cpu.X, g_cpu.Y, g_cpu.S, g_cpu.P,
+             g_cpu.N, g_cpu.V, g_cpu.D, g_cpu.I, g_cpu.Z, g_cpu.C,
+             g_current_bank, (unsigned long long)g_frame_count);
+}
+
+static void handle_read_ram(int id, const char *json)
+{
+    char addr_str[32];
+    if (!json_get_str(json, "addr", addr_str, sizeof(addr_str))) {
+        send_err(id, "missing addr");
+        return;
+    }
+    uint32_t addr = hex_to_u32(addr_str);
+    int len = json_get_int(json, "len", 1);
+    if (len < 1) len = 1;
+    if (len > 256) len = 256;
+
+    /* Build hex string */
+    char hex[513];
+    for (int i = 0; i < len; i++)
+        snprintf(hex + i * 2, 3, "%02x", read_byte(addr + i));
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"addr\":\"0x%04X\",\"len\":%d,\"hex\":\"%s\"}",
+             id, addr, len, hex);
+}
+
+static void handle_dump_ram(int id, const char *json)
+{
+    char addr_str[32];
+    if (!json_get_str(json, "addr", addr_str, sizeof(addr_str))) {
+        send_err(id, "missing addr");
+        return;
+    }
+    uint32_t addr = hex_to_u32(addr_str);
+    int len = json_get_int(json, "len", 256);
+    if (len < 1) len = 1;
+    if (len > 8192) len = 8192;
+
+    /* Send in chunks of 256 bytes */
+    int offset = 0;
+    while (offset < len) {
+        int chunk = len - offset;
+        if (chunk > 256) chunk = 256;
+        char hex[513];
+        for (int i = 0; i < chunk; i++)
+            snprintf(hex + i * 2, 3, "%02x", read_byte(addr + offset + i));
+        send_fmt("{\"id\":%d,\"ok\":true,\"addr\":\"0x%04X\",\"offset\":%d,\"len\":%d,\"hex\":\"%s\"}",
+                 id, addr + offset, offset, chunk, hex);
+        offset += chunk;
+    }
+}
+
+static void handle_write_ram(int id, const char *json)
+{
+    char addr_str[32], val_str[32];
+    if (!json_get_str(json, "addr", addr_str, sizeof(addr_str))) {
+        send_err(id, "missing addr");
+        return;
+    }
+    if (!json_get_str(json, "val", val_str, sizeof(val_str))) {
+        send_err(id, "missing val");
+        return;
+    }
+    uint32_t addr = hex_to_u32(addr_str);
+    uint8_t val = (uint8_t)hex_to_u32(val_str);
+    write_byte(addr, val);
+    send_ok(id);
+}
+
+static void handle_read_ppu(int id, const char *json)
+{
+    char addr_str[32];
+    if (!json_get_str(json, "addr", addr_str, sizeof(addr_str))) {
+        send_err(id, "missing addr");
+        return;
+    }
+    uint32_t addr = hex_to_u32(addr_str);
+    int len = json_get_int(json, "len", 1);
+    if (len < 1) len = 1;
+    if (len > 256) len = 256;
+
+    char hex[513];
+    for (int i = 0; i < len; i++) {
+        uint32_t a = addr + i;
+        uint8_t v = 0;
+        if (a < 0x2000)
+            v = g_chr_ram[a];
+        else if (a < 0x3000)
+            v = g_ppu_nt[a - 0x2000];
+        else if (a >= 0x3F00 && a < 0x3F20)
+            v = g_ppu_pal[a - 0x3F00];
+        snprintf(hex + i * 2, 3, "%02x", v);
+    }
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"addr\":\"0x%04X\",\"len\":%d,\"hex\":\"%s\"}",
+             id, addr, len, hex);
+}
+
+static void handle_mapper_state(int id, const char *json)
+{
+    (void)json;
+    MapperState ms;
+    mapper_get_state(&ms);
+    send_fmt("{\"id\":%d,\"ok\":true,\"bank\":%d,"
+             "\"type\":%d,\"mirror\":%d,"
+             "\"mmc3_bank_sel\":%d,"
+             "\"mmc3_regs\":[%d,%d,%d,%d,%d,%d,%d,%d],"
+             "\"mmc3_irq_latch\":%d,\"mmc3_irq_counter\":%d,"
+             "\"mmc3_irq_reload\":%d,\"mmc3_irq_enabled\":%d}",
+             id, g_current_bank,
+             ms.mapper_type, ms.mirroring,
+             ms.mmc3_bank_select,
+             ms.mmc3_regs[0], ms.mmc3_regs[1],
+             ms.mmc3_regs[2], ms.mmc3_regs[3],
+             ms.mmc3_regs[4], ms.mmc3_regs[5],
+             ms.mmc3_regs[6], ms.mmc3_regs[7],
+             ms.mmc3_irq_latch, ms.mmc3_irq_counter,
+             ms.mmc3_irq_reload, ms.mmc3_irq_enabled);
+}
+
+static void handle_set_input(int id, const char *json)
+{
+    char val_str[32];
+    if (!json_get_str(json, "buttons", val_str, sizeof(val_str))) {
+        send_err(id, "missing buttons");
+        return;
+    }
+    s_input_override = (int)hex_to_u32(val_str);
+    s_input_frames = 0;  /* permanent until clear_input */
+    send_ok(id);
+}
+
+/* press: set input for exactly N frames, then auto-clear.
+ * Useful for edge-triggered buttons (Start on title screen). */
+static void handle_press(int id, const char *json)
+{
+    int buttons = json_get_int(json, "buttons", -1);
+    int frames  = json_get_int(json, "frames", 2);  /* default: 2 frames */
+    if (buttons < 0) { send_err(id, "missing buttons"); return; }
+    s_input_override = buttons;
+    s_input_frames   = frames;
+    send_ok(id);
+}
+
+static void handle_clear_input(int id, const char *json)
+{
+    (void)json;
+    s_input_override = -1;
+    s_input_frames   = 0;
+    send_ok(id);
+}
+
+static void handle_set_turbo(int id, const char *json)
+{
+    int enabled = json_get_int(json, "enabled", -1);
+    if (enabled < 0) { send_err(id, "missing enabled"); return; }
+    g_turbo = enabled != 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"turbo\":%s}",
+             id, g_turbo ? "true" : "false");
+}
+
+static void handle_pause(int id, const char *json)
+{
+    (void)json;
+    s_paused = 1;
+    send_fmt("{\"id\":%d,\"ok\":true,\"paused\":true,\"frame\":%llu}",
+             id, (unsigned long long)g_frame_count);
+}
+
+static void handle_continue(int id, const char *json)
+{
+    (void)json;
+    s_paused = 0;
+    s_step_count = 0;
+    s_run_to = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"paused\":false}", id);
+}
+
+static void handle_step(int id, const char *json)
+{
+    int n = json_get_int(json, "count", 1);
+    if (n < 1) n = 1;
+    s_step_count = n;
+    s_paused = 0;  /* unpause for N frames, then re-pause */
+    send_fmt("{\"id\":%d,\"ok\":true,\"stepping\":%d}", id, n);
+}
+
+static void handle_run_to_frame(int id, const char *json)
+{
+    int target = json_get_int(json, "frame", 0);
+    if (target <= (int)g_frame_count) {
+        send_err(id, "target frame already passed");
+        return;
+    }
+    s_run_to = (uint32_t)target;
+    s_paused = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"running_to\":%d}", id, target);
+}
+
+/* ---- Ring buffer queries ---- */
+
+static void handle_history(int id, const char *json)
+{
+    (void)json;
+    uint64_t oldest = (s_history_count > FRAME_HISTORY_CAP)
+                    ? s_history_count - FRAME_HISTORY_CAP : 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"count\":%llu,\"oldest\":%llu,\"newest\":%llu}",
+             id,
+             (unsigned long long)s_history_count,
+             (unsigned long long)oldest,
+             (unsigned long long)(s_history_count > 0 ? s_history_count - 1 : 0));
+}
+
+static void handle_get_frame(int id, const char *json)
+{
+    int f = json_get_int(json, "frame", -1);
+    if (f < 0) { send_err(id, "missing frame"); return; }
+
+    uint64_t oldest = (s_history_count > FRAME_HISTORY_CAP)
+                    ? s_history_count - FRAME_HISTORY_CAP : 0;
+    if ((uint64_t)f < oldest || (uint64_t)f >= s_history_count) {
+        send_err(id, "frame not in buffer");
+        return;
+    }
+
+    uint32_t idx = (uint32_t)f % FRAME_HISTORY_CAP;
+    const NESFrameRecord *r = &s_frame_history[idx];
+    if (r->frame_number != (uint32_t)f) {
+        send_err(id, "frame record mismatch");
+        return;
+    }
+
+    /* Encode game_data as hex */
+    char gd_hex[33];
+    for (int i = 0; i < 16; i++)
+        snprintf(gd_hex + i * 2, 3, "%02x", r->game_data[i]);
+
+    /* Encode zero page as hex */
+    char zp_hex[513];
+    for (int i = 0; i < 256; i++)
+        snprintf(zp_hex + i * 2, 3, "%02x", r->ram_full[i]);
+
+    /* Use malloc for the large response */
+    char *buf = (char *)malloc(5120);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    snprintf(buf, 5120,
+             "{\"id\":%d,\"ok\":true,"
+             "\"frame\":%u,\"verify_pass\":%d,\"diff_count\":%d,"
+             "\"cpu\":{\"A\":\"0x%02X\",\"X\":\"0x%02X\",\"Y\":\"0x%02X\","
+                      "\"S\":\"0x%02X\",\"P\":\"0x%02X\","
+                      "\"N\":%d,\"V\":%d,\"D\":%d,\"I\":%d,\"Z\":%d,\"C\":%d},"
+             "\"ppu\":{\"ctrl\":\"0x%02X\",\"mask\":\"0x%02X\",\"status\":\"0x%02X\","
+                      "\"oamaddr\":\"0x%02X\","
+                      "\"scroll_x\":%d,\"scroll_y\":%d,"
+                      "\"ppuaddr\":\"0x%04X\",\"addr_latch\":%d,\"scroll_latch\":%d,"
+                      "\"data_buf\":\"0x%02X\","
+                      "\"hud_sx\":%d,\"hud_sy\":%d,\"hud_ctrl\":\"0x%02X\","
+                      "\"spr0_active\":%d,\"spr0_reads\":%d,"
+                      "\"spr0_oam_y\":%d,\"split_y\":%d,\"use_hud\":%d,"
+                      "\"spr0_hit\":%d,\"split_write_sl\":%d},"
+             "\"timing\":{\"ops_count\":%u,\"vblank_depth\":%d},"
+             "\"bank\":%d,"
+             "\"mapper\":{\"type\":%d,\"shift_reg\":%d,\"shift_count\":%d,"
+                         "\"ctrl\":%d,\"chr0\":%d,\"chr1\":%d,\"prg_reg\":%d,\"mirror\":%d,"
+                         "\"mmc3_bank_sel\":%d,"
+                         "\"mmc3_regs\":[%d,%d,%d,%d,%d,%d,%d,%d],"
+                         "\"mmc3_irq_latch\":%d,\"mmc3_irq_counter\":%d,"
+                         "\"mmc3_irq_reload\":%d,\"mmc3_irq_enabled\":%d},"
+             "\"buttons1\":\"0x%02X\",\"buttons2\":\"0x%02X\","
+             "\"ctrl_shift1\":\"0x%02X\",\"ctrl_shift2\":\"0x%02X\",\"ctrl_strobe\":%d,"
+             "\"game_data\":\"%s\","
+             "\"ram_zp\":\"%s\","
+             "\"last_func\":\"%s\"}",
+             id, r->frame_number, r->verify_pass, r->diff_count,
+             r->cpu_a, r->cpu_x, r->cpu_y, r->cpu_s, r->cpu_p,
+             r->cpu_n, r->cpu_v, r->cpu_d, r->cpu_i, r->cpu_z, r->cpu_c,
+             r->ppuctrl, r->ppumask, r->ppustatus, r->oamaddr,
+             r->ppuscroll_x, r->ppuscroll_y,
+             r->ppuaddr, r->ppuaddr_latch, r->scroll_latch,
+             r->ppudata_buf,
+             r->ppuscroll_x_hud, r->ppuscroll_y_hud, r->ppuctrl_hud,
+             r->spr0_split_active, r->spr0_reads_ctr,
+             r->spr0_oam_y, r->render_split_y, r->render_use_hud,
+             r->spr0_hit_scanline, r->spr0_split_write_sl,
+             r->ops_count, r->vblank_depth,
+             r->current_bank,
+             r->mapper.mapper_type, r->mapper.shift_reg, r->mapper.shift_count,
+             r->mapper.ctrl, r->mapper.chr0, r->mapper.chr1, r->mapper.prg_reg,
+             r->mapper.mirroring,
+             r->mapper.mmc3_bank_select,
+             r->mapper.mmc3_regs[0], r->mapper.mmc3_regs[1],
+             r->mapper.mmc3_regs[2], r->mapper.mmc3_regs[3],
+             r->mapper.mmc3_regs[4], r->mapper.mmc3_regs[5],
+             r->mapper.mmc3_regs[6], r->mapper.mmc3_regs[7],
+             r->mapper.mmc3_irq_latch, r->mapper.mmc3_irq_counter,
+             r->mapper.mmc3_irq_reload, r->mapper.mmc3_irq_enabled,
+             r->controller1_buttons, r->controller2_buttons,
+             r->ctrl1_shift, r->ctrl2_shift, r->ctrl1_strobe,
+             gd_hex, zp_hex,
+             r->last_func);
+    send_line(buf);
+    free(buf);
+}
+
+static void handle_frame_range(int id, const char *json)
+{
+    int start = json_get_int(json, "start", -1);
+    int end   = json_get_int(json, "end", -1);
+    if (start < 0 || end < 0) { send_err(id, "missing start/end"); return; }
+    if (end - start + 1 > 200) { send_err(id, "max 200 frames per request"); return; }
+
+    uint64_t oldest = (s_history_count > FRAME_HISTORY_CAP)
+                    ? s_history_count - FRAME_HISTORY_CAP : 0;
+
+    /* Build response in a large buffer */
+    char *buf = (char *)malloc(200 * 256 + 256);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+
+    int pos = snprintf(buf, 64, "{\"id\":%d,\"ok\":true,\"frames\":[", id);
+
+    int first = 1;
+    for (int f = start; f <= end; f++) {
+        if (!first) buf[pos++] = ',';
+        first = 0;
+
+        if ((uint64_t)f < oldest || (uint64_t)f >= s_history_count) {
+            pos += snprintf(buf + pos, 128,
+                "{\"frame\":%d,\"available\":false}", f);
+            continue;
+        }
+
+        uint32_t idx = (uint32_t)f % FRAME_HISTORY_CAP;
+        const NESFrameRecord *r = &s_frame_history[idx];
+        if (r->frame_number != (uint32_t)f) {
+            pos += snprintf(buf + pos, 128,
+                "{\"frame\":%d,\"available\":false}", f);
+            continue;
+        }
+
+        /* Encode game_data as hex */
+        char gd_hex[33];
+        for (int i = 0; i < 16; i++)
+            snprintf(gd_hex + i * 2, 3, "%02x", r->game_data[i]);
+
+        pos += snprintf(buf + pos, 256,
+            "{\"frame\":%u,\"verify\":%d,\"bank\":%d,\"btn\":\"0x%02X\","
+            "\"game_data\":\"%s\"}",
+            r->frame_number, r->verify_pass,
+            r->current_bank, r->controller1_buttons,
+            gd_hex);
+    }
+
+    pos += snprintf(buf + pos, 8, "]}");
+    send_line(buf);
+    free(buf);
+}
+
+static void handle_frame_timeseries(int id, const char *json)
+{
+    int start = json_get_int(json, "start", -1);
+    int end   = json_get_int(json, "end", -1);
+    if (start < 0 || end < 0) { send_err(id, "missing start/end"); return; }
+    if (end - start + 1 > 200) { send_err(id, "max 200 frames per request"); return; }
+
+    uint64_t oldest = (s_history_count > FRAME_HISTORY_CAP)
+                    ? s_history_count - FRAME_HISTORY_CAP : 0;
+
+    /* Build compact JSON array */
+    char *buf = (char *)malloc(200 * 320 + 256);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+
+    int pos = snprintf(buf, 64, "{\"id\":%d,\"ok\":true,\"ts\":[", id);
+
+    int first = 1;
+    for (int f = start; f <= end; f++) {
+        if (!first) buf[pos++] = ',';
+        first = 0;
+
+        if ((uint64_t)f < oldest || (uint64_t)f >= s_history_count) {
+            pos += snprintf(buf + pos, 32, "null");
+            continue;
+        }
+
+        uint32_t idx = (uint32_t)f % FRAME_HISTORY_CAP;
+        const NESFrameRecord *r = &s_frame_history[idx];
+        if (r->frame_number != (uint32_t)f) {
+            pos += snprintf(buf + pos, 32, "null");
+            continue;
+        }
+
+        /* Encode game_data as hex */
+        char gd_hex[33];
+        for (int i = 0; i < 16; i++)
+            snprintf(gd_hex + i * 2, 3, "%02x", r->game_data[i]);
+
+        pos += snprintf(buf + pos, 320,
+            "{\"f\":%u,\"v\":%d,\"a\":%d,\"x\":%d,\"y\":%d,"
+            "\"ctrl\":%d,\"mask\":%d,\"sx\":%d,\"sy\":%d,"
+            "\"soy\":%d,\"ss\":%d,\"sply\":%d,\"hx\":%d,"
+            "\"bk\":%d,\"btn\":%d,\"gd\":\"%s\"}",
+            r->frame_number, r->verify_pass,
+            r->cpu_a, r->cpu_x, r->cpu_y,
+            r->ppuctrl, r->ppumask, r->ppuscroll_x, r->ppuscroll_y,
+            r->spr0_oam_y, r->spr0_split_active, r->render_split_y, r->ppuscroll_x_hud,
+            r->current_bank, r->controller1_buttons,
+            gd_hex);
+    }
+
+    pos += snprintf(buf + pos, 8, "]}");
+    send_line(buf);
+    free(buf);
+}
+
+static void handle_first_failure(int id, const char *json)
+{
+    (void)json;
+    uint64_t oldest = (s_history_count > FRAME_HISTORY_CAP)
+                    ? s_history_count - FRAME_HISTORY_CAP : 0;
+
+    for (uint64_t f = oldest; f < s_history_count; f++) {
+        uint32_t idx = (uint32_t)(f % FRAME_HISTORY_CAP);
+        const NESFrameRecord *r = &s_frame_history[idx];
+        if (r->frame_number == (uint32_t)f && r->verify_pass == 0) {
+            send_fmt("{\"id\":%d,\"ok\":true,\"frame\":%u,\"diff_count\":%d}",
+                     id, r->frame_number, r->diff_count);
+            return;
+        }
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"frame\":-1,\"message\":\"no failures found\"}", id);
+}
+
+static void handle_ppu_state(int id, const char *json)
+{
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"ppuctrl\":\"0x%02X\",\"ppumask\":\"0x%02X\","
+             "\"ppustatus\":\"0x%02X\","
+             "\"scroll_x\":%d,\"scroll_y\":%d,"
+             "\"spr0_split\":%d,\"spr0_reads\":%d,"
+             "\"chr_is_rom\":%d,"
+             "\"render_irq_fired\":%d,\"render_irq_scanline\":%d,"
+             "\"render_irq_ctrl_before\":\"0x%02X\","
+             "\"render_irq_ctrl_after\":\"0x%02X\","
+             "\"render_irq_scrollx\":%d,\"render_irq_scrolly\":%d,"
+             "\"post_irq_ppuctrl_row\":\"0x%02X\","
+             "\"post_irq_chr_base\":\"0x%04X\","
+             "\"post_irq_use_hud\":%d,\"post_irq_split_y\":%d,"
+             "\"post_irq_origin_y\":%d,\"post_irq_nt_row\":%d}",
+             id, g_ppuctrl, g_ppumask, g_ppustatus,
+             g_ppuscroll_x, g_ppuscroll_y,
+             g_spr0_split_active, g_spr0_reads_ctr_legacy,
+             g_chr_is_rom,
+             g_render_irq_fired, g_render_irq_scanline,
+             g_render_irq_ppuctrl_before, g_render_irq_ppuctrl_after,
+             g_render_irq_scrollx_after, g_render_irq_scrolly_after,
+             g_render_post_irq_ppuctrl_row, g_render_post_irq_chr_base,
+             g_render_post_irq_use_hud, g_render_post_irq_split_y,
+             g_render_post_irq_origin_y, g_render_post_irq_phys_nt);
+}
+
+#ifdef RECOMP_STACK_TRACKING
+static void handle_call_stack(int id, const char *json)
+{
+    (void)json;
+    /* Dynamic alloc: each entry ~25 chars avg, plus JSON overhead */
+    int top = g_recomp_stack_top;
+    int bufsz = 256 + top * 30;
+    if (bufsz < 2048) bufsz = 2048;
+    char *buf = (char *)malloc(bufsz);
+    if (!buf) { send_err(id, "OOM"); return; }
+
+    int pos = snprintf(buf, bufsz,
+        "{\"id\":%d,\"ok\":true,\"depth\":%d,\"stack\":[",
+        id, top);
+
+    for (int i = top - 1; i >= 0; i--) {
+        if (i < top - 1 && pos < bufsz - 1) buf[pos++] = ',';
+        pos += snprintf(buf + pos, bufsz - pos,
+            "\"%s\"", g_recomp_stack[i] ? g_recomp_stack[i] : "(null)");
+        if (pos >= bufsz - 2) break;
+    }
+    pos += snprintf(buf + pos, bufsz - pos, "]}");
+    send_line(buf);
+    free(buf);
+}
+#endif
+
+static void handle_fring(int id, const char *json)
+{
+    int n = json_get_int(json, "n", 64);
+    if (n < 1) n = 1;
+    if (n > 512) n = 512;
+    NesFrameEvt *ev = (NesFrameEvt *)malloc((size_t)n * sizeof *ev);
+    if (!ev) { send_err(id, "alloc failed"); return; }
+    int got = nes_fring_last(n, ev);
+    char *buf = (char *)malloc((size_t)got * 96 + 256);
+    if (!buf) { free(ev); send_err(id, "alloc failed"); return; }
+    int pos = snprintf(buf, 256, "{\"id\":%d,\"ok\":true,\"count\":%d,\"events\":[", id, got);
+    for (int i = 0; i < got; i++) {
+        pos += sprintf(buf + pos,
+            "%s{\"k\":\"%c\",\"cyc\":%llu,\"ops\":%u,\"bud\":%u,\"d\":%u,\"aux\":\"0x%04X\"}",
+            i ? "," : "", ev[i].kind, (unsigned long long)ev[i].cyc,
+            ev[i].ops, ev[i].budget, ev[i].depth, ev[i].aux);
+    }
+    pos += sprintf(buf + pos, "]}");
+    send_line(buf);
+    free(buf);
+    free(ev);
+}
+
+/* Always-on foreign-controller movement ring. Same contract as `fring`:
+ * capture runs from power-on, this only QUERIES a window of that history. */
+static void handle_ftring(int id, const char *json)
+{
+    int n = json_get_int(json, "n", 64);
+    if (n < 1) n = 1;
+    if (n > 512) n = 512;
+    ForeignTraceEntry *ev =
+        (ForeignTraceEntry *)malloc((size_t)n * sizeof *ev);
+    if (!ev) { send_err(id, "alloc failed"); return; }
+    int got = nes_foreign_trace_last(n, ev);
+    /* Per-row budget, not a guess: the widest row is ~280 chars with modest
+     * coordinates, and every %.4f grows with magnitude. Keep headroom -- this
+     * is a fixed-size sprintf target with no bound. */
+    char *buf = (char *)malloc((size_t)got * 416 + 256);
+    if (!buf) { free(ev); send_err(id, "alloc failed"); return; }
+    const ForeignController *ctl = nes_foreign_active();
+    int pos = snprintf(buf, 256,
+        "{\"id\":%d,\"ok\":true,\"controller\":\"%s\",\"retained\":%d,"
+        "\"count\":%d,\"ticks\":[",
+        id, ctl && ctl->id ? ctl->id : "", nes_foreign_trace_count(), got);
+    for (int i = 0; i < got; i++) {
+        const ForeignTraceEntry *e = &ev[i];
+        const char *name = "";
+        if (ctl && ctl->state_name) {
+            const char *resolved = ctl->state_name(e->state);
+            if (resolved) name = resolved;
+        }
+        pos += sprintf(buf + pos,
+            "%s{\"f\":%llu,\"own\":%u,\"st\":%d,\"stn\":\"%s\",\"btn\":%d,"
+            "\"sx\":%.4f,\"sy\":%.4f,\"x\":%.4f,\"y\":%.4f,"
+            "\"vx\":%.4f,\"vy\":%.4f,\"rdx\":%.4f,\"rdy\":%.4f,"
+            "\"adx\":%.4f,\"ady\":%.4f,\"gnd\":%u,\"ff\":%u,"
+            "\"air\":%u,\"jp\":%u,\"rs\":%u,\"hw\":%u,\"hc\":%u,\"hf\":%u,"
+            "\"contact\":%u,\"imp\":%u,\"ivy\":%.4f,\"cf\":\"0x%08X\","
+            "\"nx\":%d,\"ny\":%d}",
+            i ? "," : "", (unsigned long long)e->frame, e->ownership,
+            e->state, name, e->raw_buttons, e->stick_x, e->stick_y,
+            e->x, e->y, e->vx, e->vy,
+            e->requested_dx, e->requested_dy,
+            e->resolved_dx, e->resolved_dy,
+            e->grounded, e->fast_fall,
+            e->air_cause, e->jump_phase, e->reseeded,
+            e->hit_wall, e->hit_ceiling, e->hit_floor,
+            e->attack_connected, e->has_imposed_vy, e->imposed_vy,
+            e->collision_flags,
+            e->native_x, e->native_y);
+    }
+    pos += sprintf(buf + pos, "]}");
+    send_line(buf);
+    free(buf);
+    free(ev);
+}
+
+static void handle_watchdog_status(int id, const char *json)
+{
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"triggered\":%d,\"frame\":%u,\"stack_dump\":\"%s\"}",
+             id, g_watchdog_triggered, (unsigned)g_watchdog_frame,
+             g_watchdog_stack_dump ? g_watchdog_stack_dump : "");
+}
+
+static void handle_interpreter_stats(int id, const char *json)
+{
+    NesInterpStats stats;
+    (void)json;
+    memset(&stats, 0, sizeof(stats));
+    nes_interp_get_stats(&stats);
+    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%s,"
+             "\"instrs_total\":%llu,\"runs\":%llu,\"watchdog_trips\":%llu,"
+             "\"native_handoffs\":%llu,\"native_handoffs_suppressed\":%llu,"
+             "\"native_resume_reentries\":%llu,"
+             "\"declines\":%llu,\"policy_traps\":%llu,\"instrs_this_frame\":%u,"
+             "\"max_instrs_run\":%u}",
+             id, nes_interp_is_enabled() ? "true" : "false",
+             (unsigned long long)stats.instrs_total,
+             (unsigned long long)stats.runs,
+             (unsigned long long)stats.watchdog_trips,
+             (unsigned long long)stats.native_handoffs,
+             (unsigned long long)stats.native_handoffs_suppressed,
+             (unsigned long long)stats.native_resume_reentries,
+             (unsigned long long)stats.declines,
+             (unsigned long long)stats.policy_traps,
+             stats.instrs_this_frame, stats.max_instrs_run);
+}
+
+static void handle_runtime_faults(int id, const char *json)
+{
+    extern uint64_t g_unhandled_dispatch_count;
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,\"brk_count\":%llu,"
+             "\"brk_last_pc\":\"$%04X\",\"brk_last_bank\":%d,"
+             "\"brk_last_frame\":%llu,\"dispatch_policy_count\":%llu,"
+             "\"dispatch_coverage_misses\":%llu,"
+             "\"inline_dispatch_policy_count\":%llu}",
+             id, (unsigned long long)g_brk_count, g_brk_last_pc,
+             g_brk_last_bank, (unsigned long long)g_brk_last_frame,
+             (unsigned long long)g_unhandled_dispatch_count,
+             (unsigned long long)g_dispatch_miss_count,
+             (unsigned long long)g_inline_dispatch_miss_count);
+}
+
+static void handle_dispatch_miss_info(int id, const char *json)
+{
+    (void)json;
+    extern uint32_t g_miss_count_any;
+    extern uint16_t g_miss_last_addr;
+    extern uint64_t g_miss_last_frame;
+    extern int      g_miss_last_bank;
+    extern char     g_miss_last_caller[64];
+    extern char     g_miss_last_stack2[64];
+    extern uint8_t  g_miss_last_sp;
+    extern uint8_t  g_miss_last_stack_bytes[16];
+    extern uint16_t g_miss_unique_addrs[];
+    extern int16_t  g_miss_unique_banks[];
+    extern int      g_miss_unique_count;
+    extern uint32_t g_miss_unique_total;
+
+    /* Build hex string for stack bytes */
+    char stack_hex[48];
+    for (int i = 0; i < 16; i++)
+        snprintf(stack_hex + i*3, 4, "%02X ", g_miss_last_stack_bytes[i]);
+    if (stack_hex[0]) stack_hex[47] = '\0';
+
+    /* Build unique misses array */
+    char unique_buf[3072];
+    char unique_key_buf[4096];
+    int pos = 0;
+    unique_buf[pos++] = '[';
+    for (int i = 0; i < g_miss_unique_count; i++) {
+        if (i) unique_buf[pos++] = ',';
+        pos += snprintf(unique_buf + pos, sizeof(unique_buf) - pos,
+                        "\"$%04X\"", g_miss_unique_addrs[i]);
+    }
+    unique_buf[pos++] = ']';
+    unique_buf[pos] = '\0';
+    pos = 0;
+    unique_key_buf[pos++] = '[';
+    for (int i = 0; i < g_miss_unique_count; i++) {
+        if (i) unique_key_buf[pos++] = ',';
+        pos += snprintf(unique_key_buf + pos, sizeof(unique_key_buf) - pos,
+                        "\"%d:$%04X\"", g_miss_unique_banks[i],
+                        g_miss_unique_addrs[i]);
+    }
+    unique_key_buf[pos++] = ']';
+    unique_key_buf[pos] = '\0';
+
+    /* Build ring array — oldest-first for readability. Each entry carries
+     * full classification, CPU state, call-site, target-byte hexdump, and
+     * recomp caller names so a consumer can triage without a round-trip. */
+    char ring_buf[8192];
+    int  rp = 0;
+    ring_buf[rp++] = '[';
+    if (g_miss_ring_count > 0) {
+        int start = (g_miss_ring_head - g_miss_ring_count + MAX_MISS_RING) % MAX_MISS_RING;
+        for (int n = 0; n < g_miss_ring_count; n++) {
+            const MissRecord *r = &g_miss_ring[(start + n) % MAX_MISS_RING];
+            const char *cls =
+                (r->target_class == MISS_TARGET_ZERO)     ? "ZERO_FILLED" :
+                (r->target_class == MISS_TARGET_RTS_STUB) ? "RTS_STUB"    : "CODE";
+            char tbytes_hex[32];
+            for (int i = 0; i < 8; i++)
+                snprintf(tbytes_hex + i*3, 4, "%02X ", r->target_bytes[i]);
+            tbytes_hex[23] = '\0';
+            char sbytes_hex[64];
+            for (int i = 0; i < 16; i++)
+                snprintf(sbytes_hex + i*3, 4, "%02X ", r->stack_bytes[i]);
+            sbytes_hex[47] = '\0';
+            rp += snprintf(ring_buf + rp, sizeof(ring_buf) - rp,
+                "%s{\"addr\":\"$%04X\",\"bank\":%d,\"frame\":%llu,"
+                "\"target\":\"%s\",\"target_bytes\":\"%s\","
+                "\"A\":\"$%02X\",\"X\":\"$%02X\",\"Y\":\"$%02X\","
+                "\"P\":\"$%02X\",\"S\":\"$%02X\",\"call_site\":\"$%04X\","
+                "\"caller\":\"%s\",\"caller2\":\"%s\","
+                "\"stack_bytes\":\"%s\"}",
+                n ? "," : "",
+                r->addr, r->bank, (unsigned long long)r->frame,
+                cls, tbytes_hex,
+                r->cpu_a, r->cpu_x, r->cpu_y, r->cpu_p, r->cpu_s,
+                r->call_site_pc,
+                r->caller, r->caller2,
+                sbytes_hex);
+            /* Safety margin against ring_buf overflow: stop if <512 left */
+            if (rp > (int)sizeof(ring_buf) - 512) break;
+        }
+    }
+    ring_buf[rp++] = ']';
+    ring_buf[rp] = '\0';
+
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"total_misses\":%u,"
+             "\"last_addr\":\"$%04X\","
+             "\"last_bank\":%d,"
+             "\"last_frame\":%llu,"
+             "\"last_caller\":\"%s\","
+             "\"last_stack2\":\"%s\","
+             "\"last_sp\":\"$%02X\","
+             "\"stack_bytes\":\"%s\","
+             "\"unique_miss_total\":%u,"
+             "\"unique_misses\":%s,"
+             "\"unique_miss_keys\":%s,"
+             "\"ring\":%s}",
+             id,
+             (unsigned)g_miss_count_any,
+             g_miss_last_addr,
+             g_miss_last_bank,
+             (unsigned long long)g_miss_last_frame,
+             g_miss_last_caller,
+             g_miss_last_stack2,
+             g_miss_last_sp,
+             stack_hex,
+             (unsigned)g_miss_unique_total,
+             unique_buf,
+             unique_key_buf,
+             ring_buf);
+}
+
+static void handle_quit(int id, const char *json)
+{
+    (void)json;
+    fprintf(stderr, "[RunnerExit] TCP quit command at frame %llu\n",
+            (unsigned long long)g_frame_count);
+    send_ok(id);
+    debug_server_shutdown();
+    exit(0);
+}
+
+/* ---- Time-travel: read from historical frame snapshots ---- */
+
+static uint8_t frame_read_byte(const NESFrameRecord *r, uint32_t addr)
+{
+    /* CPU address space */
+    if (addr < 0x0800) return r->ram_full[addr];
+    if (addr < 0x2000) return r->ram_full[addr & 0x07FF];  /* RAM mirrors */
+    if (addr >= 0x6000 && addr < 0x8000) return r->sram[addr - 0x6000];
+    /* PPU address space (use addr >= 0x10000 for PPU, or standard ranges) */
+    if (addr >= 0x2000 && addr < 0x3000) return r->ppu_nt[addr - 0x2000];
+    if (addr >= 0x3F00 && addr < 0x3F20) return r->ppu_pal[addr - 0x3F00];
+    /* OAM via special range */
+    if (addr >= 0xFE00 && addr < 0xFF00) return r->oam[addr - 0xFE00];
+    /* CHR RAM via PPU range 0x0000-0x1FFF (use 0x10000+ to disambiguate from CPU) */
+    if (addr >= 0x10000 && addr < 0x12000) return r->chr_ram[addr - 0x10000];
+    /* Also support raw CHR range if addr < 0x2000 and > 0x07FF — ambiguous, prefer PPU */
+    return 0;
+}
+
+static void handle_read_frame_ram(int id, const char *json)
+{
+    int f = json_get_int(json, "frame", -1);
+    if (f < 0) { send_err(id, "missing frame"); return; }
+
+    char addr_str[32];
+    if (!json_get_str(json, "addr", addr_str, sizeof(addr_str))) {
+        send_err(id, "missing addr"); return;
+    }
+    uint32_t addr = hex_to_u32(addr_str);
+    int len = json_get_int(json, "len", 1);
+    if (len < 1) len = 1;
+    if (len > 256) len = 256;
+
+    if (!s_frame_history) { send_err(id, "ring buffer not allocated"); return; }
+
+    uint64_t oldest = (s_history_count > FRAME_HISTORY_CAP)
+                    ? s_history_count - FRAME_HISTORY_CAP : 0;
+    if ((uint64_t)f < oldest || (uint64_t)f >= s_history_count) {
+        send_err(id, "frame not in buffer"); return;
+    }
+
+    uint32_t idx = (uint32_t)f % FRAME_HISTORY_CAP;
+    const NESFrameRecord *r = &s_frame_history[idx];
+
+    /* Build hex string */
+    char hex[513];
+    for (int i = 0; i < len; i++)
+        snprintf(hex + i*2, 3, "%02x", frame_read_byte(r, addr + i));
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"frame\":%d,\"addr\":\"0x%04X\",\"len\":%d,\"hex\":\"%s\"}",
+             id, f, addr, len, hex);
+}
+
+static void handle_restore_frame(int id, const char *json)
+{
+    int f = json_get_int(json, "frame", -1);
+    if (f < 0) { send_err(id, "missing frame"); return; }
+    if (!s_frame_history) { send_err(id, "ring buffer not allocated"); return; }
+
+    uint64_t oldest = (s_history_count > FRAME_HISTORY_CAP)
+                    ? s_history_count - FRAME_HISTORY_CAP : 0;
+    if ((uint64_t)f < oldest || (uint64_t)f >= s_history_count) {
+        send_err(id, "frame not in buffer"); return;
+    }
+
+    uint32_t idx = (uint32_t)f % FRAME_HISTORY_CAP;
+    const NESFrameRecord *r = &s_frame_history[idx];
+
+    /* ---- Restore CPU (exhaustive) ---- */
+    g_cpu.A = r->cpu_a;
+    g_cpu.X = r->cpu_x;
+    g_cpu.Y = r->cpu_y;
+    g_cpu.S = r->cpu_s;
+    g_cpu.P = r->cpu_p;
+    g_cpu.N = r->cpu_n; g_cpu.V = r->cpu_v; g_cpu.D = r->cpu_d;
+    g_cpu.I = r->cpu_i; g_cpu.Z = r->cpu_z; g_cpu.C = r->cpu_c;
+
+    /* ---- Restore PPU registers (exhaustive) ---- */
+    g_ppuctrl     = r->ppuctrl;
+    g_ppumask     = r->ppumask;
+    g_ppustatus   = r->ppustatus;
+    g_oamaddr     = r->oamaddr;
+    g_ppuscroll_x = r->ppuscroll_x;
+    g_ppuscroll_y = r->ppuscroll_y;
+    runtime_set_ppuaddr(r->ppuaddr);
+    runtime_set_latch_state(r->ppuaddr_latch, r->scroll_latch);
+    runtime_set_ppudata_buf(r->ppudata_buf);
+
+    /* ---- Restore sprite-0 split state ---- */
+    g_ppuscroll_x_hud  = r->ppuscroll_x_hud;
+    g_ppuscroll_y_hud  = r->ppuscroll_y_hud;
+    g_ppuctrl_hud      = r->ppuctrl_hud;
+    g_spr0_split_active     = r->spr0_split_active;
+    g_spr0_reads_ctr_legacy = r->spr0_reads_ctr;
+
+    /* ---- Restore VBlank / timing state ---- */
+    runtime_set_vblank_state(r->ops_count, r->vblank_depth);
+
+    /* ---- Restore mapper (exhaustive) ---- */
+    g_current_bank = r->current_bank;
+    mapper_set_state(&r->mapper);
+
+    /* ---- Restore controller state ---- */
+    g_controller1_buttons = r->controller1_buttons;
+    g_controller2_buttons = r->controller2_buttons;
+    runtime_set_controller_shift(r->ctrl1_shift, r->ctrl2_shift, r->ctrl1_strobe);
+
+    /* ---- Restore full memory state ---- */
+    memcpy(g_ram,     r->ram_full, sizeof(r->ram_full));
+    memcpy(g_sram,    r->sram,     sizeof(r->sram));
+    memcpy(g_chr_ram, r->chr_ram,  sizeof(r->chr_ram));
+    memcpy(g_ppu_nt,  r->ppu_nt,   sizeof(r->ppu_nt));
+    memcpy(g_ppu_pal, r->ppu_pal,  sizeof(r->ppu_pal));
+    memcpy(g_ppu_oam, r->oam,      sizeof(r->oam));
+    save_ram_sync_snapshot();
+
+    /* Reset frame counter to the restored frame */
+    g_frame_count = (uint64_t)f;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"restored_frame\":%d}", id, f);
+}
+
+/* ---- Screenshot ---- */
+
+static void handle_screenshot(int id, const char *json)
+{
+    char path[256];
+    if (!json_get_str(json, "path", path, sizeof(path))) {
+        snprintf(path, sizeof(path), "%s_shot_%04llu.png",
+                 game_get_name(), (unsigned long long)g_frame_count);
+    }
+    runner_screenshot(path);
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\"}", id, path);
+}
+
+static void handle_save_state(int id, const char *json)
+{
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path))) {
+        send_err(id, "missing path");
+        return;
+    }
+    if (!savestate_save(path)) {
+        send_err(id, "save failed");
+        return;
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"saved_frame\":%llu}",
+             id, (unsigned long long)g_frame_count);
+}
+
+static void handle_load_state(int id, const char *json)
+{
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path))) {
+        send_err(id, "missing path");
+        return;
+    }
+    if (!savestate_load(path)) {
+        send_err(id, "load failed");
+        return;
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"loaded_frame\":%llu}",
+             id, (unsigned long long)g_frame_count);
+}
+
+/* ---- frame_diff: show verify divergence diffs for a frame, or compare two frames' RAM ---- */
+
+static void handle_frame_diff(int id, const char *json)
+{
+    int frame_a = json_get_int(json, "frame", -1);
+    int frame_b = json_get_int(json, "frame_b", -1);
+
+    if (!s_frame_history) { send_err(id, "ring buffer not allocated"); return; }
+
+    uint64_t oldest = (s_history_count > FRAME_HISTORY_CAP)
+                    ? s_history_count - FRAME_HISTORY_CAP : 0;
+
+    /* Mode 1: single frame — return verify-mode diffs from that frame's record */
+    if (frame_a >= 0 && frame_b < 0) {
+        if ((uint64_t)frame_a < oldest || (uint64_t)frame_a >= s_history_count) {
+            send_err(id, "frame not in buffer"); return;
+        }
+        uint32_t idx = (uint32_t)frame_a % FRAME_HISTORY_CAP;
+        const NESFrameRecord *r = &s_frame_history[idx];
+        if (r->frame_number != (uint32_t)frame_a) {
+            send_err(id, "frame record mismatch"); return;
+        }
+
+        char *buf = (char *)malloc(8192);
+        if (!buf) { send_err(id, "alloc failed"); return; }
+
+        int pos = snprintf(buf, 8192,
+            "{\"id\":%d,\"ok\":true,\"frame\":%u,"
+            "\"verify_pass\":%d,\"diff_count\":%d,\"diffs\":[",
+            id, r->frame_number, r->verify_pass, r->diff_count);
+
+        int n = r->diff_count < MAX_FRAME_DIFFS ? r->diff_count : MAX_FRAME_DIFFS;
+        for (int i = 0; i < n && pos < 8000; i++) {
+            if (i > 0) buf[pos++] = ',';
+            pos += snprintf(buf + pos, 8192 - pos,
+                "{\"addr\":\"0x%04X\",\"mine\":\"0x%02X\",\"theirs\":\"0x%02X\"}",
+                r->diffs[i].addr, r->diffs[i].mine, r->diffs[i].theirs);
+        }
+        pos += snprintf(buf + pos, 8192 - pos,
+            "],\"last_func\":\"%s\"}", r->last_func);
+        send_line(buf);
+        free(buf);
+        return;
+    }
+
+    /* Mode 2: compare two frames' work RAM (0x0000-0x07FF) */
+    if (frame_a >= 0 && frame_b >= 0) {
+        if ((uint64_t)frame_a < oldest || (uint64_t)frame_a >= s_history_count ||
+            (uint64_t)frame_b < oldest || (uint64_t)frame_b >= s_history_count) {
+            send_err(id, "frame not in buffer"); return;
+        }
+        uint32_t idx_a = (uint32_t)frame_a % FRAME_HISTORY_CAP;
+        uint32_t idx_b = (uint32_t)frame_b % FRAME_HISTORY_CAP;
+        const NESFrameRecord *ra = &s_frame_history[idx_a];
+        const NESFrameRecord *rb = &s_frame_history[idx_b];
+        if (ra->frame_number != (uint32_t)frame_a || rb->frame_number != (uint32_t)frame_b) {
+            send_err(id, "frame record mismatch"); return;
+        }
+
+        /* Compare RAM, nametable, palette, OAM — report up to 256 diffs */
+        char *buf = (char *)malloc(65536);
+        if (!buf) { send_err(id, "alloc failed"); return; }
+
+        int pos = snprintf(buf, 65536,
+            "{\"id\":%d,\"ok\":true,\"frame_a\":%u,\"frame_b\":%u,\"diffs\":[",
+            id, ra->frame_number, rb->frame_number);
+
+        int diff_count = 0;
+        int max_diffs = 256;
+
+        /* Work RAM */
+        for (int i = 0; i < 0x0800 && diff_count < max_diffs; i++) {
+            if (ra->ram_full[i] != rb->ram_full[i]) {
+                if (diff_count > 0) buf[pos++] = ',';
+                pos += snprintf(buf + pos, 65536 - pos,
+                    "{\"addr\":\"0x%04X\",\"region\":\"ram\",\"a\":\"0x%02X\",\"b\":\"0x%02X\"}",
+                    i, ra->ram_full[i], rb->ram_full[i]);
+                diff_count++;
+            }
+        }
+
+        /* Nametable */
+        for (int i = 0; i < 0x1000 && diff_count < max_diffs; i++) {
+            if (ra->ppu_nt[i] != rb->ppu_nt[i]) {
+                if (diff_count > 0) buf[pos++] = ',';
+                pos += snprintf(buf + pos, 65536 - pos,
+                    "{\"addr\":\"0x%04X\",\"region\":\"nt\",\"a\":\"0x%02X\",\"b\":\"0x%02X\"}",
+                    0x2000 + i, ra->ppu_nt[i], rb->ppu_nt[i]);
+                diff_count++;
+            }
+        }
+
+        /* Palette */
+        for (int i = 0; i < 0x20 && diff_count < max_diffs; i++) {
+            if (ra->ppu_pal[i] != rb->ppu_pal[i]) {
+                if (diff_count > 0) buf[pos++] = ',';
+                pos += snprintf(buf + pos, 65536 - pos,
+                    "{\"addr\":\"0x%04X\",\"region\":\"pal\",\"a\":\"0x%02X\",\"b\":\"0x%02X\"}",
+                    0x3F00 + i, ra->ppu_pal[i], rb->ppu_pal[i]);
+                diff_count++;
+            }
+        }
+
+        /* OAM */
+        for (int i = 0; i < 0x100 && diff_count < max_diffs; i++) {
+            if (ra->oam[i] != rb->oam[i]) {
+                if (diff_count > 0) buf[pos++] = ',';
+                pos += snprintf(buf + pos, 65536 - pos,
+                    "{\"addr\":\"0x%04X\",\"region\":\"oam\",\"a\":\"0x%02X\",\"b\":\"0x%02X\"}",
+                    0xFE00 + i, ra->oam[i], rb->oam[i]);
+                diff_count++;
+            }
+        }
+
+        pos += snprintf(buf + pos, 65536 - pos,
+            "],\"total_diffs\":%d}", diff_count);
+        send_line(buf);
+        free(buf);
+        return;
+    }
+
+    send_err(id, "missing frame (and optionally frame_b)");
+}
+
+/* ---- read_nametable: formatted nametable dump ---- */
+
+static void handle_read_nametable(int id, const char *json)
+{
+    char addr_str[32];
+    uint32_t base = 0x2000;
+    if (json_get_str(json, "addr", addr_str, sizeof(addr_str)))
+        base = hex_to_u32(addr_str);
+
+    /* Validate: must be 0x2000, 0x2400, 0x2800, or 0x2C00 */
+    if (base != 0x2000 && base != 0x2400 && base != 0x2800 && base != 0x2C00) {
+        send_err(id, "addr must be 0x2000/0x2400/0x2800/0x2C00");
+        return;
+    }
+
+    uint32_t nt_off = base - 0x2000;
+
+    /* Encode 32x30 = 960 tile bytes as hex */
+    char tile_hex[1921];  /* 960 * 2 + 1 */
+    for (int i = 0; i < 960; i++)
+        snprintf(tile_hex + i * 2, 3, "%02x", g_ppu_nt[nt_off + i]);
+
+    /* Encode 64-byte attribute table as hex */
+    char attr_hex[129];
+    for (int i = 0; i < 64; i++)
+        snprintf(attr_hex + i * 2, 3, "%02x", g_ppu_nt[nt_off + 960 + i]);
+
+    char *buf = (char *)malloc(4096);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+
+    snprintf(buf, 4096,
+        "{\"id\":%d,\"ok\":true,\"addr\":\"0x%04X\","
+        "\"width\":32,\"height\":30,"
+        "\"tiles\":\"%s\",\"attributes\":\"%s\"}",
+        id, base, tile_hex, attr_hex);
+    send_line(buf);
+    free(buf);
+}
+
+/* ---- read_oam: formatted sprite list ---- */
+
+static void handle_read_oam(int id, const char *json)
+{
+    (void)json;
+    int sprite_size = (g_ppuctrl & 0x20) ? 16 : 8;
+
+    char *buf = (char *)malloc(32768);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+
+    int pos = snprintf(buf, 32768,
+        "{\"id\":%d,\"ok\":true,\"sprite_size\":%d,\"sprites\":[",
+        id, sprite_size);
+
+    int first = 1;
+    for (int i = 0; i < 64 && pos < 32000; i++) {
+        uint8_t y    = g_ppu_oam[i * 4 + 0];
+        uint8_t tile = g_ppu_oam[i * 4 + 1];
+        uint8_t attr = g_ppu_oam[i * 4 + 2];
+        uint8_t x    = g_ppu_oam[i * 4 + 3];
+
+        if (!first) buf[pos++] = ',';
+        first = 0;
+
+        pos += snprintf(buf + pos, 32768 - pos,
+            "{\"i\":%d,\"x\":%d,\"y\":%d,\"tile\":\"0x%02X\","
+            "\"attr\":\"0x%02X\",\"palette\":%d,"
+            "\"priority\":%d,\"flip_h\":%d,\"flip_v\":%d,"
+            "\"visible\":%d,\"x16\":%d}",
+            i, x, y, tile, attr,
+            attr & 0x03,             /* palette */
+            (attr >> 5) & 1,         /* priority: 0=front, 1=behind bg */
+            (attr >> 6) & 1,         /* horizontal flip */
+            (attr >> 7) & 1,         /* vertical flip */
+            (y < 0xEF) ? 1 : 0,      /* visible if Y < 239 */
+            g_ws_oam_sidecar ? (int)g_oam_x16[i] : (int)x); /* widescreen sidecar X */
+    }
+
+    pos += snprintf(buf + pos, 32768 - pos, "]}");
+    send_line(buf);
+    free(buf);
+}
+
+/* ---- read_palette: formatted palette dump ---- */
+
+static void handle_read_palette(int id, const char *json)
+{
+    (void)json;
+    /* Build hex string for all 32 palette bytes */
+    char hex[65];
+    for (int i = 0; i < 32; i++)
+        snprintf(hex + i * 2, 3, "%02x", g_ppu_pal[i]);
+
+    /* Also build the individual palette groups for convenience */
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"universal\":\"0x%02X\","
+             "\"bg\":[[\"0x%02X\",\"0x%02X\",\"0x%02X\",\"0x%02X\"],"
+                     "[\"0x%02X\",\"0x%02X\",\"0x%02X\",\"0x%02X\"],"
+                     "[\"0x%02X\",\"0x%02X\",\"0x%02X\",\"0x%02X\"],"
+                     "[\"0x%02X\",\"0x%02X\",\"0x%02X\",\"0x%02X\"]],"
+             "\"spr\":[[\"0x%02X\",\"0x%02X\",\"0x%02X\",\"0x%02X\"],"
+                      "[\"0x%02X\",\"0x%02X\",\"0x%02X\",\"0x%02X\"],"
+                      "[\"0x%02X\",\"0x%02X\",\"0x%02X\",\"0x%02X\"],"
+                      "[\"0x%02X\",\"0x%02X\",\"0x%02X\",\"0x%02X\"]],"
+             "\"hex\":\"%s\"}",
+             id,
+             g_ppu_pal[0],
+             /* BG palettes 0-3 */
+             g_ppu_pal[0x00], g_ppu_pal[0x01], g_ppu_pal[0x02], g_ppu_pal[0x03],
+             g_ppu_pal[0x04], g_ppu_pal[0x05], g_ppu_pal[0x06], g_ppu_pal[0x07],
+             g_ppu_pal[0x08], g_ppu_pal[0x09], g_ppu_pal[0x0A], g_ppu_pal[0x0B],
+             g_ppu_pal[0x0C], g_ppu_pal[0x0D], g_ppu_pal[0x0E], g_ppu_pal[0x0F],
+             /* Sprite palettes 0-3 */
+             g_ppu_pal[0x10], g_ppu_pal[0x11], g_ppu_pal[0x12], g_ppu_pal[0x13],
+             g_ppu_pal[0x14], g_ppu_pal[0x15], g_ppu_pal[0x16], g_ppu_pal[0x17],
+             g_ppu_pal[0x18], g_ppu_pal[0x19], g_ppu_pal[0x1A], g_ppu_pal[0x1B],
+             g_ppu_pal[0x1C], g_ppu_pal[0x1D], g_ppu_pal[0x1E], g_ppu_pal[0x1F],
+             hex);
+}
+
+/* ---- memory_diff: compare current RAM vs historical frame ---- */
+
+static void handle_memory_diff(int id, const char *json)
+{
+    int f = json_get_int(json, "frame", -1);
+    if (f < 0) { send_err(id, "missing frame"); return; }
+    if (!s_frame_history) { send_err(id, "ring buffer not allocated"); return; }
+
+    uint64_t oldest = (s_history_count > FRAME_HISTORY_CAP)
+                    ? s_history_count - FRAME_HISTORY_CAP : 0;
+    if ((uint64_t)f < oldest || (uint64_t)f >= s_history_count) {
+        send_err(id, "frame not in buffer"); return;
+    }
+
+    uint32_t idx = (uint32_t)f % FRAME_HISTORY_CAP;
+    const NESFrameRecord *r = &s_frame_history[idx];
+    if (r->frame_number != (uint32_t)f) {
+        send_err(id, "frame record mismatch"); return;
+    }
+
+    /* Optional: restrict to a region */
+    char region_str[32];
+    const char *region = json_get_str(json, "region", region_str, sizeof(region_str));
+    /* Default: compare RAM only. Options: "ram", "nt", "pal", "oam", "all" */
+    int do_ram = 1, do_nt = 0, do_pal = 0, do_oam = 0;
+    if (region) {
+        if (strcmp(region, "all") == 0)  { do_ram = do_nt = do_pal = do_oam = 1; }
+        else if (strcmp(region, "nt") == 0)   { do_ram = 0; do_nt = 1; }
+        else if (strcmp(region, "pal") == 0)  { do_ram = 0; do_pal = 1; }
+        else if (strcmp(region, "oam") == 0)  { do_ram = 0; do_oam = 1; }
+        /* "ram" is the default */
+    }
+
+    char *buf = (char *)malloc(65536);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+
+    int pos = snprintf(buf, 65536,
+        "{\"id\":%d,\"ok\":true,\"frame\":%u,\"diffs\":[",
+        id, r->frame_number);
+
+    int diff_count = 0;
+    int max_diffs = 256;
+
+    if (do_ram) {
+        for (int i = 0; i < 0x0800 && diff_count < max_diffs; i++) {
+            if (g_ram[i] != r->ram_full[i]) {
+                if (diff_count > 0) buf[pos++] = ',';
+                pos += snprintf(buf + pos, 65536 - pos,
+                    "{\"addr\":\"0x%04X\",\"region\":\"ram\",\"current\":\"0x%02X\",\"historical\":\"0x%02X\"}",
+                    i, g_ram[i], r->ram_full[i]);
+                diff_count++;
+            }
+        }
+    }
+
+    if (do_nt) {
+        for (int i = 0; i < 0x1000 && diff_count < max_diffs; i++) {
+            if (g_ppu_nt[i] != r->ppu_nt[i]) {
+                if (diff_count > 0) buf[pos++] = ',';
+                pos += snprintf(buf + pos, 65536 - pos,
+                    "{\"addr\":\"0x%04X\",\"region\":\"nt\",\"current\":\"0x%02X\",\"historical\":\"0x%02X\"}",
+                    0x2000 + i, g_ppu_nt[i], r->ppu_nt[i]);
+                diff_count++;
+            }
+        }
+    }
+
+    if (do_pal) {
+        for (int i = 0; i < 0x20 && diff_count < max_diffs; i++) {
+            if (g_ppu_pal[i] != r->ppu_pal[i]) {
+                if (diff_count > 0) buf[pos++] = ',';
+                pos += snprintf(buf + pos, 65536 - pos,
+                    "{\"addr\":\"0x%04X\",\"region\":\"pal\",\"current\":\"0x%02X\",\"historical\":\"0x%02X\"}",
+                    0x3F00 + i, g_ppu_pal[i], r->ppu_pal[i]);
+                diff_count++;
+            }
+        }
+    }
+
+    if (do_oam) {
+        for (int i = 0; i < 0x100 && diff_count < max_diffs; i++) {
+            if (g_ppu_oam[i] != r->oam[i]) {
+                if (diff_count > 0) buf[pos++] = ',';
+                pos += snprintf(buf + pos, 65536 - pos,
+                    "{\"addr\":\"0x%04X\",\"region\":\"oam\",\"current\":\"0x%02X\",\"historical\":\"0x%02X\"}",
+                    0xFE00 + i, g_ppu_oam[i], r->oam[i]);
+                diff_count++;
+            }
+        }
+    }
+
+    pos += snprintf(buf + pos, 65536 - pos, "],\"total_diffs\":%d}", diff_count);
+    send_line(buf);
+    free(buf);
+}
+
+/* ---- read_chr: CHR tile dump with optional decode ---- */
+
+static void handle_read_chr(int id, const char *json)
+{
+    char addr_str[32];
+    uint32_t addr = 0;
+    if (json_get_str(json, "addr", addr_str, sizeof(addr_str)))
+        addr = hex_to_u32(addr_str);
+
+    int len = json_get_int(json, "len", 16);  /* default: 1 tile (16 bytes) */
+    if (len < 1) len = 1;
+    if (len > 8192) len = 8192;  /* max: entire CHR bank */
+
+    if (addr + len > 0x2000) {
+        send_err(id, "addr+len exceeds CHR range ($0000-$1FFF)");
+        return;
+    }
+
+    /* Build hex string */
+    char *hex = (char *)malloc(len * 2 + 1);
+    if (!hex) { send_err(id, "alloc failed"); return; }
+    for (int i = 0; i < len; i++)
+        snprintf(hex + i * 2, 3, "%02x", g_chr_ram[addr + i]);
+
+    /* Check if caller wants tile decode */
+    int decode = json_get_int(json, "decode", 0);
+
+    if (!decode) {
+        char *buf = (char *)malloc(len * 2 + 256);
+        if (!buf) { free(hex); send_err(id, "alloc failed"); return; }
+        snprintf(buf, len * 2 + 256,
+            "{\"id\":%d,\"ok\":true,\"addr\":\"0x%04X\",\"len\":%d,\"hex\":\"%s\"}",
+            id, addr, len, hex);
+        send_line(buf);
+        free(buf);
+        free(hex);
+        return;
+    }
+
+    /* Decode tiles: each 16 bytes = 1 tile, output 8x8 grid of palette indices (0-3) */
+    int n_tiles = len / 16;
+    /* Each tile: "00112233..." 64 chars. Allocate generously */
+    char *buf = (char *)malloc(n_tiles * 80 + len * 2 + 1024);
+    if (!buf) { free(hex); send_err(id, "alloc failed"); return; }
+
+    int pos = snprintf(buf, n_tiles * 80 + len * 2 + 1024,
+        "{\"id\":%d,\"ok\":true,\"addr\":\"0x%04X\",\"len\":%d,"
+        "\"hex\":\"%s\",\"tiles\":[",
+        id, addr, len, hex);
+
+    for (int t = 0; t < n_tiles && pos < (int)(n_tiles * 80 + len * 2 + 800); t++) {
+        if (t > 0) buf[pos++] = ',';
+        buf[pos++] = '"';
+        const uint8_t *tile = &g_chr_ram[addr + t * 16];
+        for (int row = 0; row < 8; row++) {
+            uint8_t bp0 = tile[row];
+            uint8_t bp1 = tile[row + 8];
+            for (int col = 7; col >= 0; col--) {
+                int px = ((bp1 >> col) & 1) << 1 | ((bp0 >> col) & 1);
+                buf[pos++] = '0' + px;
+            }
+        }
+        buf[pos++] = '"';
+    }
+
+    pos += snprintf(buf + pos, 256, "]}");
+    send_line(buf);
+    free(buf);
+    free(hex);
+}
+
+/* ---- scroll_info: high-level effective scroll state ---- */
+
+static void handle_scroll_info(int id, const char *json)
+{
+    (void)json;
+
+    /* Calculate effective origin in virtual 512x480 nametable space */
+    int origin_x = g_ppuscroll_x + ((g_ppuctrl & 0x01) ? 256 : 0);
+    int origin_y = g_ppuscroll_y + ((g_ppuctrl & 0x02) ? 240 : 0);
+
+    int hud_origin_x = 0, hud_origin_y = 0;
+    if (g_spr0_split_active) {
+        hud_origin_x = g_ppuscroll_x_hud + ((g_ppuctrl_hud & 0x01) ? 256 : 0);
+        hud_origin_y = g_ppuscroll_y_hud + ((g_ppuctrl_hud & 0x02) ? 240 : 0);
+    }
+
+    MapperState ms;
+    mapper_get_state(&ms);
+
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"origin_x\":%d,\"origin_y\":%d,"
+             "\"scroll_x\":%d,\"scroll_y\":%d,"
+             "\"nt_select\":%d,"
+             "\"split_active\":%d,"
+             "\"hud_origin_x\":%d,\"hud_origin_y\":%d,"
+             "\"hud_scroll_x\":%d,\"hud_scroll_y\":%d,"
+             "\"mirror_mode\":%d}",
+             id,
+             origin_x, origin_y,
+             g_ppuscroll_x, g_ppuscroll_y,
+             g_ppuctrl & 0x03,
+             g_spr0_split_active,
+             hud_origin_x, hud_origin_y,
+             g_ppuscroll_x_hud, g_ppuscroll_y_hud,
+             ms.mirroring);
+}
+
+/* ---- dump_nametable_all: dump all 4 nametables in one call ---- */
+
+static void handle_dump_nametables(int id, const char *json)
+{
+    (void)json;
+    /* 4096 bytes of nametable RAM, hex-encoded = 8192 chars */
+    char *hex = (char *)malloc(8193);
+    if (!hex) { send_err(id, "alloc failed"); return; }
+    for (int i = 0; i < 0x1000; i++)
+        snprintf(hex + i * 2, 3, "%02x", g_ppu_nt[i]);
+
+    MapperState ms;
+    mapper_get_state(&ms);
+
+    char *buf = (char *)malloc(8193 + 256);
+    if (!buf) { free(hex); send_err(id, "alloc failed"); return; }
+
+    snprintf(buf, 8193 + 256,
+        "{\"id\":%d,\"ok\":true,\"mirror_mode\":%d,\"hex\":\"%s\"}",
+        id, ms.mirroring, hex);
+    send_line(buf);
+    free(buf);
+    free(hex);
+}
+
+/* ---- Scroll trace ---- */
+
+static void handle_scroll_trace(int id, const char *json)
+{
+    (void)json;
+    extern void runtime_get_scroll_trace(int *out_count, int *out_idx);
+    extern const void *runtime_get_scroll_trace_buf(void);
+    extern uint16_t runtime_get_ppu_t(void);
+    extern uint8_t  runtime_get_ppu_fine_x(void);
+    extern int      runtime_scroll_from_t_valid(void);
+
+    int count, idx;
+    runtime_get_scroll_trace(&count, &idx);
+
+    typedef struct { uint64_t frame; uint8_t val; uint8_t which; } STE;
+    const STE *buf = (const STE *)runtime_get_scroll_trace_buf();
+
+    /* Start from oldest entry, walk forward */
+    int start = (count < 64) ? 0 : idx; /* ring buffer start */
+    int n = count < 64 ? count : 64;
+
+    char entries[4096];
+    int pos = 0;
+    pos += snprintf(entries + pos, sizeof(entries) - pos, "[");
+    for (int i = 0; i < n && pos < (int)sizeof(entries) - 80; i++) {
+        int j = (start + i) % 64;
+        if (i > 0) pos += snprintf(entries + pos, sizeof(entries) - pos, ",");
+        pos += snprintf(entries + pos, sizeof(entries) - pos,
+            "{\"f\":%llu,\"v\":%d,\"w\":\"%s\"}",
+            (unsigned long long)buf[j].frame,
+            buf[j].val,
+            buf[j].which ? "Y" : "X");
+    }
+    pos += snprintf(entries + pos, sizeof(entries) - pos, "]");
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"count\":%d,\"t\":\"0x%04X\",\"fine_x\":%d,"
+             "\"scroll_2005_complete\":%d,\"entries\":%s}",
+             id, count, runtime_get_ppu_t(), runtime_get_ppu_fine_x(),
+             runtime_scroll_from_t_valid(), entries);
+}
+
+/* ---- Command dispatch ---- */
+
+typedef void (*CmdHandler)(int id, const char *json);
+typedef struct {
+    const char *name;
+    const char *summary;       /* one-line description for `help` */
+    CmdHandler  handler;
+} CmdEntry;
+
+static void handle_help(int id, const char *json);
+
+static const CmdEntry s_commands[] = {
+    { "ping",              "no-op connectivity check; returns ok",                                       handle_ping },
+    { "help",              "list all built-in commands with one-line summaries",                          handle_help },
+    { "frame",             "current frame number, bank, and run mode",                                    handle_frame },
+    { "get_registers",     "current 6502 register state (A/X/Y/S/P + flags + bank + frame)",              handle_get_registers },
+    { "read_ram",          "read N bytes from $0000-$07FF starting at addr",                              handle_read_ram },
+    { "dump_ram",          "dump full 2KB work RAM as hex",                                               handle_dump_ram },
+    { "write_ram",         "write a byte to RAM (debug poke)",                                            handle_write_ram },
+    { "read_ppu",          "read N bytes from PPU address space (NT/palette/OAM)",                        handle_read_ppu },
+    { "mapper_state",      "current bank, mapper type, mirror mode, MMC3 register snapshot",              handle_mapper_state },
+    { "read_frame_ram",    "read RAM/SRAM/CHR/NT/PAL from a specific historical frame in the ring",       handle_read_frame_ram },
+    { "restore_frame",     "rewind: restore RAM+PPU+CPU from a historical frame snapshot",                handle_restore_frame },
+    { "save_state",        "save complete emulator state to path at this frame boundary",                 handle_save_state },
+    { "load_state",        "load emulator state from path (same-session rewind is fully supported)",       handle_load_state },
+    { "set_input",         "set controller buttons for a specific frame",                                 handle_set_input },
+    { "press",             "press a button for one frame (transient input)",                              handle_press },
+    { "clear_input",       "clear all input overrides",                                                   handle_clear_input },
+    { "set_turbo",         "enable or disable uncapped runner speed",                                     handle_set_turbo },
+    { "pause",             "pause execution",                                                             handle_pause },
+    { "continue",          "resume after pause",                                                          handle_continue },
+    { "step",              "step one frame while paused",                                                 handle_step },
+    { "run_to_frame",      "resume and pause at a specific frame number",                                 handle_run_to_frame },
+    { "history",           "ring-buffer span: oldest, newest, capacity",                                  handle_history },
+    { "get_frame",         "get a single historical frame record (CPU+PPU+mapper+input)",                 handle_get_frame },
+    { "frame_range",       "get a contiguous span of historical frame records",                           handle_frame_range },
+    { "frame_timeseries",  "extract a timeseries of one field across a range of frames",                  handle_frame_timeseries },
+    { "first_failure",     "verify mode: first frame where native diverged from oracle",                  handle_first_failure },
+    { "ppu_state",         "PPU registers + sprite-0 split state + render-IRQ diagnostics",               handle_ppu_state },
+    { "watchdog_status",   "watchdog backward-branch counter and last firing reason",                     handle_watchdog_status },
+    { "interpreter_stats", "interpreter fallback enablement, work, handoffs, and watchdog counters",       handle_interpreter_stats },
+    { "runtime_faults",    "BRK and unhandled-dispatch policy counters with last BRK location",            handle_runtime_faults },
+    { "fring",             "frame-event ring: VBlank fires + $4014 OAM DMA with phase digests",           handle_fring },
+    { "ftring",            "foreign-controller movement ring: per-tick input, state, velocity, collision", handle_ftring },
+#ifdef RECOMP_STACK_TRACKING
+    { "call_stack",        "current recompile-stack (function-name shadow stack); main loops never pop", handle_call_stack },
+#endif
+    { "dispatch_miss_info", "FIRST CHECK FOR STUCK GAMES: count + ring of call_by_address misses",       handle_dispatch_miss_info },
+    { "quit",              "shut down the runner",                                                        handle_quit },
+    { "screenshot",        "save the current framebuffer to a file",                                      handle_screenshot },
+    { "scroll_trace",      "last 64 writes to $2005 (PPU scroll)",                                        handle_scroll_trace },
+    { "frame_diff",        "diff one frame's verify-mode divergences against the oracle",                 handle_frame_diff },
+    { "read_nametable",    "read tiles from a specific nametable",                                        handle_read_nametable },
+    { "read_oam",          "decoded OAM (64 sprites: x/y/tile/attr/visible)",                             handle_read_oam },
+    { "read_palette",      "current 32-byte palette (universal + 4 BG + 4 SPR groups)",                   handle_read_palette },
+    { "memory_diff",       "diff CURRENT g_ram/nt/pal/oam vs a historical frame; region=ram|nt|pal|oam|all", handle_memory_diff },
+    { "read_chr",          "read CHR ROM/RAM bytes",                                                      handle_read_chr },
+    { "scroll_info",       "decoded Loopy v/t scroll registers + fine-X",                                 handle_scroll_info },
+    { "dump_nametables",   "dump all 4 nametables as hex with mirroring resolved",                        handle_dump_nametables },
+    { NULL, NULL, NULL }
+};
+
+static void handle_help(int id, const char *json)
+{
+    (void)json;
+    /* Single JSON payload listing every built-in command + subsystem prefixes.
+     * Discoverability matters: undocumented commands have repeatedly cost
+     * hours of wrong-direction work when devs grep generated/*.c instead
+     * of querying the server. */
+    char *buf = (char *)malloc(16384);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    int pos = snprintf(buf, 16384,
+        "{\"id\":%d,\"ok\":true,\"commands\":[", id);
+    for (int i = 0; s_commands[i].name; i++) {
+        pos += snprintf(buf + pos, 16384 - pos,
+            "%s{\"name\":\"%s\",\"summary\":\"%s\"}",
+            i ? "," : "",
+            s_commands[i].name,
+            s_commands[i].summary ? s_commands[i].summary : "");
+    }
+    pos += snprintf(buf + pos, 16384 - pos,
+        "],\"subsystems\":["
+        "{\"prefix\":\"game-specific\",\"note\":\"per-game extras may register additional commands via game_handle_debug_cmd(). Send the bare command name to see if it responds.\"}"
+        "]}");
+    send_line(buf);
+    free(buf);
+}
+
+static void process_command(const char *line)
+{
+    /* Extract command name and id from JSON */
+    char cmd[64];
+    if (!json_get_str(line, "cmd", cmd, sizeof(cmd))) {
+        /* Maybe it's a bare command name (not JSON) */
+        strncpy(cmd, line, sizeof(cmd) - 1);
+        cmd[sizeof(cmd) - 1] = '\0';
+        /* Strip trailing whitespace */
+        int len = (int)strlen(cmd);
+        while (len > 0 && (cmd[len-1] == '\r' || cmd[len-1] == ' '))
+            cmd[--len] = '\0';
+    }
+
+    int id = json_get_int(line, "id", 0);
+
+    /* Try game-specific command handler first (allows overriding built-ins) */
+    if (game_handle_debug_cmd(cmd, id, line))
+        return;
+
+    /* A netplay session owns execution (recomp-ai-rules/NETPLAY.md §6): the
+     * verbs that pause, step, rewind, inject input or poke state would either
+     * stop answering the peers or put local state into a shared simulation.
+     * They stay registered so the refusal names the alternative. */
+    if (g_nes_session_locked) {
+        static const char *const refused[] = {
+            "write_ram", "restore_frame", "save_state", "load_state", "set_input",
+            "press", "set_turbo", "pause", "continue", "step", "run_to_frame", NULL
+        };
+        for (int r = 0; refused[r]; r++) {
+            if (strcmp(cmd, refused[r]) == 0) {
+                send_err(id, "refused: a netplay session owns execution -- free-run "
+                             "every peer and query the rings instead (NETPLAY.md 6)");
+                return;
+            }
+        }
+    }
+
+    for (const CmdEntry *e = s_commands; e->name; e++) {
+        if (strcmp(cmd, e->name) == 0) {
+            e->handler(id, line);
+            return;
+        }
+    }
+
+    send_err(id, "unknown command (try 'help' for the full command list)");
+}
+
+/* ---- Public API ---- */
+
+void debug_server_init(int port)
+{
+    if (port > 0) s_port = port;
+    const char *port_env = getenv("NESRECOMP_DEBUG_PORT");
+    if (port_env && *port_env) {
+        char *end = NULL;
+        long env_port = strtol(port_env, &end, 10);
+        if (end != port_env && *end == '\0' && env_port > 0 && env_port <= 65535)
+            s_port = (int)env_port;
+        else
+            fprintf(stderr, "[debug] Ignoring invalid NESRECOMP_DEBUG_PORT='%s'\n", port_env);
+    }
+    const char *start_paused_env = getenv("NESRECOMP_START_PAUSED");
+    if (start_paused_env && *start_paused_env &&
+        strcmp(start_paused_env, "0") != 0) {
+        s_paused = 1;
+    }
+
+#ifdef _WIN32
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+
+    s_listen = socket(AF_INET, SOCK_STREAM, 0);
+    if (s_listen == SOCK_INVALID) {
+        fprintf(stderr, "[debug] Failed to create socket\n");
+        return;
+    }
+
+    int yes = 1;
+    setsockopt(s_listen, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((uint16_t)s_port);
+
+    if (bind(s_listen, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "[debug] Failed to bind port %d\n", s_port);
+        sock_close(s_listen);
+        s_listen = SOCK_INVALID;
+        return;
+    }
+
+    listen(s_listen, 1);
+    set_nonblocking(s_listen);
+
+    /* Initialize ring buffer (heap-allocated for full-state snapshots) */
+    if (!s_frame_history) {
+        size_t sz = sizeof(NESFrameRecord) * FRAME_HISTORY_CAP;
+        s_frame_history = (NESFrameRecord *)calloc(FRAME_HISTORY_CAP, sizeof(NESFrameRecord));
+        if (!s_frame_history) {
+            fprintf(stderr, "[debug] Failed to allocate ring buffer (%zu MB)\n", sz / (1024*1024));
+            return;
+        }
+        fprintf(stderr, "[debug] Ring buffer allocated: %zu MB (%d frames × %zu bytes)\n",
+                sz / (1024*1024), FRAME_HISTORY_CAP, sizeof(NESFrameRecord));
+    }
+    s_history_count = 0;
+
+    fprintf(stderr, "[debug] TCP server listening on 127.0.0.1:%d\n", s_port);
+}
+
+void debug_server_poll(void)
+{
+    if (s_listen == SOCK_INVALID) return;
+
+    /* Accept new client if none connected */
+    if (s_client == SOCK_INVALID) {
+        struct sockaddr_in caddr;
+        int clen = sizeof(caddr);
+        sock_t c = accept(s_listen, (struct sockaddr *)&caddr, &clen);
+        if (c != SOCK_INVALID) {
+            s_client = c;
+            set_nonblocking(s_client);
+            s_recv_len = 0;
+            fprintf(stderr, "[debug] Client connected\n");
+        }
+        return;  /* no client yet, nothing to poll */
+    }
+
+    /* Receive data */
+    int space = RECV_BUF_SIZE - s_recv_len - 1;
+    if (space > 0) {
+        int n = recv(s_client, s_recv_buf + s_recv_len, space, 0);
+        if (n > 0) {
+            s_recv_len += n;
+            s_recv_buf[s_recv_len] = '\0';
+        } else if (n == 0) {
+            /* Client disconnected */
+            fprintf(stderr, "[debug] Client disconnected\n");
+            sock_close(s_client);
+            s_client = SOCK_INVALID;
+            s_paused = 0;
+            s_input_override = -1;
+            return;
+        } else {
+            int err = sock_error();
+#ifdef _WIN32
+            if (err != WSAEWOULDBLOCK) {
+#else
+            if (err != EAGAIN && err != EWOULDBLOCK) {
+#endif
+                fprintf(stderr, "[debug] recv error %d, dropping client\n", err);
+                sock_close(s_client);
+                s_client = SOCK_INVALID;
+                s_paused = 0;
+                s_input_override = -1;
+                return;
+            }
+        }
+    }
+
+    /* Process complete lines */
+    char *nl;
+    while ((nl = strchr(s_recv_buf, '\n')) != NULL) {
+        *nl = '\0';
+        /* Also strip \r */
+        if (nl > s_recv_buf && *(nl - 1) == '\r')
+            *(nl - 1) = '\0';
+        if (s_recv_buf[0] != '\0')
+            process_command(s_recv_buf);
+        int consumed = (int)(nl - s_recv_buf) + 1;
+        s_recv_len -= consumed;
+        memmove(s_recv_buf, nl + 1, s_recv_len + 1);
+    }
+}
+
+void debug_server_record_frame(void)
+{
+    if (!s_frame_history) return;
+
+    uint32_t idx = (uint32_t)(g_frame_count % FRAME_HISTORY_CAP);
+    NESFrameRecord *r = &s_frame_history[idx];
+
+    r->frame_number = (uint32_t)g_frame_count;
+
+    /* ---- Verify-mode result (set by a game's verify_mode via setter) ---- */
+    if (s_pending_verify_set) {
+        r->verify_pass = s_pending_verify_pass;
+        r->diff_count  = s_pending_verify_diff_count;
+        int n = s_pending_verify_n_diffs;
+        if (n > MAX_FRAME_DIFFS) n = MAX_FRAME_DIFFS;
+        memset(r->diffs, 0, sizeof(r->diffs));
+        for (int i = 0; i < n; i++) r->diffs[i] = s_pending_verify_diffs[i];
+        s_pending_verify_set        = 0;
+        s_pending_verify_pass       = -1;
+        s_pending_verify_diff_count = 0;
+        s_pending_verify_n_diffs    = 0;
+    } else {
+        r->verify_pass = -1;
+        r->diff_count  = 0;
+        memset(r->diffs, 0, sizeof(r->diffs));
+    }
+
+    /* ---- CPU state (exhaustive) ---- */
+    r->cpu_a = g_cpu.A;
+    r->cpu_x = g_cpu.X;
+    r->cpu_y = g_cpu.Y;
+    r->cpu_s = g_cpu.S;
+    r->cpu_p = (uint8_t)((g_cpu.N<<7)|(g_cpu.V<<6)|(1<<5)|
+                          (g_cpu.D<<3)|(g_cpu.I<<2)|(g_cpu.Z<<1)|g_cpu.C);
+    r->cpu_n = g_cpu.N; r->cpu_v = g_cpu.V; r->cpu_d = g_cpu.D;
+    r->cpu_i = g_cpu.I; r->cpu_z = g_cpu.Z; r->cpu_c = g_cpu.C;
+
+    /* ---- PPU registers (exhaustive) ---- */
+    r->ppuctrl     = g_ppuctrl;
+    r->ppumask     = g_ppumask;
+    r->ppustatus   = g_ppustatus;
+    r->oamaddr     = g_oamaddr;
+    r->ppuscroll_x = g_ppuscroll_x;
+    r->ppuscroll_y = g_ppuscroll_y;
+    r->ppuaddr     = runtime_get_ppuaddr();
+    {
+        uint8_t al, sl;
+        runtime_get_latch_state(&al, &sl);
+        r->ppuaddr_latch = al;
+        r->scroll_latch  = sl;
+    }
+    r->ppudata_buf = runtime_get_ppudata_buf();
+
+    /* ---- Sprite-0 split state ---- */
+    r->ppuscroll_x_hud = g_ppuscroll_x_hud;
+    r->ppuscroll_y_hud = g_ppuscroll_y_hud;
+    r->ppuctrl_hud     = g_ppuctrl_hud;
+    r->spr0_split_active = g_spr0_split_active;
+    r->spr0_reads_ctr    = g_spr0_reads_ctr_legacy;
+    /* Split-scanline diagnostics: OAM[0].Y is this frame's split input;
+     * g_render_post_irq_split_y/use_hud are last frame's render outputs. */
+    r->spr0_oam_y        = g_ppu_oam[0];
+    r->render_split_y    = (int16_t)g_render_post_irq_split_y;
+    r->render_use_hud    = (int8_t)g_render_post_irq_use_hud;
+    r->spr0_hit_scanline = (int16_t)g_predicted_spr0_scanline;
+    r->spr0_split_write_sl = (int16_t)g_spr0_split_write_scanline;
+
+    /* ---- VBlank / timing state ---- */
+    {
+        uint32_t ops; int depth;
+        runtime_get_vblank_state(&ops, &depth);
+        r->ops_count    = ops;
+        r->vblank_depth = depth;
+    }
+
+    /* ---- Mapper (exhaustive) ---- */
+    r->current_bank = g_current_bank;
+    mapper_get_state(&r->mapper);
+
+    /* ---- Controller state (exhaustive) ---- */
+    r->controller1_buttons = g_controller1_buttons;
+    r->controller2_buttons = g_controller2_buttons;
+    runtime_get_controller_shift(&r->ctrl1_shift, &r->ctrl2_shift, &r->ctrl1_strobe);
+
+    /* ---- Full memory snapshots ---- */
+    memcpy(r->ram_full, g_ram,     0x0800);
+    memcpy(r->sram,     g_sram,    0x2000);
+    memcpy(r->chr_ram,  g_chr_ram, 0x2000);
+    memcpy(r->ppu_nt,   g_ppu_nt,  0x1000);
+    memcpy(r->ppu_pal,  g_ppu_pal, 0x20);
+    memcpy(r->oam,      g_ppu_oam, 0x100);
+    if (g_ws_oam_sidecar) {
+        memcpy(r->oam_x16, g_oam_x16, sizeof(r->oam_x16));
+    } else {
+        for (int i = 0; i < 64; i++) r->oam_x16[i] = g_ppu_oam[i * 4 + 3];
+    }
+
+    /* Game-specific data (filled by game hook) */
+    memset(r->game_data, 0, sizeof(r->game_data));
+    game_fill_frame_record(r);
+
+    /* Last function */
+#ifdef RECOMP_STACK_TRACKING
+    strncpy(r->last_func, g_last_recomp_func ? g_last_recomp_func : "(none)",
+            sizeof(r->last_func) - 1);
+    r->last_func[sizeof(r->last_func) - 1] = '\0';
+#else
+    strcpy(r->last_func, "(no tracking)");
+#endif
+
+    s_history_count = g_frame_count + 1;
+
+    /* Step mode: count down and re-pause */
+    if (s_step_count > 0) {
+        s_step_count--;
+        if (s_step_count == 0) {
+            s_paused = 1;
+            send_fmt("{\"event\":\"step_done\",\"frame\":%llu}",
+                     (unsigned long long)g_frame_count);
+        }
+    }
+
+    /* Run-to-frame: pause when target reached */
+    if (s_run_to > 0 && g_frame_count >= s_run_to) {
+        s_paused = 1;
+        s_run_to = 0;
+        send_fmt("{\"event\":\"run_to_done\",\"frame\":%llu}",
+                 (unsigned long long)g_frame_count);
+    }
+}
+
+/* Public read-only accessor for the frame ring buffer. Returns NULL if the
+ * frame is out of range or has been evicted by wrap-around. */
+const NESFrameRecord *debug_server_get_frame_record(uint64_t frame)
+{
+    if (!s_frame_history) return NULL;
+    uint64_t oldest = (s_history_count > FRAME_HISTORY_CAP)
+                    ? s_history_count - FRAME_HISTORY_CAP : 0;
+    if (frame < oldest || frame >= s_history_count) return NULL;
+    uint32_t idx = (uint32_t)(frame % FRAME_HISTORY_CAP);
+    const NESFrameRecord *r = &s_frame_history[idx];
+    /* Sanity: the slot's frame_number should match what the caller asked for.
+     * If not, the record was evicted between the range check and the read. */
+    if ((uint64_t)r->frame_number != frame) return NULL;
+    return r;
+}
+
+/* Raise the pause flag from outside the TCP command loop (e.g. from
+ * dispatch-miss trap policy). Reason is best-effort recorded into the
+ * existing miss state for visibility; we don't have a dedicated trap-reason
+ * channel yet, so a printf line is the minimum to avoid silently halting. */
+void debug_server_request_pause(const char *reason)
+{
+    if (!s_paused) {
+        printf("[debug_server] TRAP: %s — pause set; resume via TCP `continue`\n",
+               reason ? reason : "(no reason)");
+        fflush(stdout);
+    }
+    s_paused = 1;
+}
+
+void debug_server_wait_if_paused(void)
+{
+    while (s_paused) {
+        /* Keep polling TCP commands (so "continue" can arrive) */
+        debug_server_poll();
+
+        /* Pump SDL events (so window doesn't freeze) */
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) {
+                fprintf(stderr, "[RunnerExit] SDL_QUIT while TCP-paused at frame %llu\n",
+                        (unsigned long long)g_frame_count);
+                exit(0);
+            }
+            if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) {
+                fprintf(stderr, "[RunnerExit] Escape key while TCP-paused at frame %llu\n",
+                        (unsigned long long)g_frame_count);
+                exit(0);
+            }
+        }
+
+        SDL_Delay(5);  /* 5ms sleep to avoid busy loop */
+    }
+}
+
+void debug_server_shutdown(void)
+{
+    if (s_client != SOCK_INVALID) {
+        sock_close(s_client);
+        s_client = SOCK_INVALID;
+    }
+    if (s_listen != SOCK_INVALID) {
+        sock_close(s_listen);
+        s_listen = SOCK_INVALID;
+    }
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    fprintf(stderr, "[debug] Server shut down\n");
+}
+
+int debug_server_is_connected(void)
+{
+    return s_client != SOCK_INVALID;
+}
+
+int debug_server_get_input_override(void)
+{
+    if (s_input_override >= 0 && s_input_frames > 0) {
+        if (--s_input_frames == 0)
+            s_input_override = -1;  /* auto-clear after N frames */
+    }
+    return s_input_override;
+}
+
+void debug_server_set_verify_result(int passed, int diff_count,
+                                    const FrameDiffEntry *diffs, int n_diffs)
+{
+    s_pending_verify_set        = 1;
+    s_pending_verify_pass       = passed ? 1 : 0;
+    s_pending_verify_diff_count = diff_count;
+    if (n_diffs < 0) n_diffs = 0;
+    if (n_diffs > MAX_FRAME_DIFFS) n_diffs = MAX_FRAME_DIFFS;
+    s_pending_verify_n_diffs = n_diffs;
+    if (diffs && n_diffs > 0)
+        memcpy(s_pending_verify_diffs, diffs, n_diffs * sizeof(FrameDiffEntry));
+}

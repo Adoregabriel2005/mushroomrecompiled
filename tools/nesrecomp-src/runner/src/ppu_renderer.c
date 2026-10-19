@@ -1,0 +1,1328 @@
+/*
+ * ppu_renderer.c — NES PPU background + sprite rendering
+ *
+ * Phase 1: BG nametable → CHR tiles → palette → ARGB8888 framebuffer
+ * Phase 2: OAM sprites
+ */
+#include "nes_runtime.h"
+#include "mapper.h"
+#include "hdpack.h"
+#include "ppu_dot.h"   /* g_dot_ppu_on: custom renderer is per-frame-renderer only */
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>  /* getenv (debug taps) */
+
+/* PNG save wrapper — implemented in main_runner.c */
+extern void save_png(const char *path, int w, int h, const void *rgb, int stride);
+
+/* Debug toggle — when set, suppress MMC3 IRQ firing during rendering. */
+int g_disable_render_irq = 0;
+extern uint16_t g_ppuaddr;  /* PPU address register (runtime.c) */
+
+/* Optional per-slot OAM suppression, installed by ppu_renderer_set_sprite_suppress().
+ * NULL by default, so a game/mod that never calls the setter draws every slot
+ * exactly as before. */
+static PpuSpriteSuppressFn s_sprite_suppress_fn   = NULL;
+static void               *s_sprite_suppress_user = NULL;
+/* Optional game-owned wide compositor (nes_runtime.h, NesCustomRenderFn).
+ * NULL by default: the render path below is then exactly the stock one. */
+static NesCustomRenderFn   s_custom_render_fn     = NULL;
+static void               *s_custom_render_user   = NULL;
+static uint32_t            s_native_scratch[256 * 240];
+static uint8_t            *s_bg_opaque_snapshot   = NULL;
+static uint32_t           *s_bg_color_snapshot    = NULL;
+static size_t              s_bg_opaque_capacity   = 0;
+static size_t              s_bg_color_capacity    = 0;
+static int                 s_bg_opaque_width      = 0;
+
+static int prepare_bg_opaque_snapshot(int width) {
+    size_t needed;
+    uint8_t *grown;
+    uint32_t *grown_colors;
+    if (width <= 0) {
+        s_bg_opaque_width = 0;
+        return 0;
+    }
+    needed = (size_t)width * 240u;
+    if (s_bg_opaque_capacity < needed) {
+        grown = (uint8_t *)realloc(s_bg_opaque_snapshot, needed);
+        if (!grown) {
+            s_bg_opaque_width = 0;
+            return 0;
+        }
+        s_bg_opaque_snapshot = grown;
+        s_bg_opaque_capacity = needed;
+    }
+    if (s_bg_color_capacity != needed) {
+        grown_colors = (uint32_t *)realloc(s_bg_color_snapshot,
+                                           needed * sizeof(uint32_t));
+        if (!grown_colors) {
+            s_bg_opaque_width = 0;
+            return 0;
+        }
+        s_bg_color_snapshot = grown_colors;
+        s_bg_color_capacity = needed;
+    }
+    s_bg_opaque_width = width;
+    return 1;
+}
+
+void ppu_renderer_set_sprite_suppress(PpuSpriteSuppressFn fn, void *user) {
+    s_sprite_suppress_fn   = fn;
+    s_sprite_suppress_user = user;
+}
+
+int ppu_renderer_sprite_suppressed(int oam_slot, int x, int y) {
+    return s_sprite_suppress_fn &&
+           s_sprite_suppress_fn(oam_slot, x, y, s_sprite_suppress_user);
+}
+
+/* Render-IRQ diagnostic: track last IRQ fire during rendering */
+int      g_render_irq_fired    = 0;   /* 1 if IRQ fired during last render */
+int      g_render_irq_scanline = -1;  /* scanline where IRQ fired */
+uint8_t  g_render_irq_ppuctrl_before = 0;
+uint8_t  g_render_irq_ppuctrl_after  = 0;
+uint8_t  g_render_irq_scrollx_before = 0;
+uint8_t  g_render_irq_scrolly_before = 0;
+uint8_t  g_render_irq_scrollx_after  = 0;
+uint8_t  g_render_irq_scrolly_after  = 0;
+int      g_render_irq_chr_changed = 0;
+/* What the renderer actually uses for scanline after IRQ */
+uint8_t  g_render_post_irq_ppuctrl_row = 0;
+int      g_render_post_irq_chr_base = 0;
+
+/* CHR window as it stood when the frame's render began (pre-IRQ regime).
+ * The BG pass services the MMC3 scanline IRQ row by row, so the game's IRQ
+ * handler swaps CHR banks (SMB3: status-bar banks at scanline 191) BEFORE
+ * the sprite pass runs. Sprites on rows above the switch must fetch their
+ * patterns from this snapshot, not the live (post-IRQ) g_chr_ram — fetching
+ * live gave every sprite the HUD banks: blank patterns in-level (invisible
+ * Mario/enemies), garbage tiles on the SMB3 world map. BG needs no snapshot
+ * because its rows render in scanline order alongside the IRQ service. */
+static uint8_t s_chr_pre_irq[0x2000];
+int      g_render_post_irq_origin_y = 0;
+int      g_render_post_irq_phys_nt = -1;
+int      g_render_post_irq_use_hud = -1;
+int      g_render_post_irq_split_y = -1;
+
+/* NES system palette — 64 colors as ARGB8888 */
+const uint32_t g_nes_palette[64] = {
+    0xFF545454,0xFF001E74,0xFF081090,0xFF300088,0xFF440064,0xFF5C0030,0xFF540400,0xFF3C1800,
+    0xFF202A00,0xFF083A00,0xFF004000,0xFF003C00,0xFF00323C,0xFF000000,0xFF000000,0xFF000000,
+    0xFF989698,0xFF084CC4,0xFF3032EC,0xFF5C1EE4,0xFF8814B0,0xFFA01464,0xFF982220,0xFF783C00,
+    0xFF545A00,0xFF287200,0xFF087C00,0xFF007628,0xFF006678,0xFF000000,0xFF000000,0xFF000000,
+    0xFFECEEEC,0xFF4C9AEC,0xFF787CEC,0xFFB062EC,0xFFE454EC,0xFFEC58B4,0xFFEC6A64,0xFFD48820,
+    0xFFA0AA00,0xFF74C400,0xFF4CD020,0xFF38CC6C,0xFF38B4CC,0xFF3C3C3C,0xFF000000,0xFF000000,
+    0xFFECEEEC,0xFFA8CCEC,0xFFBCBCEC,0xFFD4B2EC,0xFFECAEEC,0xFFECAED4,0xFFECB4B0,0xFFE4C490,
+    0xFFCCD278,0xFFB4DE78,0xFFA8E290,0xFF98E2B4,0xFFA0D6E4,0xFFA0A2A0,0xFF000000,0xFF000000,
+};
+
+/* Resolve a NES palette index (0-3 per tile) + attribute palette (0-3) to ARGB.
+ * pal_base: which 4-color sub-palette (0-3), from attribute table.
+ * color_idx: 0=transparent/BG, 1-3=foreground colors. */
+static uint32_t bg_color(int pal_base, int color_idx) {
+    if (color_idx == 0) {
+        /* Universal background color */
+        return g_nes_palette[g_ppu_pal[0] & 0x3F];
+    }
+    uint8_t nes_color = g_ppu_pal[(pal_base * 4 + color_idx) & 0x1F] & 0x3F;
+    return g_nes_palette[nes_color];
+}
+
+/* Render one 8x8 tile row into framebuf row.
+ * tile_id: nametable tile byte.
+ * pal_base: attribute table palette (0-3).
+ * chr_base: CHR pattern table base ($0000 or $1000) from PPUCTRL bit 4.
+ * tile_row: which row of the tile (0-7).
+ * px_x: starting X pixel in framebuf (0-255).
+ * px_y: Y pixel row in framebuf. */
+static void render_tile_row(uint32_t *framebuf,
+                            int tile_id, int pal_base, int chr_base,
+                            int tile_row, int px_x, int px_y) {
+    if (px_y < 0 || px_y >= 240) return;
+    int chr_offset = chr_base + tile_id * 16 + tile_row;
+    uint8_t lo = g_chr_ram[chr_offset];
+    uint8_t hi = g_chr_ram[chr_offset + 8];
+    for (int bit = 7; bit >= 0; bit--) {
+        int x = px_x + (7 - bit);
+        if (x < 0 || x >= g_render_width) continue;
+        int color_idx = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
+        framebuf[px_y * g_render_width + x] = bg_color(pal_base, color_idx);
+    }
+}
+
+/* Scroll-free dump of the two physical nametables side-by-side (phys0 | phys1),
+ * each 256x240, into a 512x240 PNG.  Renders with the CURRENT CHR pattern base,
+ * attribute palettes, and palette RAM — no scroll/mirroring applied, so it shows
+ * exactly what tile data lives in each nametable.  Debug tool for localizing
+ * render-vs-state bugs (env-gated NESRECOMP_NT_DUMP in main_runner). */
+void ppu_dump_nametables(const char *path) {
+    static uint8_t rgb[512 * 240 * 3];
+    int chr_base = (g_ppuctrl & 0x10) ? 0x1000 : 0x0000;
+    for (int phys = 0; phys < 2; phys++) {
+        int nt_off = phys * 0x400;
+        int ox = phys * 256;
+        for (int ty = 0; ty < 30; ty++) {
+            for (int tx = 0; tx < 32; tx++) {
+                uint8_t tile_id = g_ppu_nt[(nt_off + ty * 32 + tx) & 0x0FFF];
+                uint8_t attr = g_ppu_nt[(nt_off + 0x3C0 + (ty / 4) * 8 + (tx / 4)) & 0x0FFF];
+                int sub_x = (tx / 2) & 1, sub_y = (ty / 2) & 1;
+                int pal_base = (attr >> ((sub_y * 2 + sub_x) * 2)) & 0x03;
+                for (int r = 0; r < 8; r++) {
+                    int co = chr_base + tile_id * 16 + r;
+                    uint8_t lo = g_chr_ram[co], hi = g_chr_ram[co + 8];
+                    for (int b = 7; b >= 0; b--) {
+                        int ci = ((lo >> b) & 1) | (((hi >> b) & 1) << 1);
+                        uint32_t c = bg_color(pal_base, ci);
+                        int px = ox + tx * 8 + (7 - b), py = ty * 8 + r;
+                        int i = (py * 512 + px) * 3;
+                        rgb[i + 0] = (c >> 16) & 0xFF;
+                        rgb[i + 1] = (c >> 8) & 0xFF;
+                        rgb[i + 2] = c & 0xFF;
+                    }
+                }
+            }
+        }
+    }
+    save_png(path, 512, 240, rgb, 512 * 3);
+}
+
+/* ---- OAM Debug View ----
+ * Renders all 64 OAM slots as an 8x8 grid into a 256x256 ARGB buffer.
+ * Each cell is 32x32 (8px tile at 4x scale).
+ * Border colors:
+ *   dark gray   = slot off-screen (Y >= $EF)
+ *   white/cyan/green/magenta = palette 0-3, sprite in front of BG
+ *   yellow      = sprite behind BG (priority bit set)
+ * Transparent pixels rendered as dark magenta (#200020).
+ */
+void ppu_render_oam_debug(uint32_t *buf) {
+    /* Dark background */
+    for (int i = 0; i < 256 * 256; i++) buf[i] = 0xFF101010;
+
+    /* Grid lines */
+    for (int gy = 0; gy < 256; gy++)
+        for (int gx = 0; gx < 256; gx++)
+            if (gx % 32 == 0 || gy % 32 == 0)
+                buf[gy * 256 + gx] = 0xFF282828;
+
+    int spr_base = (g_ppuctrl & 0x08) ? 0x1000 : 0x0000;
+
+    /* Border palette: slot on-screen, by palette 0-3 */
+    static const uint32_t pal_border[4] = {
+        0xFFFFFFFF, /* pal 0: white */
+        0xFF00FFFF, /* pal 1: cyan */
+        0xFF00FF00, /* pal 2: green */
+        0xFFFF00FF, /* pal 3: magenta */
+    };
+
+    for (int slot = 0; slot < 64; slot++) {
+        uint8_t sy   = g_ppu_oam[slot * 4 + 0];
+        uint8_t stile= g_ppu_oam[slot * 4 + 1];
+        uint8_t sattr= g_ppu_oam[slot * 4 + 2];
+        /* sx unused for rendering but kept for symmetry */
+
+        int col = slot % 8;
+        int row = slot / 8;
+        int ox  = col * 32;
+        int oy  = row * 32;
+
+        int off_screen = (sy >= 0xEF);
+        int pal        = (sattr & 0x03);
+        int flip_h     = (sattr >> 6) & 1;
+        int flip_v     = (sattr >> 7) & 1;
+        int behind_bg  = (sattr >> 5) & 1;
+
+        uint32_t border = off_screen ? 0xFF303030
+                        : behind_bg  ? 0xFFFFFF00
+                        : pal_border[pal];
+
+        /* Draw 1px border around 32x32 cell */
+        for (int bx = ox; bx < ox + 32; bx++) {
+            buf[oy * 256 + bx]        = border;
+            buf[(oy + 31) * 256 + bx] = border;
+        }
+        for (int by = oy; by < oy + 32; by++) {
+            buf[by * 256 + ox]        = border;
+            buf[by * 256 + (ox + 31)] = border;
+        }
+
+        /* Render tile pixels at 4x scale (1px border inset → 30x30 usable, but we
+         * actually use 32x32 and let border overdraw the outermost pixel row) */
+        int spr_pal = pal + 4; /* sprite palettes start at sub-palette 4 in g_ppu_pal */
+        int chr_off = spr_base + stile * 16;
+
+        for (int tr = 0; tr < 8; tr++) {
+            int src_row = flip_v ? (7 - tr) : tr;
+            uint8_t lo = g_chr_ram[chr_off + src_row];
+            uint8_t hi = g_chr_ram[chr_off + src_row + 8];
+
+            for (int b = 7; b >= 0; b--) {
+                int src_bit = flip_h ? (7 - b) : b;
+                int ci = ((lo >> src_bit) & 1) | (((hi >> src_bit) & 1) << 1);
+                uint32_t color;
+                if (ci == 0) {
+                    color = off_screen ? 0xFF181818 : 0xFF200020; /* transparent: dark magenta */
+                } else {
+                    uint8_t nc = g_ppu_pal[(spr_pal * 4 + ci) & 0x1F] & 0x3F;
+                    color = g_nes_palette[nc];
+                    if (off_screen) {
+                        /* Dim off-screen sprites to 25% brightness */
+                        uint8_t r = ((color >> 16) & 0xFF) >> 2;
+                        uint8_t g = ((color >>  8) & 0xFF) >> 2;
+                        uint8_t bv= ( color        & 0xFF) >> 2;
+                        color = 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | bv;
+                    }
+                }
+                int px0 = ox + (7 - b) * 4;
+                int py0 = oy + tr * 4;
+                for (int dy = 0; dy < 4; dy++)
+                    for (int dx = 0; dx < 4; dx++)
+                        buf[(py0 + dy) * 256 + (px0 + dx)] = color;
+            }
+        }
+
+        /* Redraw border on top so it isn't overwritten by tile pixels */
+        for (int bx = ox; bx < ox + 32; bx++) {
+            buf[oy * 256 + bx]        = border;
+            buf[(oy + 31) * 256 + bx] = border;
+        }
+        for (int by = oy; by < oy + 32; by++) {
+            buf[by * 256 + ox]        = border;
+            buf[by * 256 + (ox + 31)] = border;
+        }
+    }
+}
+
+/* Diagnostic counters for the title-screen first-divergence investigation.
+ * Disabled by default — re-enable by setting RECOMP_RENDER_DIAG to 1. */
+#define RECOMP_RENDER_DIAG 1
+#if RECOMP_RENDER_DIAG
+uint32_t g_ppu_render_calls   = 0;
+uint32_t g_ppu_render_skipped = 0;
+uint8_t  g_ppu_render_last_mask = 0;
+uint8_t  g_ppu_render_last_ctrl = 0;
+uint8_t  g_ppu_render_last_pal0 = 0;
+uint8_t  g_ppu_render_last_chr00 = 0;  /* g_chr_ram[0x1000] (BG ptn $00 row 0) */
+#endif
+
+/* Compute BG color index (0..3) at screen pixel (sx, sy), using the
+ * current scroll/PPUCTRL state.  Self-contained — does NOT track the
+ * mid-frame v-register state used by ppu_render_frame; intended for
+ * the sprite-0-hit predictor which only needs frame-start scroll.
+ *
+ * Returns 0 if the BG pixel is the universal background (transparent
+ * for sprite-0-hit purposes), else 1..3. */
+static int bg_color_idx_at(int sx, int sy) {
+    if (sx < 0 || sx >= 256 || sy < 0 || sy >= 240) return 0;
+    int chr_base = (g_ppuctrl & 0x10) ? 0x1000 : 0x0000;
+    int origin_x = g_ppuscroll_x + ((g_ppuctrl & 0x01) ? 256 : 0);
+    int origin_y = g_ppuscroll_y + ((g_ppuctrl & 0x02) ? 240 : 0);
+    int abs_x = origin_x + sx;
+    int abs_y = origin_y + sy;
+    int nt_x  = abs_x & 0x1FF;     /* 9-bit wrap (512px nametable space) */
+    int nt_y  = abs_y;
+    if (nt_y >= 480) nt_y -= 480;
+    int tile_x = nt_x / 8;
+    int tile_y = nt_y / 8;
+    int pixel_col = nt_x % 8;
+    int tile_row  = nt_y % 8;
+    int nt_col = (tile_x >= 32) ? 1 : 0;
+    int nt_row = (tile_y >= 30) ? 1 : 0;
+    int local_tx = tile_x % 32;
+    int local_ty = tile_y % 30;
+    int virt_nt = nt_row * 2 + nt_col;
+    int phys_nt;
+    switch (mapper_get_mirroring()) {
+        case 0:  phys_nt = 0;            break;
+        case 1:  phys_nt = 1;            break;
+        case 2:  phys_nt = virt_nt & 1;  break;
+        case 3:  phys_nt = virt_nt >> 1; break;
+        default: phys_nt = virt_nt & 1;  break;
+    }
+    int nt_off  = phys_nt * 0x400;
+    uint8_t tile_id = g_ppu_nt[(nt_off + local_ty * 32 + local_tx) & 0x0FFF];
+    int bit = 7 - pixel_col;
+    int chr_off = chr_base + tile_id * 16 + tile_row;
+    return ((g_chr_ram[chr_off]     >> bit) & 1)
+         | (((g_chr_ram[chr_off + 8] >> bit) & 1) << 1);
+}
+
+int ppu_renderer_background_opaque(int framebuffer_x, int y) {
+    if (!s_bg_opaque_snapshot || framebuffer_x < 0 ||
+        framebuffer_x >= s_bg_opaque_width || y < 0 || y >= 240)
+        return 0;
+    return s_bg_opaque_snapshot[(size_t)y * s_bg_opaque_width +
+                                framebuffer_x] != 0;
+}
+
+void ppu_renderer_set_background_opaque_frame(const uint8_t *pixels,
+                                              int width, int height) {
+    if (!pixels || height != 240 || !prepare_bg_opaque_snapshot(width))
+        return;
+    memcpy(s_bg_opaque_snapshot, pixels, (size_t)width * 240u);
+}
+
+/* Predict the scanline at which sprite 0 first hits BG this frame, by
+ * scanning sprite 0's vertical span against the BG.  Returns 240 if no
+ * hit will occur (rendering disabled, sprite off-screen, no overlap).
+ *
+ * Mirrors the render-time hit detection in ppu_render_frame's sprite
+ * loop (PPUMASK gating, x=255 suppression, leftmost-8 clipping).
+ *
+ * Used by ppu_read_reg($2002) to set bit 6 at the right CPU cycle
+ * position, so games whose hit-detect spin-waits poll $2002 mid-frame
+ * (Gumshoe-style zappers) see the bit flip when the beam would have
+ * reached sprite 0 — not at end-of-frame. */
+int ppu_predict_spr0_hit_scanline(void) {
+    /* Both BG and sprite rendering must be enabled for sprite-0-hit. */
+    if ((g_ppumask & 0x18) != 0x18) return 240;
+
+    int spr_y    = g_ppu_oam[0];
+    if (spr_y >= 0xEF) return 240;     /* off-screen sentinel */
+
+    int spr_tile = g_ppu_oam[1];
+    int spr_attr = g_ppu_oam[2];
+    int spr_x    = g_ppu_oam[3];
+    int flip_h   = (spr_attr >> 6) & 1;
+    int flip_v   = (spr_attr >> 7) & 1;
+    int spr_tall = (g_ppuctrl & 0x20) != 0;
+    int spr_height = spr_tall ? 16 : 8;
+
+    int spr_chr_base = (g_ppuctrl & 0x08) ? 0x1000 : 0x0000;
+    int tile_chr_base, tile_base;
+    if (spr_tall) {
+        tile_chr_base = (spr_tile & 1) ? 0x1000 : 0x0000;
+        tile_base = spr_tile & 0xFE;
+    } else {
+        tile_chr_base = spr_chr_base;
+        tile_base = spr_tile;
+    }
+
+    int bg_clip_left   = !(g_ppumask & 0x02);  /* PPUMASK bit 1: 0 = clip BG x<8 */
+    int spr_clip_left  = !(g_ppumask & 0x04);  /* PPUMASK bit 2: 0 = clip sprites x<8 */
+
+    for (int row = 0; row < spr_height; row++) {
+        int draw_row = flip_v ? (spr_height - 1 - row) : row;
+        int py = spr_y + 1 + row;     /* OAM Y is offset by 1 */
+        if (py < 0 || py >= 240) continue;
+
+        int tile_row = draw_row;
+        int tile_num = tile_base;
+        if (spr_tall && tile_row >= 8) {
+            tile_num = tile_base + 1;
+            tile_row -= 8;
+        }
+
+        int chr_off = tile_chr_base + tile_num * 16 + tile_row;
+        uint8_t lo = g_chr_ram[chr_off];
+        uint8_t hi = g_chr_ram[chr_off + 8];
+
+        for (int bit = 7; bit >= 0; bit--) {
+            int chr_bit = flip_h ? (7 - bit) : bit;
+            int px = spr_x + (7 - bit);
+            if (px < 0 || px >= 256) continue;
+            if (px == 255) continue;          /* hardware suppresses hit at x=255 */
+            int spr_color = ((lo >> chr_bit) & 1) | (((hi >> chr_bit) & 1) << 1);
+            if (spr_color == 0) continue;     /* sprite pixel transparent */
+            if (px < 8 && spr_clip_left) continue;
+            if (px < 8 && bg_clip_left)  continue;
+            if (bg_color_idx_at(px, py) != 0)
+                return py;                    /* first scanline with overlap */
+        }
+    }
+    return 240;
+}
+
+/* Service the MMC3 scanline IRQ for ONE PPU scanline: clock the counter and,
+ * if it fires (and IRQ rendering isn't suppressed), dispatch the game's IRQ
+ * handler — pushing P/PCL/PCH in NMI convention so RTI pops them, and syncing
+ * scroll from the PPU v register if the handler wrote $2006. The handler may
+ * swap CHR banks / scroll mid-frame. `reported_scanline` is recorded for the
+ * IRQ diagnostics (pass -1 for the pre-render line).
+ *
+ * Hardware clocks this counter via the A12 rising edge on the pre-render line
+ * (-1) AND each visible line (0-239) = 241 clocks/frame. Clocking only 0-239
+ * left the counter one clock behind, firing the IRQ ~1 scanline late vs the
+ * oracle (IRQ_SLICE_001: recomp scanline 0 vs Mesen pre-render -1). For
+ * non-MMC3 mappers mapper_clock_scanline() returns 0, so this is a no-op. */
+static void service_mmc3_scanline_irq(int reported_scanline) {
+    if (g_disable_render_irq)
+        return;
+    if (mapper_clock_scanline()) {
+        g_render_irq_ppuctrl_before = g_ppuctrl;
+        g_render_irq_scrollx_before = g_ppuscroll_x;
+        g_render_irq_scrolly_before = g_ppuscroll_y;
+        uint8_t chr_before[0x2000];
+        memcpy(chr_before, g_chr_ram, sizeof(chr_before));
+        uint64_t v_write_epoch_before = runtime_get_ppu_v_write_epoch();
+        runtime_call_irq_handler();
+        /* Mid-frame $2006 writes set the PPU v register directly. The
+         * renderer must derive scroll from v (not t/$2005) so the IRQ
+         * handler's scroll change takes effect. Detect the completed write
+         * pair, not a value change: Kirby writes $0000 when v is already
+         * $0000, but the PPUCTRL nametable bits still need to sync from v. */
+        if (runtime_get_ppu_v_write_epoch() != v_write_epoch_before)
+            runtime_sync_scroll_from_v();
+        g_render_irq_fired    = 1;
+        g_render_irq_scanline = reported_scanline;
+        g_render_irq_ppuctrl_after  = g_ppuctrl;
+        g_render_irq_scrollx_after  = g_ppuscroll_x;
+        g_render_irq_scrolly_after  = g_ppuscroll_y;
+        g_render_irq_chr_changed = memcmp(chr_before, g_chr_ram, sizeof(chr_before)) != 0;
+    }
+}
+
+static void render_frame_native(uint32_t *framebuf) {
+    g_render_irq_fired = 0;
+    g_render_irq_scanline = -1;
+    g_render_irq_chr_changed = 0;
+#if RECOMP_RENDER_DIAG
+    g_ppu_render_calls++;
+    g_ppu_render_last_mask  = g_ppumask;
+    g_ppu_render_last_ctrl  = g_ppuctrl;
+    g_ppu_render_last_pal0  = g_ppu_pal[0];
+    g_ppu_render_last_chr00 = g_chr_ram[0x1000];
+#endif
+
+    /* When rendering is fully disabled (BG + sprites off), keep the previous
+     * frame's content rather than blanking.  On real NES the CRT continues
+     * displaying the last rendered scanlines, so brief rendering-off windows
+     * during nametable loads (ppumask=$06) are invisible.  Without this,
+     * those frames flash the universal background color — visible as HUD
+     * flicker on LCD displays. */
+    if (!(g_ppumask & 0x18)) {
+#if RECOMP_RENDER_DIAG
+        g_ppu_render_skipped++;
+#endif
+        return;
+    }
+
+    /* Record the exact background coverage painted below, after all of this
+     * frame's scroll splits, mirroring, CHR-bank changes, clipping, and
+     * widescreen projection. Post-render replacements can then honor sprite
+     * priority without reimplementing a second, subtly different PPU. */
+    if (prepare_bg_opaque_snapshot(g_render_width))
+        memset(s_bg_opaque_snapshot, 0, (size_t)g_render_width * 240u);
+
+    /* HD texture pack: per-pixel record of the visible tile, consumed by the
+     * upscaler after this pass. Cleared here (not on the disabled-render early
+     * return above) so kept frames keep a side channel matching the framebuffer.
+     * g_hp stays NULL — and all recording below is skipped — when no pack is
+     * active, so the native render path is unchanged. */
+    HdPixel *g_hp = NULL;
+    if (hdpack_recording()) { hdpack_frame_begin(); g_hp = hdpack_pixels(); }
+
+    /* Pre-IRQ CHR snapshot for the sprite pass (see s_chr_pre_irq). Taken
+     * before any scanline-IRQ service can rebank the live window. */
+    memcpy(s_chr_pre_irq, g_chr_ram, sizeof(s_chr_pre_irq));
+    uint8_t render_oam[0x100];
+    uint16_t render_oam_x16[64];
+    uint8_t render_start_mask = g_ppumask;
+    memcpy(render_oam, g_ppu_oam, sizeof(render_oam));
+    memcpy(render_oam_x16, g_oam_x16, sizeof(render_oam_x16));
+
+    uint8_t render_start_ctrl = g_ppuctrl;
+    uint8_t render_start_sx = g_ppuscroll_x;
+    uint8_t render_start_sy = g_ppuscroll_y;
+    uint16_t render_start_t = runtime_get_ppu_t() & 0x3FFF;
+    uint64_t render_start_frame = 0;
+    int have_render_start = runtime_get_visible_frame_start(&render_start_ctrl,
+                                                            &render_start_sx,
+                                                            &render_start_sy,
+                                                            &render_start_t,
+                                                            &render_start_frame);
+    int mapper_irq_split_scanline = -1;
+    uint8_t mapper_irq_ctrl_before = 0, mapper_irq_mask_before = 0;
+    uint8_t mapper_irq_sx_before = 0, mapper_irq_sy_before = 0;
+    uint8_t mapper_irq_ctrl_after = 0, mapper_irq_mask_after = 0;
+    uint8_t mapper_irq_sx_after = 0, mapper_irq_sy_after = 0;
+    int mapper_irq_split_active =
+        runtime_get_mapper_irq_split(&mapper_irq_split_scanline,
+                                     &mapper_irq_ctrl_before,
+                                     &mapper_irq_mask_before,
+                                     &mapper_irq_sx_before,
+                                     &mapper_irq_sy_before,
+                                     &mapper_irq_ctrl_after,
+                                     &mapper_irq_mask_after,
+                                     &mapper_irq_sx_after,
+                                     &mapper_irq_sy_after,
+                                     NULL);
+
+    /* Effective widescreen margins this frame: clamp the per-frame values
+     * to the configured framebuffer margins; -1 = follow configured.
+     * With margins configured 0 (default) both resolve to 0 and every
+     * widescreen branch below reduces exactly to the vanilla path. */
+    int ws_eff_l = g_ws_eff_left, ws_eff_r = g_ws_eff_right;
+    if (ws_eff_l < 0 || ws_eff_l > g_widescreen_left)  ws_eff_l = g_widescreen_left;
+    if (ws_eff_r < 0 || ws_eff_r > g_widescreen_right) ws_eff_r = g_widescreen_right;
+
+    /* Universal background color */
+    uint32_t bg = g_nes_palette[g_ppu_pal[0] & 0x3F];
+    if (g_widescreen_left || g_widescreen_right) {
+        /* Pillarbox: pixels outside the effective span render black. */
+        for (int i = 0; i < g_render_width * 240; i++) framebuf[i] = 0xFF000000u;
+        int span_x0 = g_widescreen_left - ws_eff_l;
+        int span_w  = 256 + ws_eff_l + ws_eff_r;
+        for (int sy = 0; sy < 240; sy++) {
+            uint32_t *row = framebuf + (size_t)sy * g_render_width + span_x0;
+            for (int i = 0; i < span_w; i++) row[i] = bg;
+        }
+    } else {
+        for (int i = 0; i < g_render_width * 240; i++) framebuf[i] = bg;
+    }
+    if (s_bg_opaque_width == g_render_width && s_bg_color_snapshot) {
+        memcpy(s_bg_color_snapshot, framebuf,
+               (size_t)g_render_width * 240u * sizeof(uint32_t));
+    }
+
+    /* Only render if BG rendering is enabled ($2001 bit 3) */
+    if (!(g_ppumask & 0x08)) goto render_sprites;
+
+    {
+        /* Frame-start sync of v from t — see 81b8a47 commit message for rationale */
+        if (!have_render_start) {
+            runtime_set_ppuaddr(runtime_get_ppu_t() & 0x3FFF);
+            if (runtime_scroll_from_t_valid()) {
+                runtime_sync_scroll_from_t();
+            }
+            render_start_ctrl = g_ppuctrl;
+            render_start_sx = g_ppuscroll_x;
+            render_start_sy = g_ppuscroll_y;
+        }
+        {
+            extern void runtime_record_frame_start_scroll(void);
+            runtime_record_frame_start_scroll();
+        }
+
+        /* Split-screen: rows 0..split_y-1 use HUD scroll (captured at sprite-0 hit);
+         * rows split_y..239 use the post-split game-area scroll.
+         * When no split occurred this frame, all rows use current scroll. */
+        /* On real NES, sprite-0 hit always fires when the sprite overlaps
+         * a non-transparent BG pixel — it's a hardware signal, not software.
+         * Our counter-based $2002 sim can miss, so fall back: if sprite 0 is
+         * on-screen and rendering is enabled, assume the split happens.
+         * HUD scroll values are pre-captured as (0,0) at VBlank start.
+         *
+         * split_y is tile-aligned: round the sprite's last scanline (Y+8) up
+         * to the next 8-pixel boundary.  This ensures the HUD/gameplay
+         * boundary lands on a tile row edge, preventing seam artifacts.
+         *   SMB:      OAM[0].Y=$18(24) → (24+15)&~7 = 32  (4 tile rows)
+         *   Faxanadu: OAM[0].Y=$17(23) → (23+15)&~7 = 32  (4 tile rows)
+         *
+         * Hysteresis: if OAM[0] was recently on-screen with a valid split,
+         * maintain the split for a few frames even if OAM[0] is temporarily
+         * hidden (e.g. during DMA timing or mode transition).  This prevents
+         * single-frame HUD disappearances. */
+        static int s_last_valid_split_y = 240;
+        static int s_split_holdoff      = 0;
+
+        int spr0_y  = (int)(g_ppu_oam[0]);
+        /* Sprite-0 scroll split: activate only when the hardware sprite-0 hit
+         * detection fired this frame. No game-specific RAM checks.
+         * The g_spr0_reads_ctr heuristic was removed — it false-triggers on
+         * games that poll $2002 for VBlank detection (e.g. Yoshi's Cookie). */
+        int split_y;
+        if (g_zapper_enabled) {
+            /* Light-gun (Zapper) games do NOT use a sprite-0 scroll split.
+             * Duck Hunt is a fixed screen; Gumshoe full-scrolls the playfield
+             * with a sprite-based HUD.  Their OAM slot 0 is a cycled gameplay
+             * sprite — slot 0 is round-robined every frame to spread the
+             * 8-sprites-per-scanline load — so its Y jumps frame-to-frame, and
+             * the Zapper's heavy $2002 polling drives the legacy sprite-0 pulse
+             * counter (ppu_read_reg $2002, runtime.c) to fire a SPURIOUS hit.
+             * The resulting split lands at whatever position the gameplay sprite
+             * happens to be and alternates every frame, dragging whole BG rows
+             * (e.g. Gumshoe's floating platforms + ground) between the stale HUD
+             * scroll and the live game scroll — the reported per-frame flicker.
+             * No Zapper game here does a genuine mid-frame scroll change, so
+             * render every scanline from the current scroll (no split). Verified
+             * live by the owner: Gumshoe renders correctly with the split off. */
+            split_y = 240;
+        } else if (g_spr0_split_active) {
+            /* Split lands just below sprite-0 (the HUD/playfield boundary),
+             * tile-aligned. Use the ACTUAL sprite height: the old (spr0_y + 15)
+             * hardcoded an 8px sprite (8 + 7), placing the split a tile row too
+             * high for games with an 8x16 sprite-0. Zelda: OAM[0].Y=39, 8x16 ->
+             * bottom at 55 -> split 56; the old 48 sheared the bottom HUD rows
+             * (hearts) right along with the playfield during a screen scroll.
+             * 8x8 games are unchanged: (y + 8 + 7) == (y + 15). */
+            int spr_height = (g_ppuctrl & 0x20) ? 16 : 8;
+            split_y = (spr0_y + spr_height + 7) & ~7;  /* tile-aligned sprite-0 bottom */
+            if (split_y > 240) split_y = 240;
+            s_last_valid_split_y = split_y;
+            s_split_holdoff      = 6;       /* maintain for up to 6 frames */
+        } else if (s_split_holdoff > 0) {
+            /* OAM[0] hidden but recently had a valid split — hold it */
+            split_y = s_last_valid_split_y;
+            s_split_holdoff--;
+        } else {
+            split_y = 240;
+        }
+
+        /* DEBUG (env-gated): per-frame PPU state, for localizing render bugs. */
+        if (getenv("NESRECOMP_SPLIT_DEBUG")) {
+            int spr_on = 0;
+            for (int s = 0; s < 64; s++) if (g_ppu_oam[s*4] < 0xEF) spr_on++;
+            fprintf(stderr,
+                "[yc] F=%llu act=%d split_y=%d mir=%d ctrl=%02X mask=%02X "
+                "scroll=%d,%d hud=%d,%d t=%04X v=%04X OAM0=Y%d T%02X X%d spr_on=%d\n",
+                (unsigned long long)g_frame_count, g_spr0_split_active, split_y,
+                mapper_get_mirroring(), g_ppuctrl, g_ppumask,
+                g_ppuscroll_x, g_ppuscroll_y, g_ppuscroll_x_hud, g_ppuscroll_y_hud,
+                runtime_get_ppu_t() & 0x3FFF, g_ppuaddr,
+                g_ppu_oam[0], g_ppu_oam[1], g_ppu_oam[3], spr_on);
+        }
+
+        /* MMC1 mirroring — look up once per frame, not per pixel */
+        int mirroring = mapper_get_mirroring();
+
+        /* Canonical PPU vertical state — used only when scroll_y >= 240
+         * (the "negative Y scroll" trick: writing $2005 with y in 240..255
+         * sets coarse_y to 30 or 31, which on real hardware wraps to 0
+         * within the SAME nametable, not the next one).  The default linear
+         * nt_y model below does not honor that wrap rule, but is correct
+         * for normal scroll values; we keep it as the default path so the
+         * frame-by-frame behavior on non-negative-Y screens is unchanged. */
+        int v_coarse_y = 0, v_fine_y = 0, v_nt_row = 0;
+        int use_canonical = 0;
+        int v_initialized = 0;
+        int v_last_use_hud = -1;
+        int v_last_scroll_y = -1;
+        int v_last_ppuctrl_nt = -1;
+
+        /* Incremental absolute nametable Y — models real PPU v register
+         * auto-increment so MMC3 IRQ scroll splits don't double-count.
+         * Only reset when scroll_y or nt_bit actually changes (IRQ case),
+         * NOT on sprite-0 HUD/game transitions where Y stays the same. */
+        int abs_nt_y = -1;
+
+        /* Pre-render line (-1): the MMC3 A12 clock fires here too on hardware
+         * (the counter clocks scanlines -1..239 = 241/frame). Clock it BEFORE
+         * the visible lines so a top-of-frame IRQ lands on the pre-render line,
+         * matching the oracle (was ~1 scanline late — IRQ_SLICE_001). */
+        service_mmc3_scanline_irq(-1);
+
+        for (int sy = 0; sy < 240; sy++) {
+            /* Choose scroll source for this scanline. Mapper 40's CPU-clocked
+             * IRQ runs in the runtime, not this row-by-row MMC3 render path,
+             * so use the captured pre/post IRQ scroll when present. */
+            int use_hud = (split_y < 240 && sy < split_y);
+            int after_mapper_irq = mapper_irq_split_active &&
+                                   sy >= mapper_irq_split_scanline + 1;
+            uint8_t live_ppuctrl;
+            int live_scroll_x;
+            int live_scroll_y;
+            if (g_render_irq_fired) {
+                live_ppuctrl = g_ppuctrl;
+                live_scroll_x = g_ppuscroll_x;
+                live_scroll_y = g_ppuscroll_y;
+            } else if (after_mapper_irq) {
+                live_ppuctrl = mapper_irq_ctrl_after;
+                live_scroll_x = mapper_irq_sx_after;
+                live_scroll_y = mapper_irq_sy_after;
+            } else if (mapper_irq_split_active) {
+                live_ppuctrl = mapper_irq_ctrl_before;
+                live_scroll_x = mapper_irq_sx_before;
+                live_scroll_y = mapper_irq_sy_before;
+            } else if (have_render_start) {
+                live_ppuctrl = render_start_ctrl;
+                live_scroll_x = render_start_sx;
+                live_scroll_y = render_start_sy;
+            } else {
+                live_ppuctrl = g_ppuctrl;
+                live_scroll_x = g_ppuscroll_x;
+                live_scroll_y = g_ppuscroll_y;
+            }
+            uint8_t ppuctrl_row = use_hud ? g_ppuctrl_hud  : live_ppuctrl;
+            int     scroll_x    = use_hud ? g_ppuscroll_x_hud : live_scroll_x;
+            int     scroll_y    = use_hud ? g_ppuscroll_y_hud : live_scroll_y;
+
+            /* BG pattern table: PPUCTRL bit 4 selects $0000 or $1000 */
+            int chr_base = (ppuctrl_row & 0x10) ? 0x1000 : 0x0000;
+            const uint8_t *bg_chr_src = g_chr_ram;
+
+            /* Capture post-IRQ rendering state on the scanline right after IRQ */
+            if ((g_render_irq_fired && sy == g_render_irq_scanline + 1) ||
+                (mapper_irq_split_active && sy == mapper_irq_split_scanline + 1)) {
+                g_render_post_irq_ppuctrl_row = ppuctrl_row;
+                g_render_post_irq_chr_base = chr_base;
+                g_render_post_irq_use_hud = use_hud;
+                g_render_post_irq_split_y = split_y;
+                g_render_post_irq_origin_y = scroll_y + ((ppuctrl_row & 0x02) ? 240 : 0);
+            }
+
+            /* Scroll origin in combined 512×480 nametable space.
+             * PPUCTRL bits 0-1 select the base nametable (add 256 or 240 to scroll). */
+            int origin_x = scroll_x + ((ppuctrl_row & 0x01) ? 256 : 0);
+            int origin_y = scroll_y + ((ppuctrl_row & 0x02) ? 240 : 0);
+
+            /* (Re)initialize the canonical state on first scanline, on
+             * use_hud transition, OR if scroll source changed mid-frame. */
+            int cur_nt_y_bit = (ppuctrl_row & 0x02) ? 1 : 0;
+            if (!v_initialized
+                || use_hud != v_last_use_hud
+                || scroll_y != v_last_scroll_y
+                || cur_nt_y_bit != v_last_ppuctrl_nt) {
+                if (scroll_y >= 240) {
+                    use_canonical = 1;
+                    v_coarse_y = (scroll_y >> 3) & 0x1F;
+                    v_fine_y   = scroll_y & 0x07;
+                    v_nt_row   = cur_nt_y_bit;
+                } else {
+                    use_canonical = 0;
+                }
+                v_initialized     = 1;
+                v_last_use_hud    = use_hud;
+                /* Reset abs_nt_y only when the Y scroll source actually
+                 * changed (IRQ mid-frame split).  A sprite-0 HUD/game
+                 * transition with the same scroll_y must NOT reset — the
+                 * incremental counter is already correct from prior rows. */
+                if (abs_nt_y < 0
+                    || scroll_y != v_last_scroll_y
+                    || cur_nt_y_bit != v_last_ppuctrl_nt) {
+                    abs_nt_y = scroll_y + (cur_nt_y_bit ? 240 : 0);
+                }
+                v_last_scroll_y   = scroll_y;
+                v_last_ppuctrl_nt = cur_nt_y_bit;
+            }
+
+            int nt_row, local_ty, tile_row;
+            if (use_canonical) {
+                nt_row   = v_nt_row;
+                local_ty = v_coarse_y;
+                tile_row = v_fine_y;
+            } else {
+                int nt_y = abs_nt_y;
+                if (nt_y >= 480) nt_y -= 480;
+                int tile_y = nt_y / 8;
+                tile_row = nt_y % 8;
+                nt_row   = (tile_y >= 30) ? 1 : 0;
+                local_ty = tile_y % 30;
+            }
+
+            /* Capture nt_row for post-IRQ diagnostic */
+            if ((g_render_irq_fired && sy == g_render_irq_scanline + 1) ||
+                (mapper_irq_split_active && sy == mapper_irq_split_scanline + 1)) {
+                g_render_post_irq_phys_nt = nt_row; /* store nt_row; phys_nt computed per-pixel */
+            }
+
+            /*
+             * Fetch background state once per CHR tile span, not once per
+             * pixel. Nametable, attribute, palette, and pattern bytes are
+             * constant until the next 8-pixel boundary; only the CHR bit and
+             * destination X advance inside the span. The first/last spans may
+             * be partial because fine-X scroll and widescreen margins are not
+             * necessarily tile-aligned.
+             *
+             * IRQ-driven state changes still occur between scanlines above,
+             * exactly where the per-pixel loop observed them.
+             */
+            uint32_t bg_palettes[4][4];
+            uint32_t row_bg =
+                g_nes_palette[g_ppu_pal[0] & 0x3F];
+            for (int p = 0; p < 4; p++) {
+                bg_palettes[p][0] = row_bg;
+                for (int c = 1; c < 4; c++) {
+                    uint8_t nes_color =
+                        g_ppu_pal[(p * 4 + c) & 0x1F] & 0x3F;
+                    bg_palettes[p][c] = g_nes_palette[nes_color];
+                }
+            }
+
+            int sx = -ws_eff_l;
+            int sx_end = 256 + ws_eff_r;
+            uint32_t *frame_row = framebuf + (size_t)sy * g_render_width;
+            while (sx < sx_end) {
+                int nt_x = (origin_x + sx) & 0x1FF;  /* 9-bit wrap */
+                int pixel_col = nt_x & 7;
+                int span = 8 - pixel_col;
+                if (span > sx_end - sx) span = sx_end - sx;
+
+                int tile_x   = nt_x >> 3;
+                int nt_col   = tile_x >> 5;
+                int local_tx = tile_x & 31;
+
+                /* Resolve virtual NT to physical NT using cached mirroring mode */
+                int virt_nt = nt_row * 2 + nt_col;
+                int phys_nt;
+                switch (mirroring) {
+                    case 0:  phys_nt = 0;            break; /* one-screen lower */
+                    case 1:  phys_nt = 1;            break; /* one-screen upper */
+                    case 2:  phys_nt = virt_nt & 1;  break; /* vertical */
+                    case 3:  phys_nt = virt_nt >> 1; break; /* horizontal */
+                    default: phys_nt = virt_nt & 1;  break;
+                }
+                int nt_off = phys_nt * 0x400;
+
+                uint8_t tile_id =
+                    g_ppu_nt[(nt_off + local_ty * 32 + local_tx) & 0x0FFF];
+                int attr_bx = local_tx >> 2;
+                int attr_by = local_ty >> 2;
+                uint8_t attr =
+                    g_ppu_nt[(nt_off + 0x3C0 + attr_by * 8 + attr_bx) & 0x0FFF];
+                int sub_x = (local_tx >> 1) & 1;
+                int sub_y = (local_ty >> 1) & 1;
+                int pal_base =
+                    (attr >> ((sub_y * 2 + sub_x) * 2)) & 0x03;
+
+                int chr_off = chr_base + tile_id * 16 + tile_row;
+                uint8_t chr_lo = bg_chr_src[chr_off];
+                uint8_t chr_hi = bg_chr_src[chr_off + 8];
+                const uint32_t *colors = bg_palettes[pal_base];
+
+                for (int i = 0; i < span; i++) {
+                    int tile_pixel = pixel_col + i;
+                    int bit = 7 - tile_pixel;
+                    int color_idx = ((chr_lo >> bit) & 1) |
+                                    (((chr_hi >> bit) & 1) << 1);
+                    int screen_x = sx + i;
+                    int fb_x = screen_x + g_widescreen_left;
+
+                    /* PPUMASK bit 1: clip leftmost 8 BG pixels to background */
+                    if (screen_x >= 0 && screen_x < 8 &&
+                        !(g_ppumask & 0x02)) {
+                        frame_row[fb_x] = bg;
+                        if (s_bg_opaque_width == g_render_width &&
+                            fb_x >= 0 && fb_x < g_render_width) {
+                            size_t off = (size_t)sy * g_render_width + fb_x;
+                            s_bg_opaque_snapshot[off] = 0;
+                            s_bg_color_snapshot[off] = bg;
+                        }
+                    } else {
+                        uint32_t bgc = colors[color_idx];
+                        frame_row[fb_x] = bgc;
+                        if (s_bg_opaque_width == g_render_width &&
+                            fb_x >= 0 && fb_x < g_render_width) {
+                            size_t off = (size_t)sy * g_render_width + fb_x;
+                            s_bg_opaque_snapshot[off] = color_idx != 0;
+                            s_bg_color_snapshot[off] = bgc;
+                        }
+                        if (g_hp && fb_x >= 0 && fb_x < g_render_width) {
+                            HdPixel *hp =
+                                &g_hp[(size_t)sy * g_render_width + fb_x];
+                            hp->bg_has   = 1;
+                            hp->bg_index =
+                                (int32_t)((chr_base >> 4) + tile_id);
+                            hp->bg_t16 =
+                                &bg_chr_src[chr_base + tile_id * 16];
+                            hp->bg_p0 = g_ppu_pal[0] & 0x3F;
+                            hp->bg_p1 =
+                                g_ppu_pal[(pal_base * 4 + 1) & 0x1F] & 0x3F;
+                            hp->bg_p2 =
+                                g_ppu_pal[(pal_base * 4 + 2) & 0x1F] & 0x3F;
+                            hp->bg_p3 =
+                                g_ppu_pal[(pal_base * 4 + 3) & 0x1F] & 0x3F;
+                            hp->bg_ox = (uint8_t)tile_pixel;
+                            hp->bg_oy = (uint8_t)tile_row;
+                            hp->bg_argb = bgc;
+                            hp->backdrop = bg;
+                        }
+                    }
+                }
+
+                sx += span;
+            }
+
+            /* Canonical-mode per-scanline advance (only when active). */
+            if (use_canonical) {
+                v_fine_y++;
+                if (v_fine_y == 8) {
+                    v_fine_y = 0;
+                    if (v_coarse_y == 29) {
+                        v_coarse_y = 0;
+                        v_nt_row ^= 1;
+                    } else if (v_coarse_y == 31) {
+                        v_coarse_y = 0;          /* same-NT wrap, no toggle */
+                    } else {
+                        v_coarse_y = (v_coarse_y + 1) & 0x1F;
+                    }
+                }
+            } else {
+                abs_nt_y++;
+            }
+
+            /* Clock the MMC3 scanline counter after painting this visible line.
+             * The line's pattern fetches generate the A12 edge, so IRQ handler
+             * writes belong to following scanlines. */
+            service_mmc3_scanline_irq(sy);
+        }
+
+        if (getenv("NESRECOMP_SPLIT_DEBUG")) {
+            fprintf(stderr,
+                "[irq] F=%llu fired=%d sl=%d ctrl_before=%02X ctrl_after=%02X "
+                "scroll_after=%d,%d post_row_ctrl=%02X post_chr=%04X "
+                "post_use_hud=%d post_split=%d post_origin_y=%d post_nt_row=%d\n",
+                (unsigned long long)g_frame_count,
+                g_render_irq_fired, g_render_irq_scanline,
+                g_render_irq_ppuctrl_before, g_render_irq_ppuctrl_after,
+                g_render_irq_scrollx_after, g_render_irq_scrolly_after,
+                g_render_post_irq_ppuctrl_row, g_render_post_irq_chr_base,
+                g_render_post_irq_use_hud, g_render_post_irq_split_y,
+                g_render_post_irq_origin_y, g_render_post_irq_phys_nt);
+        }
+    }
+
+render_sprites:
+
+    /* Phase 2: Sprites (OAM) — skip if sprite rendering disabled */
+    if (!(render_start_mask & 0x10)) return;
+
+    /* DEBUG: save OAM tile sheet — 8 cols x 8 rows, each tile at 4x scale (32x32px)
+     * Image = 256x256. Magenta BG, grid lines. Transparent pixels = magenta.
+     * Also writes a text file with OAM slot info + full palette dump. */
+    if (0 && g_frame_count >= 300 && g_frame_count % 60 == 0) {
+        #define SCALE 4
+        #define CELL (8 * SCALE)   /* 32 */
+        #define GCOLS 8
+        #define GROWS 8
+        #define GW (CELL * GCOLS)  /* 256 */
+        #define GH (CELL * GROWS)  /* 256 */
+        static uint32_t oam_img[GW * GH];
+        int sb = (g_ppuctrl & 0x08) ? 0x1000 : 0x0000;
+        /* Magenta background */
+        for (int i = 0; i < GW * GH; i++) oam_img[i] = 0xFFFF00FF;
+        /* Grid lines (dark gray) */
+        for (int gy = 0; gy < GH; gy++)
+            for (int gx = 0; gx < GW; gx++)
+                if (gx % CELL == 0 || gy % CELL == 0)
+                    oam_img[gy * GW + gx] = 0xFF333333;
+
+        for (int si = 0; si < 64; si++) {
+            uint8_t sy = g_ppu_oam[si*4+0], st = g_ppu_oam[si*4+1];
+            uint8_t sa = g_ppu_oam[si*4+2];
+            int col = si % GCOLS, row = si / GCOLS;
+            int ox = col * CELL + 1, oy = row * CELL + 1;
+            if (sy >= 0xEF) {
+                /* Mark hidden slots with dark gray fill */
+                for (int py = oy; py < oy + CELL - 1 && py < GH; py++)
+                    for (int px = ox; px < ox + CELL - 1 && px < GW; px++)
+                        oam_img[py * GW + px] = 0xFF222222;
+                continue;
+            }
+            int sp = (sa & 3) + 4;
+            for (int tr = 0; tr < 8; tr++) {
+                int co = sb + st * 16 + tr;
+                uint8_t lo = g_chr_ram[co], hi = g_chr_ram[co + 8];
+                for (int b = 7; b >= 0; b--) {
+                    int ci = ((lo >> b) & 1) | (((hi >> b) & 1) << 1);
+                    uint32_t color;
+                    if (ci == 0)
+                        color = 0xFFFF00FF; /* transparent = magenta */
+                    else {
+                        uint8_t nc = g_ppu_pal[(sp*4+ci) & 0x1F] & 0x3F;
+                        color = g_nes_palette[nc];
+                    }
+                    int px0 = ox + (7 - b) * SCALE;
+                    int py0 = oy + tr * SCALE;
+                    for (int dy = 0; dy < SCALE; dy++)
+                        for (int dx = 0; dx < SCALE; dx++) {
+                            int fx = px0 + dx, fy = py0 + dy;
+                            if (fx < GW && fy < GH)
+                                oam_img[fy * GW + fx] = color;
+                        }
+                }
+            }
+        }
+        /* Save image */
+        {
+            static uint8_t rgb[GW * GH * 3];
+            for (int i = 0; i < GW * GH; i++) {
+                rgb[i*3+0] = (oam_img[i] >> 16) & 0xFF;
+                rgb[i*3+1] = (oam_img[i] >>  8) & 0xFF;
+                rgb[i*3+2] =  oam_img[i]        & 0xFF;
+            }
+            char path[80];
+            snprintf(path, sizeof(path), "C:/temp/oam_sheet_%04llu.png",
+                     (unsigned long long)g_frame_count);
+            save_png(path, GW, GH, rgb, GW * 3);
+        }
+        /* Save text info */
+        {
+            char path[80];
+            snprintf(path, sizeof(path), "C:/temp/oam_info_%04llu.txt",
+                     (unsigned long long)g_frame_count);
+            FILE *f = fopen(path, "w");
+            if (f) {
+                fprintf(f, "Frame %llu  PPUCTRL=$%02X  spr_chr=$%04X\n",
+                        (unsigned long long)g_frame_count, g_ppuctrl, sb);
+                fprintf(f, "Palette: ");
+                for (int i = 0; i < 32; i++) fprintf(f, "%02X ", g_ppu_pal[i]);
+                fprintf(f, "\n\nSlot  Y    Tile Attr  X   Pal  Colors(1/2/3)\n");
+                for (int i = 0; i < 64; i++) {
+                    uint8_t y=g_ppu_oam[i*4], t=g_ppu_oam[i*4+1];
+                    uint8_t a=g_ppu_oam[i*4+2], x=g_ppu_oam[i*4+3];
+                    if (y >= 0xEF) continue;
+                    int p=(a&3)+4;
+                    fprintf(f, " %2d  %3d   $%02X  $%02X  %3d   %d   $%02X/$%02X/$%02X\n",
+                            i, y, t, a, x, p,
+                            g_ppu_pal[(p*4+1)&0x1F], g_ppu_pal[(p*4+2)&0x1F],
+                            g_ppu_pal[(p*4+3)&0x1F]);
+                }
+                fclose(f);
+            }
+        }
+    }
+
+    /* PPUCTRL bit 5: 0 = 8x8 sprites, 1 = 8x16 sprites */
+    int spr_tall = (g_ppuctrl & 0x20) != 0;
+    int spr_height = spr_tall ? 16 : 8;
+    /* Sprite pattern table: PPUCTRL bit 3 selects $0000 or $1000 (8x8 mode only) */
+    int spr_chr_base = (g_ppuctrl & 0x08) ? 0x1000 : 0x0000;
+
+    /* OAM: 64 sprites × 4 bytes: [Y, tile, attr, X] */
+    for (int s = 63; s >= 0; s--) {  /* draw back-to-front so sprite 0 is on top */
+        uint8_t spr_y    = render_oam[s * 4 + 0];
+        uint8_t spr_tile = render_oam[s * 4 + 1];
+        uint8_t spr_attr = render_oam[s * 4 + 2];
+        /* Sidecar-enabled games render from the unwrapped 16-bit X (which
+         * equals the OAM byte for sprites on the vanilla screen); everyone
+         * else uses the vanilla 8-bit OAM X. */
+        int spr_x = g_ws_oam_sidecar ? (int)render_oam_x16[s]
+                                     : (int)render_oam[s * 4 + 3];
+
+        if (spr_y >= 0xEF) continue; /* off-screen */
+        if (ppu_renderer_sprite_suppressed(s, spr_x, spr_y + 1))
+            continue; /* mod-owned replacement is drawing this slot instead */
+
+        int flip_h   = (spr_attr >> 6) & 1;
+        int flip_v   = (spr_attr >> 7) & 1;
+        int priority = (spr_attr >> 5) & 1; /* 0=in front, 1=behind BG */
+        int spr_pal  = (spr_attr & 0x03) + 4; /* sprite palettes start at $3F10, offset 4 */
+
+        /* 8x16 mode: tile bit 0 selects pattern table, top tile = tile & 0xFE */
+        int tile_base, tile_chr_base;
+        if (spr_tall) {
+            tile_chr_base = (spr_tile & 1) ? 0x1000 : 0x0000;
+            tile_base = spr_tile & 0xFE;
+        } else {
+            tile_chr_base = spr_chr_base;
+            tile_base = spr_tile;
+        }
+
+        for (int row = 0; row < spr_height; row++) {
+            int draw_row = flip_v ? (spr_height - 1 - row) : row;
+            int py = spr_y + 1 + row; /* OAM Y is offset by 1 */
+            if (py < 0 || py >= 240) continue;
+
+            /* Sprite rendering enable is a per-scanline PPU state, not a
+             * whole-frame property.  The background pass above services MMC3
+             * IRQ handlers row-by-row; games such as Kirby disable PPUMASK
+             * sprites for the bottom IRQ status bar.  The deferred sprite pass
+             * must therefore use the frame-start mask before the IRQ and the
+             * live post-IRQ mask after it, otherwise playfield sprites draw
+             * over the HUD/status bar. */
+            int sprite_after_mapper_irq = mapper_irq_split_active &&
+                                          py >= mapper_irq_split_scanline + 1;
+            uint8_t row_mask =
+                (g_render_irq_fired && py >= g_render_irq_scanline + 1)
+                    ? g_ppumask
+                    : (sprite_after_mapper_irq
+                        ? mapper_irq_mask_after
+                        : (mapper_irq_split_active
+                            ? mapper_irq_mask_before
+                            : render_start_mask));
+            if (!(row_mask & 0x10)) continue;
+
+            /* For 8x16: rows 0-7 use top tile, rows 8-15 use bottom tile */
+            int tile_row = draw_row;
+            int tile_num = tile_base;
+            if (spr_tall && tile_row >= 8) {
+                tile_num = tile_base + 1;
+                tile_row -= 8;
+            }
+
+            int chr_off = tile_chr_base + tile_num * 16 + tile_row;
+            /* Sprite pattern fetches happen on each scanline. The BG pass
+             * services the synthetic MMC3 IRQ before this deferred sprite
+             * pass, so sprites above the split must use the CHR window saved
+             * at frame start; only rows after the IRQ see the live window. */
+            const uint8_t *chr_src =
+                (g_render_irq_fired && py >= g_render_irq_scanline + 1)
+                    ? g_chr_ram : s_chr_pre_irq;
+            uint8_t lo = chr_src[chr_off];
+            uint8_t hi = chr_src[chr_off + 8];
+
+            for (int bit = 7; bit >= 0; bit--) {
+                /* flip_h mirrors which CHR bit we read; screen position is always (7-bit) */
+                int chr_bit = flip_h ? (7 - bit) : bit;
+                int px = spr_x + (7 - bit);
+                /* Clip to the effective viewport (vanilla [0,256) when the
+                 * margins are 0). */
+                if (px < -ws_eff_l || px >= 256 + ws_eff_r) continue;
+                int color_idx = ((lo >> chr_bit) & 1) | (((hi >> chr_bit) & 1) << 1);
+                if (color_idx == 0) continue; /* transparent */
+                /* PPUMASK bit 2: clip leftmost 8 sprite pixels */
+                if (px < 8 && !(row_mask & 0x04)) continue;
+                /* Offset sprite X into widescreen framebuffer */
+                int fb_x = px + g_widescreen_left;
+                /* Sprite-0 hit: when sprite 0's opaque pixel overlaps opaque BG,
+                 * set $2002 bit 6. Hardware constraints:
+                 *   - Both BG and sprites must be enabled (PPUMASK bits 3,4).
+                 *   - No hit at x=255 (per NES spec).
+                 *   - Obeys BG/sprite leftmost-8 clip (the px<8 gate above already
+                 *     filters sprite side; BG clip is PPUMASK bit 1). */
+                int bg_opaque =
+                    s_bg_opaque_width == g_render_width &&
+                    fb_x >= 0 && fb_x < g_render_width &&
+                    s_bg_opaque_snapshot[(size_t)py * g_render_width + fb_x];
+                if (s == 0 && px >= 0 && px < 255 && (row_mask & 0x18) == 0x18) {
+                    int bg_clipped = (px < 8 && !(row_mask & 0x02));
+                    if (!bg_clipped && bg_opaque)
+                        g_ppustatus |= 0x40;
+                }
+                /* Priority=1: sprite behind BG — only draw where BG is transparent */
+                if (priority && bg_opaque) {
+                    size_t off = (size_t)py * g_render_width + fb_x;
+                    if (s_bg_color_snapshot)
+                        framebuf[off] = s_bg_color_snapshot[off];
+                    if (g_hp && fb_x >= 0 && fb_x < g_render_width) {
+                        HdPixel *hp = &g_hp[off];
+                        hp->sp_has = 0;
+                    }
+                    continue;
+                }
+                uint8_t nes_color = g_ppu_pal[(spr_pal * 4 + color_idx) & 0x1F] & 0x3F;
+                uint32_t spc = g_nes_palette[nes_color];
+                framebuf[py * g_render_width + fb_x] = spc;
+                if (g_hp && fb_x >= 0 && fb_x < g_render_width) {
+                    HdPixel *hp = &g_hp[py * g_render_width + fb_x];
+                    hp->sp_has   = 1;
+                    hp->sp_index = (int32_t)((tile_chr_base >> 4) + tile_num);
+                    hp->sp_t16   = &chr_src[tile_chr_base + tile_num * 16];
+                    hp->sp_p1 = g_ppu_pal[(spr_pal * 4 + 1) & 0x1F] & 0x3F;
+                    hp->sp_p2 = g_ppu_pal[(spr_pal * 4 + 2) & 0x1F] & 0x3F;
+                    hp->sp_p3 = g_ppu_pal[(spr_pal * 4 + 3) & 0x1F] & 0x3F;
+                    hp->sp_ox = (uint8_t)(7 - bit);   /* screen column within tile */
+                    hp->sp_oy = (uint8_t)(row & 7);   /* screen row within displayed cell */
+                    hp->sp_hm = (uint8_t)flip_h;
+                    hp->sp_vm = (uint8_t)flip_v;
+                    hp->sp_argb = spc;                /* original sprite color (fallback) */
+                }
+            }
+        }
+    }
+
+#if 0 /* DEBUG OVERLAY: green boxes at tile >= $90 positions -- kept for reference */
+    for (int di = 0; di < 64; di++) {
+        uint8_t dy = g_ppu_oam[di*4+0], dt = g_ppu_oam[di*4+1];
+        uint8_t dx = g_ppu_oam[di*4+3];
+        if (dy >= 0xEF) continue;
+        if (dt < 0x90) continue;
+        int by = dy + 1, bx = dx;
+        for (int ry = by - 2; ry < by + 10; ry++)
+            for (int rx = bx - 2; rx < bx + 10; rx++) {
+                if (ry < 0 || ry >= 240 || rx < 0 || rx >= 256) continue;
+                if (ry < by || ry >= by+8 || rx < bx || rx >= bx+8)
+                    framebuf[ry * 256 + rx] = 0xFF00FF00;
+            }
+    }
+#endif
+}
+
+/* ---- Custom (game-owned) wide compositor ---------------------------------- */
+
+int ppu_renderer_set_custom_render(NesCustomRenderFn fn, void *user) {
+    if (fn && g_dot_ppu_on) {
+        fprintf(stderr, "[Render] custom renderer refused: the dot-PPU publishes "
+                        "incrementally (unset NESRECOMP_DOT_PPU)\n");
+        return 0;
+    }
+    s_custom_render_fn   = fn;
+    s_custom_render_user = user;
+    return 1;
+}
+
+int ppu_renderer_custom_render_active(void) {
+    return s_custom_render_fn != NULL && g_render_width > 256;
+}
+
+void ppu_render_frame(uint32_t *framebuf) {
+    if (!ppu_renderer_custom_render_active()) {
+        render_frame_native(framebuf);
+        return;
+    }
+
+    /* Stock pass at stock geometry. Every widescreen branch in the native
+     * renderer reduces to the vanilla path with margins 0, so sprite-0 hit,
+     * IRQ splits and the bg-opacity snapshot are those of a 256-wide frame.
+     * A rendering-disabled frame returns early and keeps the previous scratch
+     * content, mirroring the stock "CRT keeps the last picture" behavior. */
+    int save_w  = g_render_width, save_l = g_widescreen_left, save_r = g_widescreen_right;
+    int save_el = g_ws_eff_left, save_er = g_ws_eff_right;
+    g_render_width = 256; g_widescreen_left = 0; g_widescreen_right = 0;
+    g_ws_eff_left = -1;   g_ws_eff_right = -1;
+    render_frame_native(s_native_scratch);
+    g_render_width = save_w; g_widescreen_left = save_l; g_widescreen_right = save_r;
+    g_ws_eff_left = save_el; g_ws_eff_right = save_er;
+
+    for (int i = 0; i < g_render_width * 240; i++) framebuf[i] = 0xFF000000u;
+    if (s_custom_render_fn(framebuf, g_render_width, 240, g_widescreen_left,
+                           s_native_scratch, s_custom_render_user))
+        return;
+
+    /* Fallback: the stock frame centered in a black pillarbox. */
+    for (int y = 0; y < 240; y++)
+        memcpy(framebuf + (size_t)y * g_render_width + g_widescreen_left,
+               s_native_scratch + (size_t)y * 256, 256 * sizeof(uint32_t));
+}
+
+void ppu_renderer_draw_sprites_wide(uint32_t *out, int out_w, int native_x0,
+                                    const uint8_t *bg_opaque,
+                                    NesSpritePlaceFn place, void *user) {
+    if (!out || out_w <= 0) return;
+    if (!(g_ppumask & 0x10)) return;          /* sprites disabled this frame */
+
+    int spr_tall   = (g_ppuctrl & 0x20) != 0;
+    int spr_height = spr_tall ? 16 : 8;
+    int spr_chr_base = (g_ppuctrl & 0x08) ? 0x1000 : 0x0000;
+
+    for (int s = 63; s >= 0; s--) {           /* back-to-front: slot 0 on top */
+        uint8_t spr_y    = g_ppu_oam[s * 4 + 0];
+        uint8_t spr_tile = g_ppu_oam[s * 4 + 1];
+        uint8_t spr_attr = g_ppu_oam[s * 4 + 2];
+        int screen_x = g_ws_oam_sidecar ? (int)g_oam_x16[s] : (int)g_ppu_oam[s * 4 + 3];
+        if (spr_y >= 0xEF) continue;
+        if (ppu_renderer_sprite_suppressed(s, screen_x, spr_y + 1)) continue;
+
+        int dst_x = screen_x + native_x0;
+        if (place && !place(s, screen_x, spr_y + 1, &dst_x, user)) continue;
+
+        int flip_h   = (spr_attr >> 6) & 1;
+        int flip_v   = (spr_attr >> 7) & 1;
+        int priority = (spr_attr >> 5) & 1;
+        int spr_pal  = (spr_attr & 0x03) + 4;
+        int tile_base, tile_chr_base;
+        if (spr_tall) {
+            tile_chr_base = (spr_tile & 1) ? 0x1000 : 0x0000;
+            tile_base = spr_tile & 0xFE;
+        } else {
+            tile_chr_base = spr_chr_base;
+            tile_base = spr_tile;
+        }
+
+        for (int row = 0; row < spr_height; row++) {
+            int draw_row = flip_v ? (spr_height - 1 - row) : row;
+            int py = spr_y + 1 + row;
+            if (py < 0 || py >= 240) continue;
+            int tile_row = draw_row, tile_num = tile_base;
+            if (spr_tall && tile_row >= 8) { tile_num = tile_base + 1; tile_row -= 8; }
+            int chr_off = tile_chr_base + tile_num * 16 + tile_row;
+            uint8_t lo = g_chr_ram[chr_off], hi = g_chr_ram[chr_off + 8];
+            for (int bit = 7; bit >= 0; bit--) {
+                int chr_bit = flip_h ? (7 - bit) : bit;
+                int color_idx = ((lo >> chr_bit) & 1) | (((hi >> chr_bit) & 1) << 1);
+                if (color_idx == 0) continue;
+                int sx = screen_x + (7 - bit);        /* native-space column */
+                /* PPUMASK bit 2: leftmost 8 native columns clip sprites. */
+                if (sx >= 0 && sx < 8 && !(g_ppumask & 0x04)) continue;
+                int fx = dst_x + (7 - bit);
+                if (fx < 0 || fx >= out_w) continue;
+                size_t off = (size_t)py * out_w + fx;
+                if (priority && bg_opaque && bg_opaque[off]) continue;
+                uint8_t nes_color = g_ppu_pal[(spr_pal * 4 + color_idx) & 0x1F] & 0x3F;
+                out[off] = g_nes_palette[nes_color];
+            }
+        }
+    }
+}

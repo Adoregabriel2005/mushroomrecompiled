@@ -1,0 +1,162 @@
+/*
+ * rom_parser.c — iNES header parsing, bank extraction, vector reads
+ */
+#include "rom_parser.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+bool rom_parse(const char *path, NESRom *out) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "rom_parser: cannot open %s\n", path);
+        return false;
+    }
+
+    /* Read iNES header */
+    uint8_t header[INES_HEADER_SIZE];
+    if (fread(header, 1, INES_HEADER_SIZE, f) != INES_HEADER_SIZE) {
+        fclose(f);
+        return false;
+    }
+
+    /* Validate magic */
+    if (header[0] != 'N' || header[1] != 'E' || header[2] != 'S' || header[3] != 0x1A) {
+        fprintf(stderr, "rom_parser: not an iNES file\n");
+        fclose(f);
+        return false;
+    }
+
+    if (!nes_cart_header(header, sizeof(header), &out->cart)) {
+        fclose(f);
+        return false;
+    }
+    out->nes2 = out->cart.nes2 != 0;
+    out->prg_banks = (out->cart.prg_size + 16383) / 16384;
+    out->chr_banks = (out->cart.chr_size + 8191) / 8192;
+    out->mapper = out->cart.mapper;
+
+    /* Reject truncated CHR/trainer data too, before generating any code. */
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long file_size = ftell(f);
+    uint64_t required = out->cart.data_offset + (uint64_t)out->cart.prg_size + out->cart.chr_size;
+    if (file_size < 0 || (uint64_t)file_size < required) {
+        fclose(f);
+        return false;
+    }
+    /* Board metadata can depend on the image (known misheadered dumps), so
+     * decode it exactly as the cycle runtime and oracle loaders do. */
+    uint8_t *image = (uint8_t *)malloc((size_t)file_size);
+    if (!image || fseek(f, 0, SEEK_SET) != 0 || fread(image, 1, (size_t)file_size, f) != (size_t)file_size ||
+        !nes_cart_image(image, (size_t)file_size, &out->cart)) {
+        free(image);
+        fclose(f);
+        return false;
+    }
+    free(image);
+    out->mapper = out->cart.mapper;
+    if (fseek(f, (long)out->cart.data_offset, SEEK_SET) != 0) {
+        fclose(f);
+        return false;
+    }
+
+    /* Read all PRG ROM */
+    size_t prg_size = out->cart.prg_size;
+    out->prg_data = (uint8_t *)calloc((size_t)out->prg_banks, PRG_BANK_SIZE);
+    if (!out->prg_data) {
+        fclose(f);
+        return false;
+    }
+    if (fread(out->prg_data, 1, prg_size, f) != prg_size) {
+        fprintf(stderr, "rom_parser: PRG read failed\n");
+        free(out->prg_data);
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+
+    /* Vectors occupy the last six physical bytes, including 8 KiB images. */
+    const uint8_t *fixed = out->prg_data + prg_size - 6;
+
+    /* Read vectors from fixed bank — NES $FFFA-$FFFF = offset $3FFA in bank */
+    out->nmi_vector   = fixed[0] | ((uint16_t)fixed[1] << 8);
+    out->reset_vector = fixed[2] | ((uint16_t)fixed[3] << 8);
+    out->irq_vector   = fixed[4] | ((uint16_t)fixed[5] << 8);
+
+    /* For mappers with fully-switchable 32KB banks (e.g. GxROM/mapper 66),
+     * read per-window vectors.  Each 32KB window has its own upper 16KB bank
+     * with potentially different NMI/IRQ vectors. */
+    out->num_windows = 0;
+    if (rom_mapper_full_32k_switch(out)) {
+        int n_windows = out->prg_banks / 2;
+        if (n_windows > MAX_32K_WINDOWS) n_windows = MAX_32K_WINDOWS;
+        out->num_windows = n_windows;
+        for (int w = 0; w < n_windows; w++) {
+            int upper_bank = w * 2 + 1; /* upper 16KB of each 32KB window */
+            const uint8_t *bp = out->prg_data + (size_t)upper_bank * PRG_BANK_SIZE;
+            out->window_nmi[w] = bp[0x3FFA] | ((uint16_t)bp[0x3FFB] << 8);
+            out->window_irq[w] = bp[0x3FFE] | ((uint16_t)bp[0x3FFF] << 8);
+        }
+        printf("[ROM] GxROM: %d 32KB windows, per-window vectors:\n", n_windows);
+        for (int w = 0; w < n_windows; w++) {
+            printf("  Window %d (banks %d-%d): NMI=$%04X IRQ=$%04X\n",
+                   w, w*2, w*2+1, out->window_nmi[w], out->window_irq[w]);
+        }
+    }
+
+    return true;
+}
+
+void rom_free(NESRom *rom) {
+    free(rom->prg_data);
+    rom->prg_data = NULL;
+}
+
+const uint8_t *rom_bank_ptr(const NESRom *rom, int bank) {
+    if (bank < 0 || bank >= rom->prg_banks) return NULL;
+    return rom->prg_data + (size_t)bank * PRG_BANK_SIZE;
+}
+
+bool rom_mapper40_cpu_to_generated(const NESRom *rom, uint16_t cpu_addr,
+                                   int selected_8k, uint16_t *out_addr,
+                                   int *out_bank) {
+    if (!rom_mapper40(rom) || cpu_addr < 0x6000) return false;
+
+    int bank8;
+    if (cpu_addr < 0x8000)      bank8 = 6;
+    else if (cpu_addr < 0xA000) bank8 = 4;
+    else if (cpu_addr < 0xC000) bank8 = 5;
+    else if (cpu_addr < 0xE000) bank8 = selected_8k;
+    else                        bank8 = 7;
+
+    int total8 = rom->prg_banks * 2;
+    if (bank8 < 0 || total8 <= 0) return false;
+    bank8 %= total8;
+    if (out_bank) *out_bank = bank8 >> 1;
+    if (out_addr) {
+        *out_addr = (uint16_t)(0x8000 + ((bank8 & 1) ? 0x2000 : 0)
+                             + (cpu_addr & 0x1FFF));
+    }
+    return true;
+}
+
+uint8_t rom_read(const NESRom *rom, int switchable_bank, uint16_t addr) {
+    if (addr >= 0xC000) {
+        int bank;
+        if (rom_mapper_full_32k_switch(rom)) {
+            /* GxROM: $C000-$FFFF comes from the paired upper bank.
+             * switchable_bank is the lower 16KB index (even); upper = +1. */
+            bank = (switchable_bank | 1);
+            if (bank >= rom->prg_banks) bank = rom->prg_banks - 1;
+        } else {
+            bank = rom->prg_banks - 1; /* traditional fixed bank */
+        }
+        return rom->prg_data[(size_t)bank * PRG_BANK_SIZE + (addr - 0xC000)];
+    } else if (addr >= 0x8000) {
+        /* Switchable bank */
+        if (switchable_bank < 0 || switchable_bank >= rom->prg_banks)
+            return 0xFF;
+        return rom->prg_data[(size_t)switchable_bank * PRG_BANK_SIZE + (addr - 0x8000)];
+    }
+    return 0xFF; /* Not ROM space */
+}

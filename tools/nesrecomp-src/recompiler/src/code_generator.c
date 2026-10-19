@@ -1,0 +1,5027 @@
+/*
+ * code_generator.c — 6502→C emitter
+ *
+ * Design:
+ * - Global g_cpu struct (not passed by pointer — simpler)
+ * - FLAG_NZ(v) macro sets N and Z
+ * - One C statement per 6502 instruction (sometimes two)
+ * - JSR → direct C function call: func_C123()
+ * - RTS → return
+ * - BNE +n → if (!g_cpu.Z) goto label_XXXX
+ * - JMP (ind) → call_by_address(nes_read16(ind)); return
+ */
+#include "code_generator.h"
+#include "annotations.h"
+#include "cpu6502_decoder.h"
+#include "coverage.h"
+#include "function_dedup.h"
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---- Helpers ---- */
+
+typedef struct {
+    uint16_t addr;
+    int bank;
+} EmittedWrapper;
+
+typedef struct {
+    uint16_t addr;
+    int bank;
+    uint16_t owner_addr;
+    int owner_bank;
+    int entry_index;
+} BodyAlias;
+
+/* A multi-entry function's `func_XXXX_body` — recorded by
+ * emit_function_body_open() as it emits each one, so codegen_emit can
+ * forward-declare every body in the shared decls header without
+ * re-deriving is_multi_entry via a duplicate of emit_function's layout
+ * scan (see the split-TU decls.h note near codegen_emit). Bodies used to
+ * be `static` (safe when the whole game was one #include-stitched TU);
+ * sub-sharding a bank across multiple standalone part TUs means a body
+ * and its own wrapper(s), or a body and a same-bank BodyAlias caller
+ * elsewhere in the code, can land in different part files, so bodies are
+ * now external and need real forward declarations. */
+typedef struct {
+    uint16_t addr;
+    int bank;
+} BodyOwner;
+
+typedef struct {
+    uint16_t addr;
+    int bank;
+    int index;
+} FunctionIndexKey;
+
+static const EmittedWrapper *g_codegen_wrappers = NULL;
+static int g_codegen_wrapper_count = 0;
+static EmittedWrapper *g_codegen_actual_wrappers = NULL;
+static int g_codegen_actual_wrapper_count = 0;
+static int g_codegen_actual_wrapper_cap = 0;
+static BodyAlias *g_codegen_aliases = NULL;
+static int g_codegen_alias_count = 0;
+static BodyOwner *g_codegen_body_owners = NULL;
+static int g_codegen_body_owner_count = 0;
+static int g_codegen_body_owner_cap = 0;
+static int *g_codegen_manual_owner_indices = NULL;
+static int g_codegen_manual_owner_count = 0;
+static FunctionIndexKey *g_codegen_function_index = NULL;
+static int g_codegen_function_index_count = 0;
+static int8_t *g_codegen_native_eligibility = NULL;
+static SymbolTable *g_symtab = NULL;
+
+static int is_sram_sourced(const GameConfig *cfg, int bank, uint16_t addr);
+static int is_yield_func(uint16_t addr);
+static bool should_emit_native_body(const NESRom *rom, const GameConfig *cfg,
+                                    const FunctionEntry *entry);
+
+static void wrapper_list_add(EmittedWrapper *wrappers, int *count, int max_count,
+                             uint16_t addr, int bank);
+
+static const char *instruction_boundary_func(const NESRom *rom) {
+    return (rom->mapper == 4 || rom->mapper == 40)
+        ? "nes_instruction_boundary"
+        : "nes_cpu_instruction_boundary";
+}
+
+/* Called by emit_function_body_open() for every multi-entry function as it
+ * emits the body's opening brace. Silently drops the record past capacity
+ * (matches the pattern in wrapper_list_add) rather than aborting codegen —
+ * the caller-provided capacity (MAX_EMITTED_WRAPPERS, an upper bound on the
+ * number of standalone-emitting entries) makes overflow unreachable in
+ * practice. */
+static void codegen_record_body_owner(uint16_t addr, int bank) {
+    if (!g_codegen_body_owners) return;
+    if (g_codegen_body_owner_count >= g_codegen_body_owner_cap) return;
+    g_codegen_body_owners[g_codegen_body_owner_count++] = (BodyOwner){ addr, bank };
+}
+
+/* Emit a block comment with the symbol name for addr, if one exists.
+ * Writes nothing if no symbol is found or the table is NULL. */
+static void emit_sym(FILE *f, uint16_t addr, int bank) {
+    if (!g_symtab) return;
+    const char *name = symbol_lookup_bank(g_symtab, addr, bank);
+    if (name) fprintf(f, " /* %s */", name);
+}
+
+/* Format the C identifier for (addr, bank): "func_C123" for fixed-bank fixed-region
+ * targets, "func_8456_b3" otherwise. */
+static char *format_func_name(char *buf, size_t bufsz,
+                              uint16_t addr, int bank, int fixed_bank) {
+    if (bank == fixed_bank && addr >= 0xC000)
+        snprintf(buf, bufsz, "func_%04X", addr);
+    else
+        snprintf(buf, bufsz, "func_%04X_b%d", addr, bank);
+    return buf;
+}
+
+/* MMC3 8KB-window trampoline (kind=TRAMP_MMC3_REGION) helpers.
+ * The target hi byte selects the window the same way the on-ROM dispatch does
+ * (CMP #$80 / #$A0 / #$C0): '8' = R6 ($8000-$9FFF), 'A' = R7 ($A000-$BFFF),
+ * 'F' = no switch (fixed bank or RAM). */
+static char mmc3_tramp_region(uint8_t hi) {
+    if (hi >= 0x80 && hi < 0xA0) return '8';
+    if (hi >= 0xA0 && hi < 0xC0) return 'A';
+    return 'F';
+}
+
+/* Convert a window-relative target ($8000 or $A000 range) plus the raw 8KB
+ * MMC3 bank into the 16KB (addr,bank) the recompiler emits and dispatches on.
+ * Mirrors the runtime remap in the dispatch TU (g_mmc3_r6_odd/g_mmc3_r7_even):
+ * an even 8KB bank in the $A000 window is the lower half of a 16KB bank, so its
+ * code was generated at the $8000 offset (addr-=0x2000); an odd bank in the
+ * $8000 window is the upper half, generated at $A000 (addr+=0x2000). */
+static void mmc3_region_target(uint16_t target, uint8_t raw_bank, char region,
+                               uint16_t *out_addr, int *out_bank16) {
+    *out_bank16 = raw_bank >> 1;
+    int odd = raw_bank & 1;
+    if (region == '8')
+        *out_addr = odd ? (uint16_t)(target + 0x2000) : target;
+    else /* 'A' */
+        *out_addr = odd ? target : (uint16_t)(target - 0x2000);
+}
+
+static int nmi_rti_hijack_pattern_at(const NESRom *rom, int read_bank,
+                                     uint16_t start_addr, uint16_t rti_pc) {
+    uint16_t sta1_pc = 0, sta2_pc = 0;
+    uint8_t off1 = 0, off2 = 0;
+    int sta1_ok = 0, sta2_ok = 0;
+
+    for (int back1 = 1; back1 <= 16; back1++) {
+        if ((int)rti_pc - back1 - 2 < (int)start_addr) break;
+        uint16_t p1 = (uint16_t)(rti_pc - back1);
+        if (rom_read(rom, read_bank, p1) == 0x9D /* STA abs,X */ &&
+            rom_read(rom, read_bank, (uint16_t)(p1 + 2)) == 0x01) {
+            sta1_pc = p1;
+            off1 = rom_read(rom, read_bank, (uint16_t)(p1 + 1));
+            sta1_ok = 1;
+            break;
+        }
+    }
+    if (!sta1_ok) return 0;
+
+    for (int back2 = 1; back2 <= 12; back2++) {
+        if ((int)sta1_pc - back2 - 2 < (int)start_addr) break;
+        uint16_t p2 = (uint16_t)(sta1_pc - back2);
+        if (rom_read(rom, read_bank, p2) == 0x9D &&
+            rom_read(rom, read_bank, (uint16_t)(p2 + 2)) == 0x01) {
+            uint8_t o2 = rom_read(rom, read_bank, (uint16_t)(p2 + 1));
+            if ((o2 == (uint8_t)(off1 + 1)) || ((uint8_t)(o2 + 1) == off1)) {
+                sta2_pc = p2;
+                off2 = o2;
+                sta2_ok = 1;
+                break;
+            }
+        }
+    }
+    if (!sta2_ok) return 0;
+
+    uint16_t pc_hi_sta = (off1 > off2) ? sta1_pc : sta2_pc;
+    uint16_t pc_lo_sta = (off1 < off2) ? sta1_pc : sta2_pc;
+    int pch_ok = 0, pcl_ok = 0;
+    uint8_t pch_val = 0, pcl_val = 0;
+
+    for (int lb = 1; lb <= 8; lb++) {
+        if ((int)pc_hi_sta - lb - 1 < (int)start_addr) break;
+        uint16_t pl = (uint16_t)(pc_hi_sta - lb);
+        if (rom_read(rom, read_bank, pl) == 0xA9 /* LDA #imm */) {
+            pch_val = rom_read(rom, read_bank, (uint16_t)(pl + 1));
+            pch_ok = 1;
+            break;
+        }
+    }
+    for (int lb = 1; lb <= 8; lb++) {
+        if ((int)pc_lo_sta - lb - 1 < (int)start_addr) break;
+        uint16_t pl = (uint16_t)(pc_lo_sta - lb);
+        if (rom_read(rom, read_bank, pl) == 0xA9 /* LDA #imm */) {
+            pcl_val = rom_read(rom, read_bank, (uint16_t)(pl + 1));
+            pcl_ok = 1;
+            break;
+        }
+    }
+
+    return pch_ok && pcl_ok && (((uint16_t)pch_val << 8) | pcl_val) >= 0xC000;
+}
+
+static int nmi_has_static_rti_hijack(const NESRom *rom, uint16_t nmi_vector, int read_bank) {
+    if (nmi_vector < 0x8000) return 0;
+
+    /* Keep this in sync with function_finder.c's RTI-hijack discovery pattern.
+     * Scan the NMI routine region bytewise so early conditional RTIs do not hide
+     * a later hijack RTI in the same handler. */
+    for (uint32_t off = 0; off < 0x0400 && (uint32_t)nmi_vector + off <= 0xFFFF; off++) {
+        uint16_t pc = (uint16_t)(nmi_vector + off);
+        if (rom_read(rom, read_bank, pc) != 0x40 /* RTI */) continue;
+        if (nmi_rti_hijack_pattern_at(rom, read_bank, nmi_vector, pc))
+            return 1;
+    }
+    return 0;
+}
+
+static int rom_has_static_nmi_rti_hijack(const NESRom *rom) {
+    int fixed_bank = rom->prg_banks - 1;
+    if (rom->num_windows > 0) {
+        for (int w = 0; w < rom->num_windows; w++) {
+            int read_bank = w * 2;
+            if (read_bank >= rom->prg_banks) read_bank = rom->prg_banks - 1;
+            if (nmi_has_static_rti_hijack(rom, rom->window_nmi[w], read_bank))
+                return 1;
+        }
+        return 0;
+    }
+
+    int read_bank = (rom->nmi_vector >= 0xC000) ? fixed_bank : 0;
+    return nmi_has_static_rti_hijack(rom, rom->nmi_vector, read_bank);
+}
+
+static void emit_header(FILE *f) {
+    fprintf(f,
+        "/* AUTO-GENERATED by NESRecomp. DO NOT EDIT. */\n"
+        "#include \"nes_runtime.h\"\n"
+        "#include \"coroutine.h\"\n"
+        "#include \"mod_function_hooks.h\"\n"
+        "#ifdef RECOMP_STACK_TRACKING\n"
+        "#include \"recomp_stack.h\"\n"
+        "#endif\n"
+        "#ifdef WATCHDOG_ENABLED\n"
+        "#include \"watchdog.h\"\n"
+        "#endif\n\n"
+        "/* Flag helpers */\n"
+        "#define FLAG_NZ(v) do { g_cpu.N=((v)>>7)&1; g_cpu.Z=((v)==0)?1:0; } while(0)\n"
+        "#define FLAG_NZC_ADD(r,a,b) do { uint16_t _r=(r); g_cpu.C=(_r>0xFF)?1:0; \\\n"
+        "    g_cpu.N=((_r>>7)&1); g_cpu.Z=((_r&0xFF)==0)?1:0; \\\n"
+        "    g_cpu.V=(~((a)^(b))&((a)^_r)&0x80)?1:0; } while(0)\n"
+        "#define FLAG_NZC_SUB(r,a,b) do { int16_t _r=(r); g_cpu.C=(_r>=0)?1:0; \\\n"
+        "    g_cpu.N=((_r&0xFF)>>7); g_cpu.Z=((_r&0xFF)==0)?1:0; \\\n"
+        "    g_cpu.V=(((a)^(b))&((a)^_r)&0x80)?1:0; } while(0)\n\n"
+        "/* RTI hijack support: NMI handler stores hijacked return address here;\n"
+        " * func_NMI dispatches to it after the handler returns (outside NMI context). */\n"
+        "extern uint16_t g_rti_target;\n"
+        "extern uint16_t g_rti_source;\n"
+        "extern int g_rti_bank;\n"
+        "/* Last return address operand popped by a generated RTS. JSR sites use\n"
+        " * this to detect helpers that rewrite their caller's return address. */\n"
+        "extern uint16_t g_rts_target;\n\n"
+    );
+}
+
+static void emit_forward_decls(FILE *f, const EmittedWrapper *wrappers, int wrapper_count,
+                               const NESRom *rom) {
+    int fixed = rom->prg_banks - 1;
+    fprintf(f, "/* Forward declarations */\n");
+    for (int i = 0; i < wrapper_count; i++) {
+        uint16_t addr = wrappers[i].addr;
+        int bank = wrappers[i].bank;
+        char nm[32];
+        format_func_name(nm, sizeof nm, addr, bank, fixed);
+        fprintf(f, "void %s(void);", nm);
+        emit_sym(f, addr, bank);
+        fprintf(f, "\n");
+    }
+    fprintf(f, "\n");
+}
+
+/* Emit `#define <name> 0x<value>` for every .sym entry of one kind.
+ *
+ * Several names on one number, within a kind, are genuine aliases of the same
+ * thing (Player_X_Position is SprObject_X_Position slot 0). All are emitted —
+ * they are aliases of one constant, so defining them all costs nothing and
+ * whichever a reader reaches for resolves — and each is annotated with its
+ * siblings so the sharing stays visible rather than looking like a duplicate.
+ *
+ * A name that already denotes a function is skipped and reported: generated
+ * code calls functions by those names, and a later #define would silently
+ * retarget every call site. */
+static void emit_data_symbols(FILE *f, SymbolTable *st, SymbolKind kind,
+                              const char *title, const char *note) {
+    int total = 0;
+    for (int i = 0; i < st->count; i++)
+        if (st->entries[i].kind == kind) total++;
+    if (total == 0) return;
+
+    fprintf(f, "/* %s (from .sym file).\n * %s */\n", title, note);
+    for (int i = 0; i < st->count; i++) {
+        const SymbolEntry *e = &st->entries[i];
+        if (e->kind != kind) continue;
+
+        bool shadows_func = false;
+        for (int j = 0; j < st->count; j++) {
+            if (st->entries[j].kind != SYM_KIND_FUNC) continue;
+            if (strcmp(st->entries[j].name, e->name) != 0) continue;
+            shadows_func = true;
+            break;
+        }
+        if (shadows_func) {
+            fprintf(f, "/* SKIPPED: %s 0x%04X -- name already denotes a "
+                       "function */\n", e->name, e->addr);
+            fprintf(stderr, "[codegen] WARNING: symbol '%s' (0x%04X) collides "
+                            "with a function of the same name; the data "
+                            "define was skipped\n", e->name, e->addr);
+            continue;
+        }
+
+        const char *names[8];
+        int n = symbol_names(st, e->addr, kind, names, 8);
+        fprintf(f, "#define %s 0x%04X", e->name, e->addr);
+        if (n > 1) {
+            fprintf(f, "  /* also:");
+            for (int k = 0; k < n && k < 8; k++) {
+                if (strcmp(names[k], e->name) == 0) continue;
+                fprintf(f, " %s", names[k]);
+            }
+            if (n > 8) fprintf(f, " ...");
+            fprintf(f, " */");
+        }
+        fprintf(f, "\n");
+    }
+    fprintf(f, "\n");
+}
+
+/* Emit symbol-name aliases (from a .sym file) as #defines mapping the
+ * human-readable name to the generated func_XXXX identifier. Writes nothing
+ * if no symbol table was supplied. Shared by the <prefix>_full_decls.h
+ * writer (codegen_emit) — every part TU sees these via the decls header. */
+static void emit_symbol_aliases(FILE *f, const EmittedWrapper *wrappers, int wrapper_count,
+                                int fixed_bank, SymbolTable *st) {
+    if (!(st && st->count > 0)) return;
+    fprintf(f, "/* Symbol aliases (from .sym file) */\n");
+    for (int i = 0; i < wrapper_count; i++) {
+        uint16_t addr = wrappers[i].addr;
+
+        /* Every wrapper standalone-emitted at this address is handled
+         * together the first time we see the address; a later wrapper
+         * with the same addr (different bank) is folded in below, so
+         * skip it here to avoid re-emitting the same alias(es). */
+        bool seen_earlier = false;
+        for (int j = 0; j < i; j++) {
+            if (wrappers[j].addr == addr) { seen_earlier = true; break; }
+        }
+        if (seen_earlier) continue;
+
+        /* Collect every distinct bank this address is standalone-emitted
+         * in. On banked mappers (MMC1/MMC3/...) the same 6502 address can
+         * legitimately hold DIFFERENT code per bank, so a name keyed on
+         * address alone is ambiguous whenever more than one bank shows up
+         * here -- see beads-2dw.1.5 (PowerUpObjHandler / SetAnimSpd
+         * colliding #defines on SMB, one silently overwriting the other
+         * via C4005 macro redefinition). */
+        int banks[64];
+        int bank_count = 0;
+        for (int j = i; j < wrapper_count; j++) {
+            if (wrappers[j].addr != addr) continue;
+            bool dup = false;
+            for (int k = 0; k < bank_count; k++) {
+                if (banks[k] == wrappers[j].bank) { dup = true; break; }
+            }
+            if (!dup && bank_count < 64) banks[bank_count++] = wrappers[j].bank;
+        }
+
+        /* Resolve the name per bank. A bank-scoped .sym (BB:XXXX entries,
+         * see symbol_table.h) names each bank's code independently; a
+         * bankless .sym yields the same name for every bank. */
+        const char *bank_names[64];
+        int named = 0;
+        for (int k = 0; k < bank_count; k++) {
+            bank_names[k] = symbol_lookup_bank(st, addr, banks[k]);
+            if (bank_names[k]) named++;
+        }
+        if (named == 0) continue;
+
+        /* One alias per (name, bank). A name that appears in exactly one
+         * bank is emitted unsuffixed. A name shared by several banks would
+         * be defined several times -- the last #define would silently win
+         * (the exact failure this exists to prevent), so every bank that
+         * shares it gets a bank-qualified alias instead and a symbolic call
+         * site must disambiguate, turning a silently-wrong call into a
+         * compile error. Banks without a name get no alias. */
+        bool any_shared = false;
+        for (int k = 0; k < bank_count; k++) {
+            if (!bank_names[k]) continue;
+            int uses = 0;
+            for (int j = 0; j < bank_count; j++)
+                if (bank_names[j] && strcmp(bank_names[j], bank_names[k]) == 0) uses++;
+            char nm[32];
+            format_func_name(nm, sizeof nm, addr, banks[k], fixed_bank);
+            if (uses <= 1) {
+                fprintf(f, "#define %s %s\n", bank_names[k], nm);
+                continue;
+            }
+            if (!any_shared) {
+                any_shared = true;
+                fprintf(f, "/* %s: 0x%04X is standalone-emitted in %d banks (",
+                        bank_names[k], addr, uses);
+                int first = 1;
+                for (int j = 0; j < bank_count; j++) {
+                    if (!bank_names[j] || strcmp(bank_names[j], bank_names[k]) != 0) continue;
+                    fprintf(f, "%sb%d", first ? "" : ",", banks[j]);
+                    first = 0;
+                }
+                fprintf(f, ") -- no unsuffixed alias emitted; use %s__bN explicitly */\n",
+                        bank_names[k]);
+                fprintf(stderr, "[codegen] WARNING: symbol '%s' (0x%04X) is "
+                                "standalone-emitted in %d banks; skipped the "
+                                "unsuffixed #define (would collide) -- use "
+                                "%s__bN explicitly\n",
+                                bank_names[k], addr, uses, bank_names[k]);
+            }
+            fprintf(f, "#define %s__b%d %s\n", bank_names[k], banks[k], nm);
+        }
+    }
+    fprintf(f, "\n");
+
+    /*
+     * Names from the .sym file that denote data rather than code.
+     *
+     * Two kinds, and keeping them apart is the point. `ram` is a memory
+     * location, so game code can say g_ram[Player_X_Position] instead of
+     * g_ram[0x0086] -- a bare literal is a guess wearing the costume of a
+     * fact. `const` is a plain value, typically an object or enemy id.
+     *
+     * Assembly declares both as `Name = $33`, and SMB has exactly that clash:
+     * $0033 is PlayerFacingDir in zero page AND enemy id $33
+     * (BulletBill_CannonVar). They share a number and nothing else, so they
+     * are emitted separately and never described as aliases of each other.
+     */
+    emit_data_symbols(f, st, SYM_KIND_RAM, "RAM/MMIO symbol addresses",
+                      "Several names on one address are aliases of the same "
+                      "byte,\n * used by different subsystems.");
+    emit_data_symbols(f, st, SYM_KIND_CONST,
+                      "Object/type id constants -- VALUES, not addresses",
+                      "These are ids compared against, not memory to read.");
+}
+
+/* Forward-declare every multi-entry function's `_body` (external since bank
+ * sub-sharding; see the BodyOwner comment). Written into the shared decls
+ * header from the BodyOwner list codegen_record_body_owner() collected
+ * while the bank part TUs were being emitted — codegen_emit writes decls.h
+ * AFTER the bank-emission loop for exactly this reason (see the split-TU
+ * decls.h note there): this avoids re-deriving is_multi_entry via a second,
+ * possibly-divergent copy of emit_function's layout-scan logic. */
+static void emit_body_forward_decls(FILE *f, const BodyOwner *owners, int owner_count,
+                                    const NESRom *rom) {
+    if (owner_count == 0) return;
+    int fixed = rom->prg_banks - 1;
+    fprintf(f, "/* Multi-entry function body forward declarations */\n");
+    for (int i = 0; i < owner_count; i++) {
+        char nm[32];
+        format_func_name(nm, sizeof nm, owners[i].addr, owners[i].bank, fixed);
+        fprintf(f, "void %s_body(int _entry);\n", nm);
+    }
+    fprintf(f, "\n");
+}
+
+/* Emit the operand address computation for a given addressing mode.
+ * Returns a C expression string (static buffer — use immediately). */
+static const char *operand_addr_expr(AddrMode am, uint8_t op1, uint8_t op2) {
+    static char buf[64];
+    uint16_t abs16 = op1 | ((uint16_t)op2 << 8);
+    switch (am) {
+        case AM_ZP:   snprintf(buf, sizeof(buf), "0x%02X", op1); break;
+        case AM_ZPX:  snprintf(buf, sizeof(buf), "(0x%02X + g_cpu.X) & 0xFF", op1); break;
+        case AM_ZPY:  snprintf(buf, sizeof(buf), "(0x%02X + g_cpu.Y) & 0xFF", op1); break;
+        case AM_ABS:  snprintf(buf, sizeof(buf), "0x%04X", abs16); break;
+        case AM_ABSX: snprintf(buf, sizeof(buf), "(0x%04X + g_cpu.X) & 0xFFFF", abs16); break;
+        case AM_ABSY: snprintf(buf, sizeof(buf), "(0x%04X + g_cpu.Y) & 0xFFFF", abs16); break;
+        case AM_INDX: snprintf(buf, sizeof(buf), "nes_read16zp((0x%02X + g_cpu.X) & 0xFF)", op1); break;
+        case AM_INDY: snprintf(buf, sizeof(buf), "(nes_read16zp(0x%02X) + g_cpu.Y) & 0xFFFF", op1); break;
+        default:      snprintf(buf, sizeof(buf), "0"); break;
+    }
+    return buf;
+}
+
+/* Check if a branch target is a valid instruction-start address within this function.
+ * Only addresses we actually pre-scanned are safe goto labels. Treating
+ * one-past-the-last-scanned instruction as local can emit gotos to labels that
+ * never appear in the body when the pre-scan stopped at a function boundary. */
+static bool is_valid_label_target(uint16_t tgt, const uint16_t *vs, int vc,
+                                    const NESRom *rom, int bank) {
+    (void)rom;
+    (void)bank;
+    for (int i = 0; i < vc; i++)
+        if (vs[i] == tgt) return true;
+    return false;
+}
+
+/* Check if a RAM address has a read hook registered in game.cfg */
+static bool is_ram_read_hooked(const GameConfig *cfg, uint16_t addr) {
+    for (int i = 0; i < cfg->ram_read_hook_count; i++)
+        if (cfg->ram_read_hooks[i].addr == addr) return true;
+    return false;
+}
+
+/* Should this memory read route through game_ram_read_hook?
+ * AM_ABS matches the exact address; absolute-indexed modes match when the
+ * BASE address has a hook entry marked `indexed` (the hook receives the
+ * runtime-computed effective address via nes_read_hooked, so game policy
+ * dispatches on it).  Other addressing modes never match, and RMW
+ * instructions never call this — virtualizing their read would corrupt
+ * the writeback. */
+static bool read_is_hooked(const GameConfig *cfg, AddrMode am, uint16_t abs16) {
+    if (am == AM_ABS) return is_ram_read_hooked(cfg, abs16);
+    if (am == AM_ABSX || am == AM_ABSY) {
+        for (int i = 0; i < cfg->ram_read_hook_count; i++)
+            if (cfg->ram_read_hooks[i].addr == abs16 && cfg->ram_read_hooks[i].indexed)
+                return true;
+    }
+    return false;
+}
+
+/* Check if an address is a registered function entry point */
+static bool is_func_entry(const FunctionList *funcs, uint16_t addr) {
+    for (int i = 0; i < funcs->count; i++) {
+        if (funcs->entries[i].addr == addr) return true;
+    }
+    return false;
+}
+
+static bool contains_addr(const uint16_t *addrs, int count, uint16_t addr) {
+    for (int i = 0; i < count; i++) {
+        if (addrs[i] == addr) return true;
+    }
+    return false;
+}
+
+static bool prefer_merge_range_wrapper(const GameConfig *cfg, int bank,
+                                       uint16_t canonical_pc, uint16_t wrapper_addr) {
+    for (int ri = 0; ri < cfg->merge_range_count; ri++) {
+        if (cfg->merge_ranges[ri].bank != bank) continue;
+        if (wrapper_addr < cfg->merge_ranges[ri].addr_lo ||
+            wrapper_addr > cfg->merge_ranges[ri].addr_hi) {
+            continue;
+        }
+        if (canonical_pc < cfg->merge_ranges[ri].addr_lo ||
+            canonical_pc > cfg->merge_ranges[ri].addr_hi) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool config_has_extra_label(const GameConfig *cfg, int bank, uint16_t addr) {
+    for (int i = 0; i < cfg->extra_label_count; i++) {
+        if (cfg->extra_labels[i].bank == bank && cfg->extra_labels[i].addr == addr)
+            return true;
+    }
+    return false;
+}
+
+static bool suppress_merge_range_wrapper(const GameConfig *cfg, int bank,
+                                         uint16_t canonical_pc, uint16_t wrapper_addr) {
+    if (config_has_extra_label(cfg, bank, wrapper_addr)) return false;
+    for (int ri = 0; ri < cfg->merge_range_count; ri++) {
+        const MergeRange *range = &cfg->merge_ranges[ri];
+        if (range->public_wrappers) continue;
+        if (range->bank != bank) continue;
+        if (canonical_pc < range->addr_lo || canonical_pc > range->addr_hi) continue;
+        if (wrapper_addr < range->addr_lo || wrapper_addr > range->addr_hi) continue;
+        return wrapper_addr != canonical_pc;
+    }
+    return false;
+}
+
+static bool entry_emits_standalone(const FunctionList *funcs, const GameConfig *cfg,
+                                   const FunctionEntry *entry) {
+    (void)funcs;
+    bool manual = (entry->source_flags & FUNCTION_SOURCE_MANUAL) != 0;
+    if (entry->kind == FUNCTION_KIND_SECONDARY) return false;
+
+    for (int mi = 0; mi < cfg->merge_func_count; mi++) {
+        if (entry->bank == cfg->merge_funcs[mi].bank &&
+            entry->addr == cfg->merge_funcs[mi].addr_hi) {
+            return manual;
+        }
+    }
+
+    return true;
+}
+
+static bool wrapper_list_contains(const EmittedWrapper *wrappers, int count,
+                                  uint16_t addr, int bank) {
+    for (int i = 0; i < count; i++) {
+        if (wrappers[i].addr == addr && wrappers[i].bank == bank) return true;
+    }
+    return false;
+}
+
+static int compare_function_index_keys(const void *lhs, const void *rhs) {
+    const FunctionIndexKey *a = (const FunctionIndexKey *)lhs;
+    const FunctionIndexKey *b = (const FunctionIndexKey *)rhs;
+    if (a->bank != b->bank) return a->bank < b->bank ? -1 : 1;
+    if (a->addr != b->addr) return a->addr < b->addr ? -1 : 1;
+    return a->index - b->index;
+}
+
+static bool build_codegen_function_index(const FunctionList *funcs) {
+    free(g_codegen_function_index);
+    g_codegen_function_index = NULL;
+    g_codegen_function_index_count = 0;
+    free(g_codegen_native_eligibility);
+    g_codegen_native_eligibility = NULL;
+
+    FunctionIndexKey *keys = (FunctionIndexKey *)malloc(
+        (size_t)funcs->count * sizeof(FunctionIndexKey));
+    if (!keys && funcs->count > 0) return false;
+    int8_t *native_eligibility = (int8_t *)malloc((size_t)funcs->count);
+    if (!native_eligibility && funcs->count > 0) {
+        free(keys);
+        return false;
+    }
+
+    for (int i = 0; i < funcs->count; i++) {
+        keys[i] = (FunctionIndexKey){
+            funcs->entries[i].addr, funcs->entries[i].bank, i
+        };
+        native_eligibility[i] = -1;
+    }
+    qsort(keys, (size_t)funcs->count, sizeof(FunctionIndexKey),
+          compare_function_index_keys);
+    g_codegen_function_index = keys;
+    g_codegen_function_index_count = funcs->count;
+    g_codegen_native_eligibility = native_eligibility;
+    return true;
+}
+
+static int codegen_find_function_index(const FunctionList *funcs, uint16_t addr, int bank) {
+    int lo = 0;
+    int hi = g_codegen_function_index_count - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        const FunctionIndexKey *key = &g_codegen_function_index[mid];
+        if (key->bank == bank && key->addr == addr) return key->index;
+        if (key->bank < bank || (key->bank == bank && key->addr < addr))
+            lo = mid + 1;
+        else
+            hi = mid - 1;
+    }
+
+    /* Keep the helper usable before codegen_emit initializes its index. */
+    if (!g_codegen_function_index && funcs) {
+        for (int i = 0; i < funcs->count; i++) {
+            if (funcs->entries[i].addr == addr && funcs->entries[i].bank == bank)
+                return i;
+        }
+    }
+    return -1;
+}
+
+static bool codegen_has_emitted_wrapper(uint16_t addr, int bank) {
+    if (!g_codegen_wrappers) return false;
+    return wrapper_list_contains(g_codegen_wrappers, g_codegen_wrapper_count, addr, bank);
+}
+
+static void codegen_record_actual_wrapper(uint16_t addr, int bank) {
+    if (!g_codegen_actual_wrappers) return;
+    wrapper_list_add(g_codegen_actual_wrappers, &g_codegen_actual_wrapper_count,
+                     g_codegen_actual_wrapper_cap, addr, bank);
+}
+
+static bool codegen_lookup_body_alias(uint16_t addr, int bank,
+                                      uint16_t *owner_addr, int *owner_bank,
+                                      int *entry_index) {
+    for (int i = 0; i < g_codegen_alias_count; i++) {
+        if (g_codegen_aliases[i].addr == addr && g_codegen_aliases[i].bank == bank) {
+            if (owner_addr) *owner_addr = g_codegen_aliases[i].owner_addr;
+            if (owner_bank) *owner_bank = g_codegen_aliases[i].owner_bank;
+            if (entry_index) *entry_index = g_codegen_aliases[i].entry_index;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool find_pushed_forward_continuation(const NESRom *rom, int bank,
+                                             uint16_t func_base, uint16_t pc,
+                                             uint16_t *out_cont) {
+    for (int back = 6; back <= 256; back++) {
+        if (pc < (uint16_t)(0x8000 + back + 5)) break;
+        uint16_t probe = (uint16_t)(pc - back);
+        if (probe < func_base) break;
+        if (rom_read(rom, bank, probe)     == 0xA9 /* LDA #imm */ &&
+            rom_read(rom, bank, probe + 2) == 0x48 /* PHA */ &&
+            rom_read(rom, bank, probe + 3) == 0xA9 /* LDA #imm */ &&
+            rom_read(rom, bank, probe + 5) == 0x48 /* PHA */) {
+            uint8_t hi_val = rom_read(rom, bank, probe + 1);
+            uint8_t lo_val = rom_read(rom, bank, probe + 4);
+            uint16_t cont = (uint16_t)((((uint16_t)hi_val << 8) | lo_val) + 1);
+            if (cont > pc && cont >= 0x8000) {
+                uint8_t op = rom_read(rom, bank, cont);
+                if (!mn_finder_illegal(g_opcode_table[op].mnemonic)) {
+                    if (out_cont) *out_cont = cont;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static bool configured_indirect_continuation(const NESRom *rom, const GameConfig *cfg,
+                                             int bank, uint16_t func_base,
+                                             uint16_t pc, uint16_t *out_cont) {
+    if (!cfg->push_all_jsr) return false;
+    for (int i = 0; i < cfg->indirect_continuation_count; i++) {
+        const IndirectContinuation *ic = &cfg->indirect_continuations[i];
+        if (ic->bank != bank || ic->jmp_addr != pc) continue;
+        if (ic->continuation <= pc || ic->continuation < 0x8000) continue;
+        if ((ic->continuation & 0xE000) != (pc & 0xE000)) continue;
+
+        uint16_t detected = 0;
+        if (!find_pushed_forward_continuation(rom, bank, func_base, pc, &detected))
+            continue;
+        if (detected != ic->continuation) continue;
+        if (out_cont) *out_cont = ic->continuation;
+        return true;
+    }
+    return false;
+}
+
+static uint16_t next_pending_after(uint16_t pc, const uint16_t *pending, int pending_count) {
+    uint16_t best = 0;
+    for (int i = 0; i < pending_count; i++) {
+        uint16_t p = pending[i];
+        if (p <= pc) continue;
+        if (best == 0 || p < best) best = p;
+    }
+    return best;
+}
+
+static bool replace_func_matches(const GameConfig *cfg, int fixed_bank, uint16_t addr, int bank) {
+    for (int i = 0; i < cfg->replace_func_count; i++) {
+        int rb = (cfg->replace_funcs[i].bank < 0) ? fixed_bank : cfg->replace_funcs[i].bank;
+        if (rb == bank && cfg->replace_funcs[i].addr == addr)
+            return true;
+    }
+    return false;
+}
+
+/* Which declared [[mod_function_hook]] entries actually matched an emitted
+ * function entry. A hook that matches nothing is a silent no-op at runtime —
+ * the mod looks broken and the config looks fine — so codegen reports it. */
+static bool s_mod_hook_matched[GAME_CFG_MAX_EXTRA_FUNCS];
+
+static bool mod_function_hook_matches(const GameConfig *cfg, int fixed_bank,
+                                      uint16_t addr, int bank, bool at_instruction) {
+    (void)fixed_bank;
+    bool hit = false;
+    for (int i = 0; i < cfg->mod_function_hook_count; i++) {
+        if (cfg->mod_function_hook_internal[i] != at_instruction) continue;
+        /* bank omitted (-1) means ANY bank: a 6502 address alone identifies
+         * the routine in most titles, and requiring the bank would make the
+         * common NROM case fail silently (e.g. $B0E9 lives in bank 0, not the
+         * fixed bank). Name a bank explicitly to disambiguate a banked game. */
+        const int hb = cfg->mod_function_hooks[i].bank;
+        if (hb >= 0 && hb != bank) continue;
+        if (cfg->mod_function_hooks[i].addr != addr) continue;
+        s_mod_hook_matched[i] = true;
+        hit = true;
+    }
+    return hit;
+}
+
+/* Fail loudly on a hook that never matched, rather than shipping a mod that
+ * quietly never fires. */
+static void audit_mod_function_hooks(const GameConfig *cfg) {
+    int unmatched = 0;
+    for (int i = 0; i < cfg->mod_function_hook_count; i++) {
+        if (s_mod_hook_matched[i]) continue;
+        unmatched++;
+        fprintf(stderr,
+                "[codegen] WARNING: [[mod_function_hook]] addr=0x%04X",
+                cfg->mod_function_hooks[i].addr);
+        if (cfg->mod_function_hooks[i].bank >= 0)
+            fprintf(stderr, " bank=%d", cfg->mod_function_hooks[i].bank);
+        fprintf(stderr, " matched no emitted function entry — the hook will"
+                        " never fire. Check the address, or add it to"
+                        " [functions] so it becomes an entry.\n");
+    }
+    if (cfg->mod_function_hook_count > 0)
+        fprintf(stderr, "[codegen] mod function hooks: %d declared, %d matched\n",
+                cfg->mod_function_hook_count,
+                cfg->mod_function_hook_count - unmatched);
+}
+
+/* Emit the trusted mod entry hook, if this entry opted in.
+ *
+ * Placed BEFORE the stack-tracking push so a mod that handles the call can
+ * simply `return` with no push/pop bookkeeping: the mod owns the whole call,
+ * including its stack frame. Returning zero — the default with no plugin
+ * registered — falls through to the original body unchanged.
+ *
+ * Emitted only for addresses listed in [[mod_function_hook]], so a title that
+ * does not opt in produces byte-identical generated code. */
+static void emit_mod_function_hook(FILE *f, const GameConfig *cfg,
+                                   int fixed_bank, uint16_t addr, int bank) {
+    if (!mod_function_hook_matches(cfg, fixed_bank, addr, bank, false)) return;
+    fprintf(f, "    if (nes_mod_function_entry(0x%04Xu)) return;"
+               "  /* trusted opt-in game-mod hook */\n", addr);
+}
+
+/* A native branch may enter a routine through a label in a shared C body,
+ * bypassing its public wrapper. Explicit include_internal hooks live at that
+ * instruction label instead, so JSR, branch, fallthrough and dedup aliases all
+ * pass the same gate exactly once. A handled callback returns from the native
+ * remainder; the multi-entry wrapper owns its tracking pop. */
+static void emit_mod_internal_hook(FILE *f, const GameConfig *cfg,
+                                  int fixed_bank, uint16_t addr, int bank,
+                                  bool multi_entry) {
+    if (!mod_function_hook_matches(cfg, fixed_bank, addr, bank, true)) return;
+    fprintf(f,"    if (nes_mod_function_entry(0x%04Xu)) { /* trusted native branch entry */\n",addr);
+    if (!multi_entry)
+        fprintf(f,"#ifdef RECOMP_STACK_TRACKING\n        recomp_stack_pop();\n#endif\n");
+    fprintf(f,"        return;\n    }\n");
+}
+
+static bool replace_func_matches_member(const GameConfig *cfg, int fixed_bank,
+                                        uint16_t addr, int bank) {
+    for (int i = 0; i < cfg->replace_func_count; i++) {
+        int rb = (cfg->replace_funcs[i].bank < 0) ? fixed_bank : cfg->replace_funcs[i].bank;
+        if (!cfg->replace_funcs[i].replace_group && rb == bank &&
+            cfg->replace_funcs[i].addr == addr)
+            return true;
+    }
+    return false;
+}
+
+static bool dedup_excluded(const GameConfig *cfg, int fixed_bank,
+                           uint16_t addr, int bank) {
+    for (int i = 0; i < cfg->dedup_exclude_count; i++) {
+        int eb = (cfg->dedup_excludes[i].bank < 0) ? fixed_bank : cfg->dedup_excludes[i].bank;
+        if (eb == bank && cfg->dedup_excludes[i].addr == addr) return true;
+    }
+    return false;
+}
+
+static bool dedup_entry_eligible(const NESRom *rom, const GameConfig *cfg,
+                                 const FunctionEntry *entry) {
+    int fixed_bank = rom->prg_banks - 1;
+    if (entry->kind != FUNCTION_KIND_STANDALONE) return false;
+    if (!should_emit_native_body(rom, cfg, entry)) return false;
+    if (replace_func_matches_member(cfg, fixed_bank, entry->addr, entry->bank)) return false;
+    if (dedup_excluded(cfg, fixed_bank, entry->addr, entry->bank)) return false;
+    if (is_sram_sourced(cfg, entry->bank, entry->addr)) return false;
+    if (is_yield_func(entry->addr)) return false;
+    if (entry->addr == rom->reset_vector || entry->addr == rom->nmi_vector ||
+        entry->addr == rom->irq_vector) return false;
+    for (int i = 0; i < g_codegen_alias_count; i++) {
+        if (g_codegen_aliases[i].owner_addr == entry->addr &&
+            g_codegen_aliases[i].owner_bank == entry->bank)
+            return false;
+    }
+    return true;
+}
+
+static bool entry_source_is_curated(const FunctionEntry *entry) {
+    return (entry->source_flags & (FUNCTION_SOURCE_MANUAL |
+                                   FUNCTION_SOURCE_KNOWN_TABLE |
+                                   FUNCTION_SOURCE_SPLIT_TABLE)) != 0;
+}
+
+static bool config_has_extra_func(const GameConfig *cfg, int fixed_bank,
+                                  uint16_t addr, int bank) {
+    for (int i = 0; i < cfg->extra_func_count; i++) {
+        int cfg_bank = (cfg->extra_funcs[i].bank < 0) ? fixed_bank : cfg->extra_funcs[i].bank;
+        if (cfg_bank == bank && cfg->extra_funcs[i].addr == addr)
+            return true;
+    }
+    return false;
+}
+
+static bool config_forces_interp(const GameConfig *cfg, int fixed_bank,
+                                 uint16_t addr, int bank) {
+    for (int i = 0; i < cfg->force_interp_count; i++) {
+        int cfg_bank = (cfg->force_interp_funcs[i].bank < 0)
+                     ? fixed_bank : cfg->force_interp_funcs[i].bank;
+        if (cfg_bank == bank && cfg->force_interp_funcs[i].addr == addr)
+            return true;
+    }
+    return false;
+}
+
+static uint16_t resolve_jmp_thunk(const NESRom *rom, int fixed_bank,
+                                  uint16_t addr);
+
+static bool native_entry_decode_valid(const NESRom *rom, const GameConfig *cfg,
+                                      int bank, uint16_t addr) {
+    enum { MIN_VALID = 7 };
+    /* Mapper 40's function finder already validates its physical 8KB window
+     * identities, including entries whose instruction bytes straddle a window
+     * boundary. Re-reading those identities as ordinary 16KB addresses here
+     * incorrectly demotes valid native entries to interpreter wrappers. */
+    if (rom_mapper40(rom)) return true;
+    int fixed_bank = rom->prg_banks - 1;
+    /* GxROM switches the full 32KB CPU window, so its $C000-$FFFF entries
+     * belong to the paired odd bank recorded by the finder. Treating that
+     * half as universally fixed validates bytes from bank 7 instead and
+     * demotes hundreds of legitimate Gumshoe routines to interpreter stubs. */
+    int read_bank = (addr >= 0xC000 && !rom_mapper_full_32k_switch(rom))
+                  ? fixed_bank : bank;
+    uint8_t first = rom_read(rom, read_bank, addr);
+
+    if (first == 0x00 || first == 0x40) return false;
+    if (mn_finder_illegal(g_opcode_table[first].mnemonic)) return false;
+    if (first == 0x60) return true;
+
+    uint16_t pc = addr;
+    for (int i = 0; i < MIN_VALID; i++) {
+        uint8_t op = rom_read(rom, read_bank, pc);
+        const OpcodeEntry *e = &g_opcode_table[op];
+        if (op == 0x00 || op == 0x40) return false;
+        if (mn_finder_illegal(e->mnemonic)) return false;
+        if (op == 0x20) {
+            uint16_t target =
+                (uint16_t)rom_read(rom, read_bank, pc + 1) |
+                ((uint16_t)rom_read(rom, read_bank, pc + 2) << 8);
+            uint16_t resolved =
+                resolve_jmp_thunk(rom, fixed_bank, target);
+            bool skipped_trampoline_payload = false;
+            for (int ti = 0; ti < cfg->trampoline_count; ti++) {
+                const TrampolineEntry *tramp = &cfg->trampolines[ti];
+                if (target != tramp->addr && resolved != tramp->addr)
+                    continue;
+                /* Configured bank-switch trampolines consume fixed inline
+                 * operands after the JSR. Those bytes are payload, not 6502
+                 * instructions, so resume validation after the payload just
+                 * as the function finder and native emitter do. */
+                pc = (uint16_t)(pc + 3 + tramp->inline_bytes);
+                skipped_trampoline_payload = true;
+                break;
+            }
+            if (skipped_trampoline_payload)
+                continue;
+            for (int ti = 0; ti < cfg->inline_dispatch_count; ti++) {
+                /* Bytes following this JSR are an inline address table, not a
+                 * linear instruction stream. Code generation has a dedicated
+                 * lowering for the configured dispatcher, so reaching it is
+                 * sufficient native-eligibility evidence. */
+                if (resolved == cfg->inline_dispatches[ti].addr)
+                    return true;
+            }
+        }
+        if (op == 0x60 || op == 0x4C || op == 0x6C) return true;
+        pc = (uint16_t)(pc + (e->size > 0 ? e->size : 1));
+    }
+    return true;
+}
+
+static bool should_emit_native_body_uncached(const NESRom *rom, const GameConfig *cfg,
+                                             const FunctionEntry *entry) {
+    if (config_forces_interp(cfg, rom->prg_banks - 1, entry->addr, entry->bank))
+        return false;
+    if (entry->bank == rom->prg_banks - 1) return true;
+    if (config_has_extra_func(cfg, rom->prg_banks - 1, entry->addr, entry->bank)) return true;
+    if (entry_source_is_curated(entry)) return true;
+    return native_entry_decode_valid(rom, cfg, entry->bank, entry->addr);
+}
+
+static bool should_emit_native_body(const NESRom *rom, const GameConfig *cfg,
+                                    const FunctionEntry *entry) {
+    int index = -1;
+    if (g_codegen_function_index)
+        index = codegen_find_function_index(NULL, entry->addr, entry->bank);
+    if (g_codegen_native_eligibility &&
+        index >= 0 && index < g_codegen_function_index_count) {
+        int8_t cached = g_codegen_native_eligibility[index];
+        if (cached >= 0) return cached != 0;
+        bool eligible = should_emit_native_body_uncached(rom, cfg, entry);
+        g_codegen_native_eligibility[index] = eligible ? 1 : 0;
+        return eligible;
+    }
+    return should_emit_native_body_uncached(rom, cfg, entry);
+}
+
+static void wrapper_list_add(EmittedWrapper *wrappers, int *count, int max_count,
+                             uint16_t addr, int bank) {
+    if (*count >= max_count) return;
+    if (wrapper_list_contains(wrappers, *count, addr, bank)) return;
+    wrappers[(*count)++] = (EmittedWrapper){ addr, bank };
+}
+
+static bool entry_is_merge_range_secondary(const NESRom *rom, const FunctionList *funcs,
+                                           const GameConfig *cfg, int entry_index) {
+    const FunctionEntry *entry = &funcs->entries[entry_index];
+
+    for (int ri = 0; ri < cfg->merge_range_count; ri++) {
+        if (entry->bank != cfg->merge_ranges[ri].bank) continue;
+        uint16_t fa = entry->addr;
+        if (fa < cfg->merge_ranges[ri].addr_lo || fa > cfg->merge_ranges[ri].addr_hi) continue;
+        uint16_t canonical = 0xFFFF;
+        for (int fi = 0; fi < funcs->count; fi++) {
+            if (funcs->entries[fi].bank != cfg->merge_ranges[ri].bank) continue;
+            uint16_t ca = funcs->entries[fi].addr;
+            if (ca >= cfg->merge_ranges[ri].addr_lo && ca <= cfg->merge_ranges[ri].addr_hi) {
+                if (ca < canonical) canonical = ca;
+            }
+        }
+        if (fa == canonical) return false;
+        if (!cfg->merge_ranges[ri].public_wrappers) return true;
+
+        uint16_t walk = canonical;
+        int bank_for_walk = entry->bank;
+        for (int wi = 0; wi < 512; wi++) {
+            if (walk == fa) return true;
+            if (walk > fa || walk > cfg->merge_ranges[ri].addr_hi) break;
+            uint8_t op = rom_read(rom, bank_for_walk, walk);
+            extern const OpcodeEntry g_opcode_table[];
+            const OpcodeEntry *ew = &g_opcode_table[op];
+            int wsz = (ew->size > 0) ? ew->size : 1;
+            walk += wsz;
+        }
+    }
+
+    return false;
+}
+
+static bool function_is_suppressed_merge_secondary(const NESRom *rom,
+                                                    const FunctionList *funcs,
+                                                    const GameConfig *cfg,
+                                                    uint16_t addr, int bank) {
+    for (int i = 0; i < funcs->count; i++) {
+        const FunctionEntry *entry = &funcs->entries[i];
+        if (entry->addr == addr && entry->bank == bank)
+            return entry_is_merge_range_secondary(rom, funcs, cfg, i);
+    }
+    return false;
+}
+
+static bool entry_owns_merge_range_addr(const FunctionList *funcs,
+                                        const GameConfig *cfg,
+                                        const FunctionEntry *owner,
+                                        uint16_t addr) {
+    if (!function_list_contains(funcs, addr, owner->bank)) return false;
+
+    for (int ri = 0; ri < cfg->merge_range_count; ri++) {
+        const MergeRange *range = &cfg->merge_ranges[ri];
+        if (owner->bank != range->bank) continue;
+        if (owner->addr < range->addr_lo || owner->addr > range->addr_hi ||
+            addr < range->addr_lo || addr > range->addr_hi)
+            continue;
+
+        uint16_t canonical = 0xFFFF;
+        for (int fi = 0; fi < funcs->count; fi++) {
+            const FunctionEntry *candidate = &funcs->entries[fi];
+            if (candidate->bank != range->bank) continue;
+            if (candidate->addr < range->addr_lo || candidate->addr > range->addr_hi)
+                continue;
+            if (candidate->addr < canonical) canonical = candidate->addr;
+        }
+        if (owner->addr == canonical) return true;
+    }
+
+    return false;
+}
+
+static bool entry_owns_public_merge_range_alias(const FunctionList *funcs,
+                                                const GameConfig *cfg,
+                                                const FunctionEntry *owner,
+                                                const FunctionEntry *alias) {
+    for (int ri = 0; ri < cfg->merge_range_count; ri++) {
+        const MergeRange *range = &cfg->merge_ranges[ri];
+        if (!range->public_wrappers || owner->bank != range->bank ||
+            alias->bank != range->bank)
+            continue;
+        if (owner->addr < range->addr_lo || owner->addr > range->addr_hi ||
+            alias->addr < range->addr_lo || alias->addr > range->addr_hi)
+            continue;
+
+        uint16_t canonical = 0xFFFF;
+        for (int fi = 0; fi < funcs->count; fi++) {
+            const FunctionEntry *candidate = &funcs->entries[fi];
+            if (candidate->bank != range->bank) continue;
+            if (candidate->addr < range->addr_lo || candidate->addr > range->addr_hi)
+                continue;
+            if (candidate->addr < canonical) canonical = candidate->addr;
+        }
+        if (owner->addr == canonical) return true;
+    }
+
+    return false;
+}
+
+#define MAX_SECONDARY_ENTRIES 4096
+
+static bool manual_entry_inherits_pending_pha(const NESRom *rom,
+                                              const FunctionEntry *owner,
+                                              const FunctionEntry *entry,
+                                              const GameConfig *cfg) {
+    if (owner->bank != entry->bank || owner->addr >= entry->addr)
+        return false;
+
+    uint16_t valid_starts[MAX_INSNS_PER_FUNC];
+    int valid_count = 0;
+    int pending_pha_count = 0;
+    scan_function_boundaries(rom, owner->addr, owner->bank, cfg,
+                             valid_starts, &valid_count, MAX_INSNS_PER_FUNC);
+
+    for (int i = 0; i < valid_count; i++) {
+        uint16_t addr = valid_starts[i];
+        if (addr >= entry->addr) break;
+        OpMnemonic mnemonic = g_opcode_table[rom_read(rom, owner->bank, addr)].mnemonic;
+        if (mnemonic == MN_PHA)
+            pending_pha_count++;
+        else if (mnemonic == MN_PLA && pending_pha_count > 0)
+            pending_pha_count--;
+    }
+
+    return pending_pha_count >= 2;
+}
+
+static int find_manual_entry_owner_index_uncached(const NESRom *rom, const FunctionList *funcs,
+                                                  const GameConfig *cfg, int entry_index) {
+    const FunctionEntry *entry = &funcs->entries[entry_index];
+    if (!(entry->source_flags & FUNCTION_SOURCE_MANUAL)) return -1;
+
+    /* A direct entry on RTS did not execute a preceding PHA. Aliasing it into
+     * an enclosing body would make the context-sensitive RTS emitter treat a
+     * plain return as a computed tail dispatch. Keep that entry standalone. */
+    if (entry->addr > 0x8000 &&
+        rom_read(rom, entry->bank, entry->addr) == 0x60 &&
+        rom_read(rom, entry->bank, entry->addr - 1) == 0x48)
+        return -1;
+
+    int best_index = -1;
+    uint16_t best_addr = 0;
+
+    for (int oi = 0; oi < funcs->count; oi++) {
+        if (oi == entry_index) continue;
+        const FunctionEntry *owner = &funcs->entries[oi];
+        if (owner->bank != entry->bank) continue;
+        if (owner->addr > entry->addr) continue;
+        if (!entry_emits_standalone(funcs, cfg, owner)) continue;
+        /* An owner rejected from native emission (most commonly because it
+         * begins inside a configured data region) cannot publish a manual
+         * entry wrapper. Assigning ownership to it suppresses the real
+         * entry's standalone body and leaves only an interpreter stub. */
+        if (!should_emit_native_body(rom, cfg, owner)) continue;
+        if (!(owner->source_flags & FUNCTION_SOURCE_MANUAL) &&
+            entry_is_merge_range_secondary(rom, funcs, cfg, oi)) continue;
+        if (manual_entry_inherits_pending_pha(rom, owner, entry, cfg)) continue;
+
+        uint16_t valid_starts[MAX_INSNS_PER_FUNC];
+        int valid_count = 0;
+        scan_function_boundaries(rom, owner->addr, owner->bank, cfg,
+                                 valid_starts, &valid_count, MAX_INSNS_PER_FUNC);
+        if (!contains_addr(valid_starts, valid_count, entry->addr)) continue;
+
+        if (best_index < 0 || owner->addr > best_addr) {
+            best_index = oi;
+            best_addr = owner->addr;
+        }
+    }
+
+    return best_index;
+}
+
+static int find_manual_entry_owner_index(const NESRom *rom, const FunctionList *funcs,
+                                         const GameConfig *cfg, int entry_index) {
+    (void)rom;
+    (void)funcs;
+    (void)cfg;
+    if (g_codegen_manual_owner_indices &&
+        entry_index >= 0 && entry_index < g_codegen_manual_owner_count)
+        return g_codegen_manual_owner_indices[entry_index];
+    return -1;
+}
+
+static bool build_manual_owner_cache(const NESRom *rom, const FunctionList *funcs,
+                                     const GameConfig *cfg) {
+    free(g_codegen_manual_owner_indices);
+    g_codegen_manual_owner_indices = NULL;
+    g_codegen_manual_owner_count = 0;
+
+    int *owners = (int *)malloc((size_t)funcs->count * sizeof(int));
+    if (!owners) return false;
+    for (int i = 0; i < funcs->count; i++) owners[i] = -1;
+
+    g_codegen_manual_owner_indices = owners;
+    g_codegen_manual_owner_count = funcs->count;
+    for (int i = 0; i < funcs->count; i++) {
+        if (funcs->entries[i].source_flags & FUNCTION_SOURCE_MANUAL)
+            owners[i] = find_manual_entry_owner_index_uncached(rom, funcs, cfg, i);
+    }
+
+    /* A manual entry can be nested inside another manual entry that is itself
+     * emitted only as a public wrapper. Wrapper collection runs from standalone
+     * bodies, so resolve every chain to the ultimate body owner. Owner addresses
+     * strictly decrease, but keep a hop bound to make malformed input harmless. */
+    for (int i = 0; i < funcs->count; i++) {
+        int owner = owners[i];
+        int hops = 0;
+        while (owner >= 0 && owner < funcs->count &&
+               owners[owner] >= 0 && hops++ < funcs->count) {
+            owner = owners[owner];
+        }
+        if (hops < funcs->count) {
+            bool owner_can_publish = owner >= 0 && owner < funcs->count;
+            if (owner_can_publish) {
+                uint16_t valid_starts[MAX_INSNS_PER_FUNC];
+                int valid_count = 0;
+                scan_function_boundaries(rom, funcs->entries[owner].addr,
+                                         funcs->entries[owner].bank, cfg,
+                                         valid_starts, &valid_count,
+                                         MAX_INSNS_PER_FUNC);
+                owner_can_publish = contains_addr(valid_starts, valid_count,
+                                                  funcs->entries[i].addr);
+            }
+            if (owner_can_publish &&
+                !manual_entry_inherits_pending_pha(rom, &funcs->entries[owner],
+                                                   &funcs->entries[i], cfg))
+                owners[i] = owner;
+            else
+                owners[i] = -1;
+        }
+    }
+
+    return true;
+}
+
+static int collect_secondary_addrs(const NESRom *rom, const FunctionList *funcs,
+                                   const GameConfig *cfg, int entry_index,
+                                   uint16_t *secondary_addrs, int max_secondary) {
+    const FunctionEntry *entry = &funcs->entries[entry_index];
+    /* A promoted automatic secondary is deliberately a fresh, single-entry
+     * body. Its rejected canonical owner cannot donate an alias graph, and
+     * searching every function for nested aliases here is both misleading
+     * and quadratic for large discovery sets. */
+    if (entry->kind == FUNCTION_KIND_SECONDARY &&
+        !(entry->source_flags & FUNCTION_SOURCE_MANUAL))
+        return 0;
+
+    uint16_t pc = entry->addr;
+    int bank = entry->bank;
+    uint16_t valid_starts[MAX_INSNS_PER_FUNC];
+    int valid_count = 0;
+    uint16_t merge_partners[16];
+    int merge_partner_count = 0;
+
+    scan_function_boundaries(rom, pc, bank, cfg,
+                             valid_starts, &valid_count, MAX_INSNS_PER_FUNC);
+
+    for (int mi = 0; mi < cfg->merge_func_count && merge_partner_count < 16; mi++) {
+        if (cfg->merge_funcs[mi].bank != bank) continue;
+        if (cfg->merge_funcs[mi].addr_lo == pc)
+            merge_partners[merge_partner_count++] = cfg->merge_funcs[mi].addr_hi;
+        else if (cfg->merge_funcs[mi].addr_hi == pc)
+            merge_partners[merge_partner_count++] = cfg->merge_funcs[mi].addr_lo;
+    }
+    for (int ri = 0; ri < cfg->merge_range_count && merge_partner_count < 16; ri++) {
+        if (cfg->merge_ranges[ri].bank != bank) continue;
+        if (pc < cfg->merge_ranges[ri].addr_lo || pc > cfg->merge_ranges[ri].addr_hi) continue;
+        for (uint16_t a = cfg->merge_ranges[ri].addr_lo;
+             a <= cfg->merge_ranges[ri].addr_hi && merge_partner_count < 16; ) {
+            if (a != pc && function_list_contains(funcs, a, bank))
+                merge_partners[merge_partner_count++] = a;
+            uint8_t op = rom_read(rom, bank, a);
+            int sz = g_opcode_table[op].size;
+            if (sz <= 0) sz = 1;
+            if ((uint32_t)a + (uint32_t)sz > 0xFFFFu) break;
+            a = (uint16_t)(a + sz);
+        }
+    }
+
+    int secondary_count = 0;
+    /* Explicit labels and manual entries are public dispatch contracts. Add
+     * them before the much larger auto-secondary set so a permissive body scan
+     * cannot exhaust the bounded array and silently demote configured entries
+     * to fallback. */
+    for (int li = 0; li < cfg->extra_label_count && secondary_count < max_secondary; li++) {
+        int lbl_bank = cfg->extra_labels[li].bank;
+        uint16_t lbl_addr = cfg->extra_labels[li].addr;
+        if (lbl_bank != bank || lbl_addr == pc) continue;
+        bool suppressed_merge_entry =
+            function_is_suppressed_merge_secondary(rom, funcs, cfg, lbl_addr, bank);
+        if (function_list_contains(funcs, lbl_addr, bank) && !suppressed_merge_entry)
+            continue;
+        bool valid = entry_owns_merge_range_addr(funcs, cfg, entry, lbl_addr);
+        for (int v = 0; v < valid_count; v++) {
+            if (valid_starts[v] == lbl_addr) {
+                valid = true;
+                break;
+            }
+        }
+        /* Merge-range emission seeds every discovered entry in the range as a
+         * pending body start. That can publish a configured label after a JMP
+         * even though the finder-style reachability scan above stops earlier. */
+        if (valid && !contains_addr(secondary_addrs, secondary_count, lbl_addr))
+            secondary_addrs[secondary_count++] = lbl_addr;
+    }
+    for (int pass = 0; pass < 2 && secondary_count < max_secondary; pass++) {
+        for (int fi = 0; fi < funcs->count && secondary_count < max_secondary; fi++) {
+            const FunctionEntry *fe = &funcs->entries[fi];
+            bool manual = (fe->source_flags & FUNCTION_SOURCE_MANUAL) != 0;
+            if ((pass == 0) != manual) continue;
+            if (fe->bank != bank || fe->addr == pc) continue;
+
+            if (manual) {
+                if (find_manual_entry_owner_index(rom, funcs, cfg, fi) != entry_index)
+                    continue;
+            } else if (fe->kind == FUNCTION_KIND_SECONDARY) {
+                int owner_index = -1;
+                uint16_t owner_addr = fe->canonical_addr;
+                int owner_bank = fe->canonical_bank;
+
+                /* Structural classification can point an automatic secondary
+                 * at a configured entry which is itself emitted only as a
+                 * wrapper. Resolve that wrapper ownership before deciding
+                 * which real body must publish the automatic entry. */
+                for (int hops = 0; hops < funcs->count; hops++) {
+                    owner_index = codegen_find_function_index(
+                        funcs, owner_addr, owner_bank);
+                    if (owner_index < 0) break;
+
+                    const FunctionEntry *owner = &funcs->entries[owner_index];
+                    int manual_owner = find_manual_entry_owner_index(
+                        rom, funcs, cfg, owner_index);
+                    if (manual_owner >= 0 && manual_owner != owner_index) {
+                        owner_addr = funcs->entries[manual_owner].addr;
+                        owner_bank = funcs->entries[manual_owner].bank;
+                        continue;
+                    }
+                    if (owner->kind == FUNCTION_KIND_SECONDARY &&
+                        (owner->canonical_addr != owner_addr ||
+                         owner->canonical_bank != owner_bank)) {
+                        owner_addr = owner->canonical_addr;
+                        owner_bank = owner->canonical_bank;
+                        continue;
+                    }
+                    break;
+                }
+                if (owner_index != entry_index) continue;
+            } else {
+                continue;
+            }
+
+            bool valid = false;
+            for (int v = 0; v < valid_count; v++) {
+                if (valid_starts[v] == fe->addr) { valid = true; break; }
+            }
+            if (valid && !contains_addr(secondary_addrs, secondary_count, fe->addr))
+                secondary_addrs[secondary_count++] = fe->addr;
+        }
+    }
+    for (int mi = 0; mi < merge_partner_count && secondary_count < max_secondary; mi++) {
+        uint16_t mp = merge_partners[mi];
+        bool found = false;
+        for (int si = 0; si < secondary_count; si++) {
+            if (secondary_addrs[si] == mp) { found = true; break; }
+        }
+        if (!found) {
+            bool valid = false;
+            for (int v = 0; v < valid_count; v++) {
+                if (valid_starts[v] == mp) { valid = true; break; }
+            }
+            if (valid)
+                secondary_addrs[secondary_count++] = mp;
+        }
+    }
+
+    return secondary_count;
+}
+
+static bool entry_has_public_secondary_wrapper(const NESRom *rom, const FunctionList *funcs,
+                                               const GameConfig *cfg, int entry_index) {
+    const FunctionEntry *entry = &funcs->entries[entry_index];
+    if (entry->source_flags & FUNCTION_SOURCE_MANUAL)
+        return find_manual_entry_owner_index(rom, funcs, cfg, entry_index) >= 0;
+
+    return false;
+}
+
+static int resolve_secondary_owner_index(const FunctionList *funcs, int entry_index) {
+    int current = entry_index;
+
+    for (int hops = 0; hops < funcs->count; hops++) {
+        const FunctionEntry *entry = &funcs->entries[current];
+        if (entry->kind != FUNCTION_KIND_SECONDARY) return current;
+
+        int owner = codegen_find_function_index(
+            funcs, entry->canonical_addr, entry->canonical_bank);
+        if (owner < 0 || owner == current) return -1;
+        current = owner;
+    }
+
+    return -1;
+}
+
+static bool secondary_owner_emits_native_body(const NESRom *rom,
+                                              const FunctionList *funcs,
+                                              const GameConfig *cfg,
+                                              int entry_index) {
+    int owner_index = resolve_secondary_owner_index(funcs, entry_index);
+    if (owner_index < 0 || owner_index == entry_index) return false;
+
+    const FunctionEntry *owner = &funcs->entries[owner_index];
+    if (!entry_emits_standalone(funcs, cfg, owner)) return false;
+    if (!(owner->source_flags & FUNCTION_SOURCE_MANUAL) &&
+        entry_is_merge_range_secondary(rom, funcs, cfg, owner_index)) return false;
+
+    return should_emit_native_body(rom, cfg, owner);
+}
+
+static bool entry_should_emit_standalone_body(const NESRom *rom, const FunctionList *funcs,
+                                              const GameConfig *cfg, int entry_index) {
+    const FunctionEntry *entry = &funcs->entries[entry_index];
+
+    if (entry->source_flags & FUNCTION_SOURCE_MANUAL)
+        if (entry_has_public_secondary_wrapper(rom, funcs, cfg, entry_index))
+            return false;
+
+    if (entry->kind == FUNCTION_KIND_SECONDARY) {
+        /* A structurally discovered entry normally aliases its canonical
+         * body's generated C function. If that owner is rejected from native
+         * emission, however, an interpreter wrapper for the secondary starts
+         * without the guest JSR frame that its RTS expects. Preserve the
+         * ownership when the owner is native; otherwise promote only a
+         * secondary that independently validates as native code. */
+        if (entry_is_merge_range_secondary(rom, funcs, cfg, entry_index))
+            return false;
+        if (secondary_owner_emits_native_body(rom, funcs, cfg, entry_index))
+            return false;
+        return should_emit_native_body(rom, cfg, entry);
+    }
+
+    if (!entry_emits_standalone(funcs, cfg, entry)) return false;
+    if (!(entry->source_flags & FUNCTION_SOURCE_MANUAL) &&
+        entry_is_merge_range_secondary(rom, funcs, cfg, entry_index)) return false;
+
+    return true;
+}
+
+static int collect_internal_alias_addrs(const NESRom *rom, const FunctionList *funcs,
+                                        const GameConfig *cfg, int entry_index,
+                                        const uint16_t *existing_addrs, int existing_count,
+                                        uint16_t *alias_addrs, int max_aliases) {
+    const FunctionEntry *entry = &funcs->entries[entry_index];
+    if (entry->kind == FUNCTION_KIND_SECONDARY &&
+        !(entry->source_flags & FUNCTION_SOURCE_MANUAL))
+        return 0;
+
+    uint16_t valid_starts[MAX_INSNS_PER_FUNC];
+    int valid_count = 0;
+    int alias_count = 0;
+
+    scan_function_boundaries(rom, entry->addr, entry->bank, cfg,
+                             valid_starts, &valid_count, MAX_INSNS_PER_FUNC);
+
+    for (int fi = 0; fi < funcs->count && alias_count < max_aliases; fi++) {
+        const FunctionEntry *fe = &funcs->entries[fi];
+        if (fe->bank != entry->bank) continue;
+        if (fe->addr == entry->addr) continue;
+        /* Only alias entries that are intentionally omitted as standalone wrappers.
+         * Pulling in arbitrary discovered functions here can collapse unrelated code
+         * into a single mega-body when the boundary scan is over-permissive. */
+        if (fe->source_flags & FUNCTION_SOURCE_MANUAL) continue;
+        if (!entry_is_merge_range_secondary(rom, funcs, cfg, fi)) continue;
+        if (!entry_owns_public_merge_range_alias(funcs, cfg, entry, fe)) continue;
+        if (contains_addr(existing_addrs, existing_count, fe->addr)) continue;
+
+        bool valid = false;
+        for (int v = 0; v < valid_count; v++) {
+            if (valid_starts[v] == fe->addr) { valid = true; break; }
+        }
+        if (valid && !contains_addr(alias_addrs, alias_count, fe->addr))
+            alias_addrs[alias_count++] = fe->addr;
+    }
+
+    return alias_count;
+}
+
+#define MAX_BODY_ALIASES (MAX_FUNCTIONS * 4)
+#define MAX_SECONDARY_ENTRIES 4096
+
+static int collect_body_aliases(const NESRom *rom, const FunctionList *funcs,
+                                const GameConfig *cfg, BodyAlias *aliases,
+                                int max_aliases) {
+    int alias_count = 0;
+
+    for (int i = 0; i < funcs->count; i++) {
+        const FunctionEntry *entry = &funcs->entries[i];
+        if (!entry_should_emit_standalone_body(rom, funcs, cfg, i)) continue;
+
+        uint16_t public_addrs[MAX_SECONDARY_ENTRIES];
+        int public_count = collect_secondary_addrs(rom, funcs, cfg, i,
+                                                   public_addrs, MAX_SECONDARY_ENTRIES);
+        uint16_t internal_addrs[MAX_SECONDARY_ENTRIES];
+        int internal_count = collect_internal_alias_addrs(rom, funcs, cfg, i,
+                                                          public_addrs, public_count,
+                                                          internal_addrs, MAX_SECONDARY_ENTRIES);
+        for (int ai = 0; ai < internal_count && alias_count < max_aliases; ai++) {
+            aliases[alias_count++] = (BodyAlias){
+                internal_addrs[ai], entry->bank, entry->addr, entry->bank,
+                public_count + ai + 1
+            };
+        }
+    }
+
+    return alias_count;
+}
+
+#define MAX_EMITTED_WRAPPERS (MAX_FUNCTIONS * 4)
+
+
+static int collect_emitted_wrappers(const NESRom *rom, const FunctionList *funcs,
+                                    const GameConfig *cfg, EmittedWrapper *wrappers,
+                                    int max_wrappers) {
+    int wrapper_count = 0;
+
+    for (int i = 0; i < funcs->count; i++) {
+        const FunctionEntry *entry = &funcs->entries[i];
+        if (!entry_should_emit_standalone_body(rom, funcs, cfg, i)) continue;
+
+        wrapper_list_add(wrappers, &wrapper_count, max_wrappers, entry->addr, entry->bank);
+
+        uint16_t secondary_addrs[MAX_SECONDARY_ENTRIES];
+        int secondary_count = collect_secondary_addrs(rom, funcs, cfg, i,
+                                                      secondary_addrs, MAX_SECONDARY_ENTRIES);
+        for (int si = 0; si < secondary_count; si++) {
+            uint16_t sa = secondary_addrs[si];
+            if (suppress_merge_range_wrapper(cfg, entry->bank, entry->addr, sa))
+                continue;
+            if (prefer_merge_range_wrapper(cfg, entry->bank, entry->addr, sa))
+                continue;
+            wrapper_list_add(wrappers, &wrapper_count, max_wrappers, sa, entry->bank);
+        }
+
+        uint16_t internal_addrs[MAX_SECONDARY_ENTRIES];
+        int internal_count = collect_internal_alias_addrs(rom, funcs, cfg, i,
+                                                          secondary_addrs, secondary_count,
+                                                          internal_addrs, MAX_SECONDARY_ENTRIES);
+        for (int ai = 0; ai < internal_count; ai++) {
+            wrapper_list_add(wrappers, &wrapper_count, max_wrappers,
+                             internal_addrs[ai], entry->bank);
+        }
+    }
+
+    return wrapper_count;
+}
+
+/* Translate an SRAM address to ROM address via game config sram_map.
+ * Returns the ROM address (>= $8000) on success, or 0 if not mapped. */
+static uint16_t codegen_sram_translate(const GameConfig *cfg, uint16_t addr, int *out_bank) {
+    for (int i = 0; i < cfg->sram_map_count; i++) {
+        const SramMap *m = &cfg->sram_maps[i];
+        if (addr >= m->sram_start && addr < m->sram_start + m->size) {
+            *out_bank = m->bank;
+            return m->rom_start + (addr - m->sram_start);
+        }
+    }
+    return 0;
+}
+
+/* Check if an address is a valid inline_dispatch table entry:
+ * either in ROM range ($8000+) with a known function that is actually
+ * emitted (not in a data region, not zero-fill), or in a configured
+ * SRAM map range whose translated ROM address has a generated function.
+ * dispatch_bank: bank for switchable-range ($8000-$BFFF) targets.
+ * fixed_bank:    bank index for fixed range ($C000+) targets.
+ * rom:           ROM data for code validation (NULL to skip). */
+static int is_valid_dispatch_target(const GameConfig *cfg, uint16_t addr,
+                                     const FunctionList *funcs,
+                                     int dispatch_bank, int fixed_bank,
+                                     const NESRom *rom) {
+    if (rom && rom_mapper40(rom) && addr >= 0x6000) {
+        int first8 = 0;
+        int last8 = (addr >= 0xC000 && addr < 0xE000)
+                  ? rom->prg_banks * 2 : 1;
+        for (int bank8 = first8; bank8 < last8; bank8++) {
+            uint16_t gen_addr;
+            int gen_bank;
+            if (!rom_mapper40_cpu_to_generated(rom, addr, bank8,
+                                                &gen_addr, &gen_bank))
+                continue;
+            if (rom_read(rom, gen_bank, gen_addr) == 0x00)
+                continue;
+            if (!funcs || function_list_contains(funcs, gen_addr, gen_bank))
+                return 1;
+        }
+        return 0;
+    }
+    if (addr >= 0x8000) {
+        /* For GxROM and similar full-32KB-switch mappers, $C000+ targets
+         * live in the paired upper bank of the current window — not in
+         * fixed_bank.  Mirrors gxrom_paired_bank() used by emit_call_target
+         * and emit_dispatch.  Without this, dispatch tables get truncated
+         * the moment they reference a $C000+ target whose discovered
+         * function lives in (dispatch_bank | 1) instead of fixed_bank. */
+        int check_bank;
+        if (addr >= 0xC000) {
+            if (rom && rom_mapper_full_32k_switch(rom) && dispatch_bank >= 0)
+                check_bank = dispatch_bank | 1;
+            else
+                check_bank = fixed_bank;
+        } else {
+            check_bank = dispatch_bank;
+        }
+        /* Reject targets where the first byte is BRK ($00) — indicates
+         * zero-fill or unused ROM, not a valid function entry. */
+        if (rom && check_bank >= 0 && rom_read(rom, check_bank, addr) == 0x00)
+            return 0;
+        /* Require a discovered function at the target. */
+        if (funcs) {
+            if (check_bank >= 0 &&
+                function_list_contains(funcs, addr, check_bank)) return 1;
+            /* If dispatch bank unknown for switchable range, accept
+             * cautiously (can't validate without bank info). */
+            if (addr < 0xC000 && dispatch_bank < 0) return 1;
+            return 0;
+        }
+        return 1;  /* No function list: accept all ROM targets */
+    }
+    int sram_bank = -1;
+    uint16_t rom_addr = codegen_sram_translate(cfg, addr, &sram_bank);
+    if (!rom_addr) return 0;
+    /* Only accept SRAM targets that have a known function — prevents
+     * random ROM data from extending the table past its real end. */
+    if (funcs && function_list_contains(funcs, rom_addr, sram_bank)) return 1;
+    return 0;
+}
+
+/* If `addr` points to a single JMP abs (opcode $4C), return the JMP target.
+ * Otherwise return `addr` unchanged.  Used to auto-detect thunks like
+ *   $C000: JMP $F573   — JSR $C000 should be treated as JSR $F573.
+ * The address must be in the fixed bank range ($C000-$FFFF) so we read
+ * from `fixed_bank`. */
+static uint16_t resolve_jmp_thunk(const NESRom *rom, int fixed_bank, uint16_t addr) {
+    if (addr < 0xC000) return addr;           /* switchable range — skip */
+    if (rom_read(rom, fixed_bank, addr) != 0x4C) return addr;  /* not JMP abs */
+    uint8_t lo = rom_read(rom, fixed_bank, addr + 1);
+    uint8_t hi = rom_read(rom, fixed_bank, addr + 2);
+    return (uint16_t)(lo | ((uint16_t)hi << 8));
+}
+
+/* ---------------------------------------------------------------------------
+ * inline_dispatch trampoline side-effect derivation.
+ *
+ * Inline dispatch replaces a `JSR <trampoline>` + inline address table with
+ * a compile-time switch, but the trampoline body's side effects remain
+ * visible to game code: RAM stores (e.g. SMB's JumpEngine at $8E04 writes
+ * the pulled return address to $04/$05 and the dispatch target to $06/$07),
+ * final register/flag state (JumpEngine exits with Y=2*A+2 and A=target hi),
+ * and consumed CPU cycles.
+ *
+ * These effects differ per game — hardcoding one game's pattern corrupts
+ * another's state (Gumshoe's dispatcher does STX $27/STY $28; those same
+ * addresses are SMB's Block_State[1]/Misc_State[0]).  So derive them by
+ * symbolically executing the trampoline's straight-line body at codegen
+ * time.  Execution is concrete: A is the switch-case selector, the pulled
+ * return address is the static JSR site + 2, and table reads come from ROM.
+ * X/Y pass through as runtime values unless overwritten.  Any construct
+ * outside this model (branches, RMW memory ops, I/O stores, values that
+ * can't be represented) fails the derivation and no side effects are
+ * emitted, with a codegen warning.
+ * ------------------------------------------------------------------------ */
+
+#define TRAMP_MAX_STORES 16
+
+typedef struct {
+    enum { TV_CONST, TV_XIN, TV_YIN, TV_RET_LO, TV_RET_HI, TV_UNKNOWN } kind;
+    uint8_t k;                      /* concrete analysis value */
+} TrampVal;
+
+typedef struct { uint16_t addr; TrampVal val; } TrampStore;
+
+typedef struct {
+    TrampStore stores[TRAMP_MAX_STORES];
+    int      store_count;
+    TrampVal a, x, y;               /* final register state */
+    int      flag_c, flag_v;        /* -1 = unchanged by body, else 0/1 */
+    int      nz_set;                /* 1 if the body produced final N/Z */
+    TrampVal nz;                    /* value the final N/Z derive from */
+    int      cycles;                /* exact cycles incl. page-cross penalties */
+} TrampEffects;
+
+static TrampVal tramp_const(uint8_t k) {
+    TrampVal v; v.kind = TV_CONST; v.k = k; return v;
+}
+
+static void tramp_store_put(TrampEffects *fx, uint16_t addr, TrampVal val, int *ok) {
+    for (int i = 0; i < fx->store_count; i++)
+        if (fx->stores[i].addr == addr) { fx->stores[i].val = val; return; }
+    if (fx->store_count >= TRAMP_MAX_STORES) { *ok = 0; return; }
+    fx->stores[fx->store_count].addr = addr;
+    fx->stores[fx->store_count].val  = val;
+    fx->store_count++;
+}
+
+static int tramp_mem_lookup(const TrampEffects *fx, uint16_t addr, TrampVal *out) {
+    for (int i = 0; i < fx->store_count; i++)
+        if (fx->stores[i].addr == addr) { *out = fx->stores[i].val; return 1; }
+    return 0;
+}
+
+/* Resolve a load's value.  Returns 0 if the addressing can't be resolved
+ * concretely.  Reads of RAM the body hasn't written are TV_UNKNOWN (fine
+ * until something needs the actual value).  Adds page-cross penalties. */
+static int tramp_load(const NESRom *rom, int bank, const TrampEffects *fx,
+                      AddrMode am, uint8_t op1, uint8_t op2,
+                      TrampVal *out, int *cycles) {
+    uint16_t ea;
+    switch (am) {
+    case AM_IMM: *out = tramp_const(op1); return 1;
+    case AM_ZP:  ea = op1; break;
+    case AM_ABS: ea = (uint16_t)(op1 | ((uint16_t)op2 << 8)); break;
+    case AM_ZPX:
+        if (fx->x.kind != TV_CONST) return 0;
+        ea = (uint8_t)(op1 + fx->x.k); break;
+    case AM_ZPY:
+        if (fx->y.kind != TV_CONST) return 0;
+        ea = (uint8_t)(op1 + fx->y.k); break;
+    case AM_ABSX: {
+        if (fx->x.kind != TV_CONST) return 0;
+        uint16_t base = (uint16_t)(op1 | ((uint16_t)op2 << 8));
+        ea = (uint16_t)(base + fx->x.k);
+        if ((base & 0xFF00) != (ea & 0xFF00)) (*cycles)++;
+        break; }
+    case AM_ABSY: {
+        if (fx->y.kind != TV_CONST) return 0;
+        uint16_t base = (uint16_t)(op1 | ((uint16_t)op2 << 8));
+        ea = (uint16_t)(base + fx->y.k);
+        if ((base & 0xFF00) != (ea & 0xFF00)) (*cycles)++;
+        break; }
+    case AM_INDY: {
+        TrampVal lo, hi;
+        if (!tramp_mem_lookup(fx, op1, &lo) ||
+            !tramp_mem_lookup(fx, (uint8_t)(op1 + 1), &hi)) return 0;
+        int concrete_ptr = lo.kind == TV_CONST && hi.kind == TV_CONST;
+        int live_ret_ptr = lo.kind == TV_RET_LO && hi.kind == TV_RET_HI;
+        if ((!concrete_ptr && !live_ret_ptr) || fx->y.kind != TV_CONST) return 0;
+        uint16_t base = (uint16_t)(lo.k | ((uint16_t)hi.k << 8));
+        ea = (uint16_t)(base + fx->y.k);
+        if ((base & 0xFF00) != (ea & 0xFF00)) (*cycles)++;
+        break; }
+    default: return 0;  /* (zp,X) etc. — unsupported */
+    }
+    if (tramp_mem_lookup(fx, ea, out)) return 1;
+    if (ea >= 0x8000) { *out = tramp_const(rom_read(rom, bank, ea)); return 1; }
+    out->kind = TV_UNKNOWN; out->k = 0;
+    return 1;
+}
+
+/* Resolve a store's effective address (must be concrete plain RAM). */
+static int tramp_store_ea(const TrampEffects *fx, AddrMode am,
+                          uint8_t op1, uint8_t op2, uint16_t *ea) {
+    switch (am) {
+    case AM_ZP:  *ea = op1; return 1;
+    case AM_ABS: *ea = (uint16_t)(op1 | ((uint16_t)op2 << 8)); return 1;
+    case AM_ZPX:
+        if (fx->x.kind != TV_CONST) return 0;
+        *ea = (uint8_t)(op1 + fx->x.k); return 1;
+    case AM_ZPY:
+        if (fx->y.kind != TV_CONST) return 0;
+        *ea = (uint8_t)(op1 + fx->y.k); return 1;
+    case AM_ABSX:
+        if (fx->x.kind != TV_CONST) return 0;
+        *ea = (uint16_t)((op1 | ((uint16_t)op2 << 8)) + fx->x.k); return 1;
+    case AM_ABSY:
+        if (fx->y.kind != TV_CONST) return 0;
+        *ea = (uint16_t)((op1 | ((uint16_t)op2 << 8)) + fx->y.k); return 1;
+    case AM_INDY: {
+        TrampVal lo, hi;
+        if (!tramp_mem_lookup(fx, op1, &lo) ||
+            !tramp_mem_lookup(fx, (uint8_t)(op1 + 1), &hi)) return 0;
+        int concrete_ptr = lo.kind == TV_CONST && hi.kind == TV_CONST;
+        int live_ret_ptr = lo.kind == TV_RET_LO && hi.kind == TV_RET_HI;
+        if ((!concrete_ptr && !live_ret_ptr) || fx->y.kind != TV_CONST) return 0;
+        *ea = (uint16_t)((lo.k | ((uint16_t)hi.k << 8)) + fx->y.k); return 1; }
+    default: return 0;
+    }
+}
+
+/* Symbolically execute the trampoline body for one dispatch case.
+ * Returns 1 and fills fx on success; 0 if the body leaves the model
+ * (fail_pc/fail_op report where). */
+static int derive_trampoline_effects(const NESRom *rom, int bank,
+                                     uint16_t tramp_addr, uint16_t jsr_pc,
+                                     uint8_t selector, int live_return,
+                                     TrampEffects *fx,
+                                     uint16_t *fail_pc, uint8_t *fail_op) {
+    memset(fx, 0, sizeof(*fx));
+    fx->a = tramp_const(selector);
+    fx->x.kind = TV_XIN;
+    fx->y.kind = TV_YIN;
+    fx->flag_c = -1;
+    fx->flag_v = -1;
+
+    /* 6502 stack as the trampoline sees it: the JSR pushed (jsr_pc + 2)
+     * hi then lo, so the return-address low byte is on top.  PHA/PLA in
+     * the body share this model. */
+    TrampVal stk[8];
+    int sp = 0;
+    uint16_t ret = (uint16_t)(jsr_pc + 2);
+    stk[sp++] = tramp_const((uint8_t)(ret >> 8));
+    stk[sp++] = tramp_const((uint8_t)(ret & 0xFF));
+    if (live_return) {
+        stk[0].kind = TV_RET_HI;
+        stk[1].kind = TV_RET_LO;
+    }
+
+    uint16_t pc = tramp_addr;
+    for (int steps = 0; steps < 64; steps++) {
+        uint8_t op  = rom_read(rom, bank, pc);
+        uint8_t op1 = rom_read(rom, bank, (uint16_t)(pc + 1));
+        uint8_t op2 = rom_read(rom, bank, (uint16_t)(pc + 2));
+        const OpcodeEntry *e = &g_opcode_table[op];
+        *fail_pc = pc;
+        *fail_op = op;
+        fx->cycles += e->cycles;
+        int ok = 1;
+        switch (e->mnemonic) {
+        case MN_JMP:
+            if (e->addr_mode == AM_IND) goto done;   /* the dispatch jump */
+            if (e->addr_mode == AM_ABS) { pc = (uint16_t)(op1 | ((uint16_t)op2 << 8)); continue; }
+            return 0;
+        case MN_RTS:
+            goto done;                               /* RTS-style dispatch */
+        case MN_ASL: case MN_LSR: case MN_ROL: case MN_ROR: {
+            if (e->addr_mode != AM_ACC || fx->a.kind != TV_CONST) { ok = 0; break; }
+            int oldc = fx->flag_c;
+            if (e->mnemonic == MN_ASL) {
+                fx->flag_c = (fx->a.k >> 7) & 1;
+                fx->a.k = (uint8_t)(fx->a.k << 1);
+            } else if (e->mnemonic == MN_LSR) {
+                fx->flag_c = fx->a.k & 1;
+                fx->a.k >>= 1;
+            } else if (e->mnemonic == MN_ROL) {
+                if (oldc < 0) { ok = 0; break; }
+                fx->flag_c = (fx->a.k >> 7) & 1;
+                fx->a.k = (uint8_t)((fx->a.k << 1) | oldc);
+            } else { /* ROR */
+                if (oldc < 0) { ok = 0; break; }
+                fx->flag_c = fx->a.k & 1;
+                fx->a.k = (uint8_t)((fx->a.k >> 1) | (oldc << 7));
+            }
+            fx->nz = fx->a; fx->nz_set = 1;
+            break; }
+        case MN_TAY: fx->y = fx->a; fx->nz = fx->a; fx->nz_set = 1; break;
+        case MN_TAX: fx->x = fx->a; fx->nz = fx->a; fx->nz_set = 1; break;
+        case MN_TYA: fx->a = fx->y; fx->nz = fx->y; fx->nz_set = 1; break;
+        case MN_TXA: fx->a = fx->x; fx->nz = fx->x; fx->nz_set = 1; break;
+        case MN_INY: case MN_DEY:
+            if (fx->y.kind != TV_CONST) { ok = 0; break; }
+            fx->y.k = (uint8_t)(fx->y.k + (e->mnemonic == MN_INY ? 1 : -1));
+            fx->nz = fx->y; fx->nz_set = 1;
+            break;
+        case MN_INX: case MN_DEX:
+            if (fx->x.kind != TV_CONST) { ok = 0; break; }
+            fx->x.k = (uint8_t)(fx->x.k + (e->mnemonic == MN_INX ? 1 : -1));
+            fx->nz = fx->x; fx->nz_set = 1;
+            break;
+        case MN_PLA:
+            if (sp <= 0) { ok = 0; break; }
+            fx->a = stk[--sp];
+            fx->nz = fx->a; fx->nz_set = 1;
+            break;
+        case MN_PHA:
+            if (sp >= (int)(sizeof(stk) / sizeof(stk[0]))) { ok = 0; break; }
+            stk[sp++] = fx->a;
+            break;
+        case MN_LDA: case MN_LDX: case MN_LDY: {
+            TrampVal v;
+            if (!tramp_load(rom, bank, fx, e->addr_mode, op1, op2, &v, &fx->cycles)) { ok = 0; break; }
+            if (e->mnemonic == MN_LDA) fx->a = v;
+            else if (e->mnemonic == MN_LDX) fx->x = v;
+            else fx->y = v;
+            fx->nz = v; fx->nz_set = 1;
+            break; }
+        case MN_STA: case MN_STX: case MN_STY: {
+            uint16_t ea;
+            if (!tramp_store_ea(fx, e->addr_mode, op1, op2, &ea)) { ok = 0; break; }
+            TrampVal v = (e->mnemonic == MN_STA) ? fx->a :
+                         (e->mnemonic == MN_STX) ? fx->x : fx->y;
+            if (v.kind == TV_UNKNOWN) { ok = 0; break; }
+            if (ea >= 0x2000) { ok = 0; break; }  /* I/O — not modelable */
+            tramp_store_put(fx, ea, v, &ok);
+            break; }
+        case MN_AND: case MN_ORA: case MN_EOR: {
+            TrampVal v;
+            if (fx->a.kind != TV_CONST ||
+                !tramp_load(rom, bank, fx, e->addr_mode, op1, op2, &v, &fx->cycles) ||
+                v.kind != TV_CONST) { ok = 0; break; }
+            if (e->mnemonic == MN_AND) fx->a.k &= v.k;
+            else if (e->mnemonic == MN_ORA) fx->a.k |= v.k;
+            else fx->a.k ^= v.k;
+            fx->nz = fx->a; fx->nz_set = 1;
+            break; }
+        case MN_ADC: case MN_SBC: {
+            TrampVal v;
+            if (fx->a.kind != TV_CONST || fx->flag_c < 0 ||
+                !tramp_load(rom, bank, fx, e->addr_mode, op1, op2, &v, &fx->cycles) ||
+                v.kind != TV_CONST) { ok = 0; break; }
+            uint8_t m = (e->mnemonic == MN_SBC) ? (uint8_t)~v.k : v.k;
+            int sum = fx->a.k + m + fx->flag_c;
+            fx->flag_c = sum > 0xFF;
+            fx->flag_v = (~(fx->a.k ^ m) & (fx->a.k ^ sum) & 0x80) != 0;
+            fx->a.k = (uint8_t)sum;
+            fx->nz = fx->a; fx->nz_set = 1;
+            break; }
+        case MN_CMP: case MN_CPX: case MN_CPY: {
+            TrampVal r = (e->mnemonic == MN_CMP) ? fx->a :
+                         (e->mnemonic == MN_CPX) ? fx->x : fx->y;
+            TrampVal v;
+            if (r.kind != TV_CONST ||
+                !tramp_load(rom, bank, fx, e->addr_mode, op1, op2, &v, &fx->cycles) ||
+                v.kind != TV_CONST) { ok = 0; break; }
+            fx->flag_c = r.k >= v.k;
+            fx->nz = tramp_const((uint8_t)(r.k - v.k)); fx->nz_set = 1;
+            break; }
+        case MN_CLC: fx->flag_c = 0; break;
+        case MN_SEC: fx->flag_c = 1; break;
+        case MN_CLV: fx->flag_v = 0; break;
+        case MN_NOP: case MN_NOP_READ:
+        case MN_CLD: case MN_SED: case MN_CLI: case MN_SEI:
+            break;  /* no modeled state */
+        default:
+            ok = 0;
+            break;
+        }
+        if (!ok) return 0;
+        pc = (uint16_t)(pc + e->size);
+    }
+    return 0;  /* never reached a dispatch jump within the step cap */
+
+done:
+    /* Final N/Z referencing a passthrough register only works if that
+     * register still holds its entry value at emission time. */
+    if (fx->nz_set) {
+        if (fx->nz.kind == TV_UNKNOWN) return 0;
+        if (fx->nz.kind == TV_XIN && fx->x.kind != TV_XIN) return 0;
+        if (fx->nz.kind == TV_YIN && fx->y.kind != TV_YIN) return 0;
+    }
+    /* A mutual X<->Y swap can't be expressed as sequential assignments. */
+    if (fx->x.kind == TV_YIN && fx->y.kind == TV_XIN) return 0;
+    return 1;
+}
+
+/* Emit the derived side effects ahead of a dispatch case's call.
+ * Stores first (they may reference entry X/Y), then registers, then
+ * flags, then the body's cycle count. */
+static void emit_trampoline_effects(FILE *f, const TrampEffects *fx,
+                                    uint8_t selector, uint16_t continuation) {
+    for (int i = 0; i < fx->store_count; i++) {
+        const TrampStore *s = &fx->stores[i];
+        if (s->val.kind == TV_CONST)
+            fprintf(f, "nes_write(0x%04X, 0x%02X); ", s->addr, s->val.k);
+        else if (s->val.kind == TV_XIN)
+            fprintf(f, "nes_write(0x%04X, g_cpu.X); ", s->addr);
+        else if (s->val.kind == TV_YIN)
+            fprintf(f, "nes_write(0x%04X, g_cpu.Y); ", s->addr);
+        else if (s->val.kind == TV_RET_LO)
+            fprintf(f, "nes_write(0x%04X, (uint8_t)_inline_ret); ", s->addr);
+        else if (s->val.kind == TV_RET_HI)
+            fprintf(f, "nes_write(0x%04X, (uint8_t)(_inline_ret >> 8)); ", s->addr);
+    }
+    if (!(fx->a.kind == TV_CONST && fx->a.k == selector)) {
+        if (fx->a.kind == TV_CONST)    fprintf(f, "g_cpu.A = 0x%02X; ", fx->a.k);
+        else if (fx->a.kind == TV_XIN) fprintf(f, "g_cpu.A = g_cpu.X; ");
+        else if (fx->a.kind == TV_YIN) fprintf(f, "g_cpu.A = g_cpu.Y; ");
+        else if (fx->a.kind == TV_RET_LO) fprintf(f, "g_cpu.A = (uint8_t)_inline_ret; ");
+        else if (fx->a.kind == TV_RET_HI) fprintf(f, "g_cpu.A = (uint8_t)(_inline_ret >> 8); ");
+    }
+    if (fx->x.kind == TV_CONST) fprintf(f, "g_cpu.X = 0x%02X; ", fx->x.k);
+    else if (fx->x.kind == TV_YIN) fprintf(f, "g_cpu.X = g_cpu.Y; ");
+    else if (fx->x.kind == TV_RET_LO) fprintf(f, "g_cpu.X = (uint8_t)_inline_ret; ");
+    else if (fx->x.kind == TV_RET_HI) fprintf(f, "g_cpu.X = (uint8_t)(_inline_ret >> 8); ");
+    if (fx->y.kind == TV_CONST) fprintf(f, "g_cpu.Y = 0x%02X; ", fx->y.k);
+    else if (fx->y.kind == TV_XIN) fprintf(f, "g_cpu.Y = g_cpu.X; ");
+    else if (fx->y.kind == TV_RET_LO) fprintf(f, "g_cpu.Y = (uint8_t)_inline_ret; ");
+    else if (fx->y.kind == TV_RET_HI) fprintf(f, "g_cpu.Y = (uint8_t)(_inline_ret >> 8); ");
+    if (fx->flag_c >= 0) fprintf(f, "g_cpu.C = %d; ", fx->flag_c);
+    if (fx->flag_v >= 0) fprintf(f, "g_cpu.V = %d; ", fx->flag_v);
+    if (fx->nz_set) {
+        if (fx->nz.kind == TV_CONST)
+            fprintf(f, "g_cpu.Z = %d; g_cpu.N = %d; ",
+                    fx->nz.k == 0, (fx->nz.k >> 7) & 1);
+        else if (fx->nz.kind == TV_XIN)
+            fprintf(f, "FLAG_NZ(g_cpu.X); ");
+        else if (fx->nz.kind == TV_YIN)
+            fprintf(f, "FLAG_NZ(g_cpu.Y); ");
+        else if (fx->nz.kind == TV_RET_LO)
+            fprintf(f, "FLAG_NZ((uint8_t)_inline_ret); ");
+        else if (fx->nz.kind == TV_RET_HI)
+            fprintf(f, "FLAG_NZ((uint8_t)(_inline_ret >> 8)); ");
+    }
+    fprintf(f, "nes_cpu_instruction_boundary(0x%04X, %d); ",
+            continuation, fx->cycles);
+}
+
+/* GxROM cross-half bank pairing.  On GxROM (mapper 66), the entire 32KB
+ * window ($8000-$FFFF) is switched as a unit.  The recompiler processes
+ * each 16KB half as a separate bank file:
+ *   even banks (0, 2, 4, 6) = lower half ($8000-$BFFF)
+ *   odd  banks (1, 3, 5, 7) = upper half ($C000-$FFFF)
+ * When code in one half calls a target in the other half, the call must
+ * reference the paired bank, not the source bank.  Without this, calls
+ * from upper-half code to lower-half targets would resolve to a wrapper
+ * generated from the wrong ROM bank's data. */
+static int gxrom_paired_bank(const NESRom *rom, int source_bank, uint16_t target_addr) {
+    if (!rom_mapper_full_32k_switch(rom)) return source_bank;
+    if (target_addr >= 0x8000 && target_addr < 0xC000)
+        return source_bank & ~1;  /* lower half → even bank */
+    if (target_addr >= 0xC000)
+        return source_bank | 1;   /* upper half → odd bank */
+    return source_bank;
+}
+
+static bool mapper40_reaches_8k_boundary(const NESRom *rom, uint16_t addr,
+                                         int size, bool *straddles) {
+    if (straddles) *straddles = false;
+    if (!rom_mapper40(rom) || addr < 0x8000 || addr >= 0xC000 || size <= 0)
+        return false;
+    unsigned end = (unsigned)(addr & 0x1FFF) + (unsigned)size;
+    if (end < 0x2000) return false;
+    if (straddles) *straddles = end > 0x2000;
+    return true;
+}
+
+/* Addresses of coroutine yield function entry points.
+ * Multiple function entries can alias into the same body containing
+ * the yield pattern (TSX; STX zp,Y; JMP scheduler).  JSRs to ANY of
+ * these addresses skip the universal bail check because the scheduler's
+ * RESUME path (PLA+PLA+S+=2) legitimately changes S across the
+ * yield/resume boundary. */
+#define MAX_YIELD_FUNCS 16
+static uint16_t s_yield_func_addrs[MAX_YIELD_FUNCS];
+static int s_yield_func_count = 0;
+
+static int is_yield_func(uint16_t addr) {
+    for (int i = 0; i < s_yield_func_count; i++)
+        if (s_yield_func_addrs[i] == addr) return 1;
+    return 0;
+}
+
+/* ---- Emission helpers (used by emit_instruction and the wrapper emitters) ---- */
+
+/* Returns true if `target` matches a push_jmp entry whose source is 0
+ * (any) or equals `source`. */
+static bool push_jmp_matches(const GameConfig *cfg, uint16_t source, uint16_t target) {
+    for (int ji = 0; ji < cfg->push_jmp_count; ji++) {
+        if (target == cfg->push_jmps[ji].target &&
+            (cfg->push_jmps[ji].source == 0 || cfg->push_jmps[ji].source == source))
+            return true;
+    }
+    return false;
+}
+
+static bool return_adjust_func_matches(const GameConfig *cfg, uint16_t target) {
+    for (int i = 0; i < cfg->return_adjust_func_count; i++) {
+        if (target == cfg->return_adjust_funcs[i])
+            return true;
+    }
+    return false;
+}
+
+/* JSR targets whose callee consumes the pushed return address as data
+ * (e.g. inline bytecode trampolines that PLA it into a pointer). The
+ * pushed 3-byte frame is gone when the callee returns, so the post-call
+ * S check must restore S instead of bailing. */
+static bool absorb_jsr_ret_matches(const GameConfig *cfg, uint16_t target) {
+    for (int i = 0; i < cfg->absorb_jsr_ret_count; i++) {
+        if (target == cfg->absorb_jsr_rets[i])
+            return true;
+    }
+    return false;
+}
+
+/* Is `addr` a genuine instruction START?  Decodes forward from `base` (a
+ * known instruction boundary, e.g. the function's first byte) and reports
+ * whether the linear stream lands exactly on `addr` before reaching `limit`.
+ * Guards pattern-matchers that read single bytes (e.g. "previous byte ==
+ * 0x48 means PHA") against matching an OPERAND — e.g. Tetris $9CA2 `INC $48`
+ * has operand $48 immediately before a plain RTS ($9CA4), which the 2-PHA
+ * RTS-as-JMP detector mistook for PHA and turned the RTS into a stack-pop
+ * dispatch, corrupting S and jumping to $80C1/$3501.  A misaligned decode
+ * (data tables, branch targets) yields false negatives only — those degrade
+ * to a plain RTS, which is always safe. */
+static bool is_insn_boundary_from(const NESRom *rom, int bank, uint16_t base,
+                                  uint16_t addr, uint16_t limit) {
+    if (addr < base || addr >= limit) return false;
+    uint16_t a = base;
+    while (a < limit) {
+        if (a == addr) return true;
+        uint8_t op = rom_read(rom, bank, a);
+        int sz = g_opcode_table[op].size;
+        if (sz <= 0 || sz > 3) return false;
+        uint16_t next = (uint16_t)(a + sz);
+        if (next <= a) return false;
+        a = next;
+    }
+    return false;
+}
+
+/* JSR targets whose callee leaves the pushed return address on the 6502
+ * stack (its RTS is a plain C return that never touches S). Same post-call
+ * S restore as absorb_jsr_ret, but no site+5 goto — execution continues at
+ * site+3 (the ordinary 3-byte JSR fall-through). */
+static bool restore_jsr_matches(const GameConfig *cfg, uint16_t target) {
+    for (int i = 0; i < cfg->restore_jsr_count; i++) {
+        if (target == cfg->restore_jsrs[i])
+            return true;
+    }
+    return false;
+}
+
+/* Inline-bytecode trampoline JSR sites (absorb_jsr_ret): the callee pops the
+ * JSR return as its script pointer and consumes the 2 ROM bytes after the
+ * JSR operand as inline script data, so on real hardware the interpreter's
+ * exit RTS resumes at site+5, not the ordinary fall-through site+3. The
+ * emitter handles this by returning 5 from emit_instruction so the next
+ * label lands at site+5 (see the MN_JSR absorb_jsr_ret case). */
+
+#define DUMMY_PUSH_PAIR \
+    "g_ram[0x100+g_cpu.S]=0; g_cpu.S--; g_ram[0x100+g_cpu.S]=0; g_cpu.S--; "
+#define DUMMY_JSR_PRE \
+    "{ uint8_t _cbs=g_cpu.S; uint64_t _irq_epoch=runtime_get_interrupt_epoch(); " \
+    "g_rti_target=0; g_rti_source=0; g_rti_bank=-1; " DUMMY_PUSH_PAIR
+#define DUMMY_JSR_POST \
+    " if (!nes_jsr_stack_ok_after_call(_cbs, _irq_epoch)) return; }"
+
+typedef struct {
+    bool force_dynamic;          /* skip alias/wrapper, always call_by_address */
+    bool vblank_prefix;          /* charge transfer timing at target continuation */
+    bool push_dummy_static;      /* push 0,0 before wrapper call (only when wrapper hits) */
+    bool push_dummy_dynamic;     /* push 0,0 before call_by_address (when no static target) */
+    bool tail_return;            /* append " return;" */
+    bool jsr_pop_fallback;       /* dynamic call uses "if (!call_by_address(..)) g_cpu.S += 2;" */
+    bool use_caller_bank;        /* dynamic call passes a caller-bank hint (cross-8KB) */
+    int  caller_bank;            /* the hint: caller's bank, used when use_caller_bank */
+} EmitCallOpts;
+
+/* Emit a call/dispatch to (addr, bank): tries body alias → wrapper → call_by_address
+ * (unless force_dynamic). Format:
+ *   [vblank;][ push_dummy;] (alias|wrapper|call_by_address);[ return;]\n
+ * `bank` is the source bank.  For GxROM cross-half calls, we re-pair to the
+ * target's matching bank before alias/wrapper lookup so we resolve to the
+ * correct generated function. The fixed-bank/$C000+ rule strips the _b suffix. */
+static void emit_call_target(FILE *f, const NESRom *rom, uint16_t addr,
+                             int bank, int fixed_bank, EmitCallOpts opts) {
+    if (opts.vblank_prefix)
+        fprintf(f, "nes_cpu_instruction_boundary(0x%04X, 2); ", addr);
+
+    int lookup_bank = gxrom_paired_bank(rom, bank, addr);
+
+    if (!opts.force_dynamic) {
+        /* Static call into the always-fixed $E000 window from mapper-4 code:
+         * the callee executes in window base $E000 regardless of the caller's
+         * window, so scope g_code_window_base for its JSR pushes. (All other
+         * cross-window transfers are dynamic and handled by nes_dispatch_call;
+         * same-window static calls inherit the caller's base correctly.) */
+        int wb_wrap = (rom->mapper == 4 && addr >= 0xE000);
+        uint16_t alias_owner = 0;
+        int alias_bank = -1;
+        int alias_entry = 0;
+        if (codegen_lookup_body_alias(addr, lookup_bank, &alias_owner, &alias_bank, &alias_entry)) {
+            char nm[32];
+            format_func_name(nm, sizeof nm, alias_owner, alias_bank, fixed_bank);
+            if (wb_wrap)
+                fprintf(f, "{ uint16_t _swb = g_code_window_base; g_code_window_base = 0xE000; %s_body(%d); g_code_window_base = _swb; }", nm, alias_entry);
+            else
+                fprintf(f, "%s_body(%d);", nm, alias_entry);
+            if (opts.tail_return) fprintf(f, " return;");
+            fprintf(f, "\n");
+            return;
+        }
+        if (codegen_has_emitted_wrapper(addr, lookup_bank)) {
+            if (opts.push_dummy_static) fprintf(f, DUMMY_PUSH_PAIR);
+            char nm[32];
+            format_func_name(nm, sizeof nm, addr, lookup_bank, fixed_bank);
+            if (wb_wrap)
+                fprintf(f, "{ uint16_t _swb = g_code_window_base; g_code_window_base = 0xE000; %s(); g_code_window_base = _swb; }", nm);
+            else
+                fprintf(f, "%s();", nm);
+            if (opts.tail_return) fprintf(f, " return;");
+            fprintf(f, "\n");
+            return;
+        }
+    }
+
+    if (opts.push_dummy_dynamic) fprintf(f, DUMMY_PUSH_PAIR);
+    /* Cross-8KB dispatch carries a caller-bank hint: when the runtime bank
+     * register lookup misses (stale g_current_bank), the dispatch retries with
+     * the caller's statically-known bank — cross-8KB calls are intra-16KB-bank,
+     * so the caller's bank is the correct fallback.
+     * Tail transfers (JMP) go through call_by_address_tail, which defers when
+     * already inside a dispatch so JMP loop chains cannot grow the C stack;
+     * calls (JSR) go through the depth-counted nes_dispatch_call. */
+    {
+        int cb = opts.use_caller_bank ? opts.caller_bank : -1;
+        if (opts.tail_return)
+            fprintf(f, "call_by_address_tail(0x%04X, %d); return;\n", addr, cb);
+        else if (opts.jsr_pop_fallback)
+            fprintf(f, "if (!nes_dispatch_call(0x%04X, %d)) g_cpu.S += 2;\n", addr, cb);
+        else
+            fprintf(f, "nes_dispatch_call(0x%04X, %d);\n", addr, cb);
+    }
+}
+
+/* LDA/LDX/LDY: register loaded from immediate or memory. `reg` is 'A','X','Y'. */
+static void emit_load(FILE *f, char reg, AddrMode am, uint8_t op1, uint8_t op2,
+                      uint16_t pc, uint16_t abs16, const GameConfig *cfg) {
+    if (am == AM_IMM)
+        fprintf(f, "g_cpu.%c = 0x%02X; FLAG_NZ(g_cpu.%c);\n", reg, op1, reg);
+    else if (read_is_hooked(cfg, am, abs16))
+        fprintf(f, "g_cpu.%c = nes_read_hooked(0x%04X, %s); FLAG_NZ(g_cpu.%c);\n",
+                reg, pc, operand_addr_expr(am, op1, op2), reg);
+    else
+        fprintf(f, "g_cpu.%c = nes_read(%s); FLAG_NZ(g_cpu.%c);\n",
+                reg, operand_addr_expr(am, op1, op2), reg);
+}
+
+/* STA/STX/STY: register stored to memory. */
+static void emit_store(FILE *f, char reg, AddrMode am, uint8_t op1, uint8_t op2) {
+    fprintf(f, "nes_write(%s, g_cpu.%c);\n",
+            operand_addr_expr(am, op1, op2), reg);
+}
+
+/* CMP/CPX/CPY: subtract memory from register, set NZC. `reg` is 'A','X','Y'. */
+static void emit_compare(FILE *f, char reg, AddrMode am, uint8_t op1, uint8_t op2,
+                         uint16_t pc, uint16_t abs16, const GameConfig *cfg) {
+    if (am == AM_IMM)
+        fprintf(f, "{ int r=g_cpu.%c-0x%02X; g_cpu.C=(g_cpu.%c>=0x%02X)?1:0; FLAG_NZ(r&0xFF); }\n",
+                reg, op1, reg, op1);
+    else if (read_is_hooked(cfg, am, abs16))
+        fprintf(f, "{ uint8_t m=nes_read_hooked(0x%04X, %s); int r=g_cpu.%c-m; g_cpu.C=(g_cpu.%c>=m)?1:0; FLAG_NZ(r&0xFF); }\n",
+                pc, operand_addr_expr(am, op1, op2), reg, reg);
+    else
+        fprintf(f, "{ uint8_t m=nes_read(%s); int r=g_cpu.%c-m; g_cpu.C=(g_cpu.%c>=m)?1:0; FLAG_NZ(r&0xFF); }\n",
+                operand_addr_expr(am, op1, op2), reg, reg);
+}
+
+/* AND/ORA/EOR: A op= immediate or memory. `op` is "&"/"|"/"^". */
+static void emit_logical(FILE *f, const char *op, AddrMode am, uint8_t op1, uint8_t op2,
+                         uint16_t pc, uint16_t abs16, const GameConfig *cfg) {
+    if (am == AM_IMM)
+        fprintf(f, "g_cpu.A %s= 0x%02X; FLAG_NZ(g_cpu.A);\n", op, op1);
+    else if (read_is_hooked(cfg, am, abs16))
+        fprintf(f, "g_cpu.A %s= nes_read_hooked(0x%04X, %s); FLAG_NZ(g_cpu.A);\n",
+                op, pc, operand_addr_expr(am, op1, op2));
+    else
+        fprintf(f, "g_cpu.A %s= nes_read(%s); FLAG_NZ(g_cpu.A);\n",
+                op, operand_addr_expr(am, op1, op2));
+}
+
+/* ASL/LSR/ROL/ROR: accumulator form runs `body_acc` (a complete statement);
+ * memory form wraps `body_mem` with the standard read-modify-write scaffold.
+ * `body_mem` operates on local `v` (uint8_t), updating g_cpu.C as needed. */
+static void emit_shift(FILE *f, const char *body_acc, const char *body_mem,
+                       AddrMode am, uint8_t op1, uint8_t op2) {
+    if (am == AM_ACC)
+        fprintf(f, "%s\n", body_acc);
+    else
+        fprintf(f, "{ uint16_t a=%s; uint8_t v=nes_read(a); %s nes_write(a,v); FLAG_NZ(v); }\n",
+                operand_addr_expr(am, op1, op2), body_mem);
+}
+
+/* Set true while emitting a function that uses the "PLA PLA RTS = return two
+ * levels up (abort caller)" JSR idiom (a contiguous 68 68 60). Read by the RTS
+ * emitter to undo the phantom stack-pointer rise the idiom would otherwise leave
+ * (see the detection + fix in emit_function / MN_RTS). File-static: emission is
+ * single-threaded and finishes one function before starting the next. */
+static bool s_abort_idiom_func = false;
+
+/* Emit C for one instruction. Returns bytes consumed.
+ * sched_reset_addr: if non-zero, we're inside a coroutine scheduler function.
+ * This is the address of the LDX #$FF; TXS stack-reset (scheduler loop entry).
+ * JMP(ind) and resume-RTS will goto this label instead of returning. */
+static int emit_instruction(FILE *f, const NESRom *rom, int bank,
+                            uint16_t pc, uint16_t func_base, int fixed_bank,
+                            const FunctionList *funcs,
+                            const uint16_t *valid_starts, int valid_count,
+                            const GameConfig *cfg, int sram_sourced,
+                            int effective_bank,
+                            const uint16_t *merge_partners, int merge_partner_count,
+                            const uint16_t *emitted_addrs, int emitted_count,
+                            uint16_t sched_reset_addr) {
+    uint8_t opcode = rom_read(rom, bank, pc);
+    const OpcodeEntry *e = &g_opcode_table[opcode];
+    uint8_t op1 = (e->size > 1) ? rom_read(rom, bank, pc+1) : 0;
+    uint8_t op2 = (e->size > 2) ? rom_read(rom, bank, pc+2) : 0;
+    uint16_t abs16 = op1 | ((uint16_t)op2 << 8);
+
+    /* Label for branch targets.
+     * Emit maybe_trigger_vblank(2) at every instruction boundary — on real
+     * 6502, NMI is only sampled between instructions, never mid-instruction.
+     * nes_read/nes_write now only increment the bus-op counter (bus_tick),
+     * so VBlank can only fire here at the instruction boundary. */
+    const char *insn_boundary = instruction_boundary_func(rom);
+    fprintf(f, "    /* $%04X: %02X */ %s(0x%04X, %d); ",
+            pc, opcode, insn_boundary, pc, e->cycles);
+
+    if (e->mnemonic == MN_ILLEGAL) {
+        fprintf(f, "/* ILLEGAL $%02X — skip %d */\n", opcode, e->size);
+        return e->size;
+    }
+
+    switch (e->mnemonic) {
+        /* Load/Store */
+        case MN_LDA: emit_load(f, 'A', e->addr_mode, op1, op2, pc, abs16, cfg); break;
+        case MN_LDX: emit_load(f, 'X', e->addr_mode, op1, op2, pc, abs16, cfg); break;
+        case MN_LDY: emit_load(f, 'Y', e->addr_mode, op1, op2, pc, abs16, cfg); break;
+        case MN_LAX:
+            if (e->addr_mode == AM_IMM)
+                fprintf(f, "g_cpu.A = g_cpu.X = 0x%02X; FLAG_NZ(g_cpu.A);\n", op1);
+            else
+                fprintf(f, "g_cpu.A = g_cpu.X = nes_read(%s); FLAG_NZ(g_cpu.A);\n",
+                        operand_addr_expr(e->addr_mode, op1, op2));
+            break;
+        case MN_STA: emit_store(f, 'A', e->addr_mode, op1, op2); break;
+        case MN_STX: emit_store(f, 'X', e->addr_mode, op1, op2); break;
+        case MN_STY: emit_store(f, 'Y', e->addr_mode, op1, op2); break;
+
+        /* Transfers */
+        case MN_TAX: fprintf(f, "g_cpu.X = g_cpu.A; FLAG_NZ(g_cpu.X);\n"); break;
+        case MN_TAY: fprintf(f, "g_cpu.Y = g_cpu.A; FLAG_NZ(g_cpu.Y);\n"); break;
+        case MN_TXA: fprintf(f, "g_cpu.A = g_cpu.X; FLAG_NZ(g_cpu.A);\n"); break;
+        case MN_TYA: fprintf(f, "g_cpu.A = g_cpu.Y; FLAG_NZ(g_cpu.A);\n"); break;
+        case MN_TSX: fprintf(f, "g_cpu.X = g_cpu.S; FLAG_NZ(g_cpu.X);\n"); break;
+        case MN_TXS:
+            fprintf(f, "g_cpu.S = g_cpu.X;\n");
+            /* Coroutine scheduler: LDX #$FF; TXS resets the stack.
+             * Emit setjmp so coroutine_yield() can longjmp back here. */
+            if (sched_reset_addr && pc == sched_reset_addr + 2) {
+                fprintf(f, "    coroutine_scheduler_setjmp(); /* scheduler loop entry */\n");
+            }
+            break;
+
+        /* Stack — bus_tick for each stack byte access (real 6502 does 1 bus
+         * cycle per stack push/pull; JSR/RTS also push/pull via the stack
+         * but their ticks are handled in the JSR/RTS emitters below). */
+        case MN_PHA:
+            fprintf(f, "g_ram[0x100 + g_cpu.S] = g_cpu.A; g_cpu.S--;\n");
+            break;
+        case MN_PLA:
+            fprintf(f, "g_cpu.S++; g_cpu.A = g_ram[0x100 + g_cpu.S]; FLAG_NZ(g_cpu.A);\n");
+            break;
+        case MN_PHP:
+            fprintf(f, "{ uint8_t p = (g_cpu.N<<7)|(g_cpu.V<<6)|0x30|(g_cpu.D<<3)|(g_cpu.I<<2)|(g_cpu.Z<<1)|g_cpu.C;\n"
+                       "  g_ram[0x100 + g_cpu.S] = p; g_cpu.S--; }\n");
+            break;
+        case MN_PLP:
+            fprintf(f, "{ g_cpu.S++; uint8_t p = g_ram[0x100 + g_cpu.S];\n"
+                       "  g_cpu.N=(p>>7)&1; g_cpu.V=(p>>6)&1; g_cpu.D=(p>>3)&1;\n"
+                       "  g_cpu.I=(p>>2)&1; g_cpu.Z=(p>>1)&1; g_cpu.C=p&1; }\n");
+            break;
+
+        /* ALU */
+        case MN_ADC: {
+            if (e->addr_mode == AM_IMM)
+                fprintf(f, "{ uint16_t r = g_cpu.A + 0x%02X + g_cpu.C; FLAG_NZC_ADD(r,g_cpu.A,0x%02X); g_cpu.A=r&0xFF; }\n", op1, op1);
+            else if (read_is_hooked(cfg, e->addr_mode, abs16))
+                fprintf(f, "{ uint8_t m=nes_read_hooked(0x%04X, %s); uint16_t r=g_cpu.A+m+g_cpu.C; FLAG_NZC_ADD(r,g_cpu.A,m); g_cpu.A=r&0xFF; }\n",
+                        pc, operand_addr_expr(e->addr_mode, op1, op2));
+            else
+                fprintf(f, "{ uint8_t m=nes_read(%s); uint16_t r=g_cpu.A+m+g_cpu.C; FLAG_NZC_ADD(r,g_cpu.A,m); g_cpu.A=r&0xFF; }\n",
+                        operand_addr_expr(e->addr_mode, op1, op2));
+            break;
+        }
+        case MN_SBC:
+            if (e->addr_mode == AM_IMM)
+                fprintf(f, "{ uint8_t m=0x%02X; int16_t r=g_cpu.A-m-(1-g_cpu.C); FLAG_NZC_SUB(r,g_cpu.A,m); g_cpu.A=r&0xFF; }\n", op1);
+            else if (read_is_hooked(cfg, e->addr_mode, abs16))
+                fprintf(f, "{ uint8_t m=nes_read_hooked(0x%04X, %s); int16_t r=g_cpu.A-m-(1-g_cpu.C); FLAG_NZC_SUB(r,g_cpu.A,m); g_cpu.A=r&0xFF; }\n",
+                        pc, operand_addr_expr(e->addr_mode, op1, op2));
+            else
+                fprintf(f, "{ uint8_t m=nes_read(%s); int16_t r=g_cpu.A-m-(1-g_cpu.C); FLAG_NZC_SUB(r,g_cpu.A,m); g_cpu.A=r&0xFF; }\n",
+                        operand_addr_expr(e->addr_mode, op1, op2));
+            break;
+        case MN_AND: emit_logical(f, "&", e->addr_mode, op1, op2, pc, abs16, cfg); break;
+        case MN_ORA: emit_logical(f, "|", e->addr_mode, op1, op2, pc, abs16, cfg); break;
+        case MN_EOR: emit_logical(f, "^", e->addr_mode, op1, op2, pc, abs16, cfg); break;
+
+        /* Shifts */
+        case MN_ASL:
+            emit_shift(f,
+                "g_cpu.C = (g_cpu.A>>7)&1; g_cpu.A = (g_cpu.A<<1)&0xFF; FLAG_NZ(g_cpu.A);",
+                "g_cpu.C=(v>>7)&1; v=(v<<1)&0xFF;",
+                e->addr_mode, op1, op2);
+            break;
+        case MN_LSR:
+            emit_shift(f,
+                "g_cpu.C = g_cpu.A&1; g_cpu.A >>= 1; FLAG_NZ(g_cpu.A);",
+                "g_cpu.C=v&1; v>>=1;",
+                e->addr_mode, op1, op2);
+            break;
+        case MN_ROL:
+            emit_shift(f,
+                "{ uint8_t c=g_cpu.C; g_cpu.C=(g_cpu.A>>7)&1; g_cpu.A=((g_cpu.A<<1)|c)&0xFF; FLAG_NZ(g_cpu.A); }",
+                "uint8_t c=g_cpu.C; g_cpu.C=(v>>7)&1; v=((v<<1)|c)&0xFF;",
+                e->addr_mode, op1, op2);
+            break;
+        case MN_ROR:
+            emit_shift(f,
+                "{ uint8_t c=g_cpu.C; g_cpu.C=g_cpu.A&1; g_cpu.A=((g_cpu.A>>1)|(c<<7))&0xFF; FLAG_NZ(g_cpu.A); }",
+                "uint8_t c=g_cpu.C; g_cpu.C=v&1; v=((v>>1)|(c<<7))&0xFF;",
+                e->addr_mode, op1, op2);
+            break;
+
+        /* Inc/Dec */
+        case MN_INC:
+            fprintf(f, "{ uint16_t a=%s; uint8_t v=(nes_read(a)+1)&0xFF; nes_write(a,v); FLAG_NZ(v); }\n",
+                    operand_addr_expr(e->addr_mode, op1, op2));
+            break;
+        case MN_DEC:
+            fprintf(f, "{ uint16_t a=%s; uint8_t v=(nes_read(a)-1)&0xFF; nes_write(a,v); FLAG_NZ(v); }\n",
+                    operand_addr_expr(e->addr_mode, op1, op2));
+            break;
+        case MN_INX: fprintf(f, "g_cpu.X = (g_cpu.X+1)&0xFF; FLAG_NZ(g_cpu.X);\n"); break;
+        case MN_DEX: fprintf(f, "g_cpu.X = (g_cpu.X-1)&0xFF; FLAG_NZ(g_cpu.X);\n"); break;
+        case MN_INY: fprintf(f, "g_cpu.Y = (g_cpu.Y+1)&0xFF; FLAG_NZ(g_cpu.Y);\n"); break;
+        case MN_DEY: fprintf(f, "g_cpu.Y = (g_cpu.Y-1)&0xFF; FLAG_NZ(g_cpu.Y);\n"); break;
+
+        /* Stable unofficial RMW + ALU combos (memory op then accumulator op). */
+        case MN_SLO: /* ASL mem; ORA A */
+            fprintf(f, "{ uint16_t a=%s; uint8_t v=nes_read(a); g_cpu.C=(v>>7)&1; v=(v<<1)&0xFF; nes_write(a,v); g_cpu.A|=v; FLAG_NZ(g_cpu.A); }\n",
+                    operand_addr_expr(e->addr_mode, op1, op2));
+            break;
+        case MN_RLA: /* ROL mem; AND A */
+            fprintf(f, "{ uint16_t a=%s; uint8_t v=nes_read(a); uint8_t c=g_cpu.C; g_cpu.C=(v>>7)&1; v=((v<<1)|c)&0xFF; nes_write(a,v); g_cpu.A&=v; FLAG_NZ(g_cpu.A); }\n",
+                    operand_addr_expr(e->addr_mode, op1, op2));
+            break;
+        case MN_SRE: /* LSR mem; EOR A */
+            fprintf(f, "{ uint16_t a=%s; uint8_t v=nes_read(a); g_cpu.C=v&1; v>>=1; nes_write(a,v); g_cpu.A^=v; FLAG_NZ(g_cpu.A); }\n",
+                    operand_addr_expr(e->addr_mode, op1, op2));
+            break;
+        case MN_RRA: /* ROR mem; ADC A */
+            fprintf(f, "{ uint16_t a=%s; uint8_t v=nes_read(a); uint8_t c=g_cpu.C; g_cpu.C=v&1; v=((v>>1)|(c<<7))&0xFF; nes_write(a,v); uint16_t r=g_cpu.A+v+g_cpu.C; FLAG_NZC_ADD(r,g_cpu.A,v); g_cpu.A=r&0xFF; }\n",
+                    operand_addr_expr(e->addr_mode, op1, op2));
+            break;
+        case MN_DCP: /* DEC mem; CMP A */
+            fprintf(f, "{ uint16_t a=%s; uint8_t v=(nes_read(a)-1)&0xFF; nes_write(a,v); g_cpu.C=(g_cpu.A>=v)?1:0; FLAG_NZ((uint8_t)(g_cpu.A-v)); }\n",
+                    operand_addr_expr(e->addr_mode, op1, op2));
+            break;
+        case MN_ISC: /* INC mem; SBC A */
+            fprintf(f, "{ uint16_t a=%s; uint8_t v=(nes_read(a)+1)&0xFF; nes_write(a,v); int16_t r=g_cpu.A-v-(1-g_cpu.C); FLAG_NZC_SUB(r,g_cpu.A,v); g_cpu.A=r&0xFF; }\n",
+                    operand_addr_expr(e->addr_mode, op1, op2));
+            break;
+        case MN_ANC: /* AND #imm; C = bit7 of result */
+            fprintf(f, "g_cpu.A &= 0x%02X; FLAG_NZ(g_cpu.A); g_cpu.C=(g_cpu.A>>7)&1;\n", op1);
+            break;
+        case MN_ALR: /* AND #imm; LSR A */
+            fprintf(f, "g_cpu.A &= 0x%02X; g_cpu.C=g_cpu.A&1; g_cpu.A>>=1; FLAG_NZ(g_cpu.A);\n", op1);
+            break;
+        case MN_ARR: /* AND #imm; ROR A; C=bit6, V=bit6^bit5 */
+            fprintf(f, "{ g_cpu.A &= 0x%02X; uint8_t c=g_cpu.C; g_cpu.A=((g_cpu.A>>1)|(c<<7))&0xFF; FLAG_NZ(g_cpu.A); g_cpu.C=(g_cpu.A>>6)&1; g_cpu.V=(((g_cpu.A>>6)&1)^((g_cpu.A>>5)&1)); }\n", op1);
+            break;
+        case MN_AXS: /* X = (A & X) - imm; C set like CMP */
+            fprintf(f, "{ uint8_t t=(uint8_t)(g_cpu.A & g_cpu.X); g_cpu.C=(t>=0x%02X)?1:0; g_cpu.X=(t-0x%02X)&0xFF; FLAG_NZ(g_cpu.X); }\n", op1, op1);
+            break;
+
+        /* Compare */
+        case MN_CMP: emit_compare(f, 'A', e->addr_mode, op1, op2, pc, abs16, cfg); break;
+        case MN_CPX: emit_compare(f, 'X', e->addr_mode, op1, op2, pc, abs16, cfg); break;
+        case MN_CPY: emit_compare(f, 'Y', e->addr_mode, op1, op2, pc, abs16, cfg); break;
+        case MN_BIT:
+            if (read_is_hooked(cfg, e->addr_mode, abs16))
+                fprintf(f, "{ uint8_t m=nes_read_hooked(0x%04X, %s); g_cpu.Z=(g_cpu.A&m)?0:1; g_cpu.N=(m>>7)&1; g_cpu.V=(m>>6)&1; }\n",
+                        pc, operand_addr_expr(e->addr_mode, op1, op2));
+            else
+                fprintf(f, "{ uint8_t m=nes_read(%s); g_cpu.Z=(g_cpu.A&m)?0:1; g_cpu.N=(m>>7)&1; g_cpu.V=(m>>6)&1; }\n",
+                        operand_addr_expr(e->addr_mode, op1, op2));
+            break;
+
+        /* Branches — detect cross-function targets:
+         *   1. target < func_base: backward into a different function
+         *   2. target is a registered function entry: branch into another func
+         *   3. target is mid-instruction: not a valid label start in this function
+         * In all three cases emit as conditional tail-call, not goto. */
+        #define EMIT_BRANCH(cond_str) do { \
+            int8_t _off = (int8_t)op1; \
+            uint16_t _tgt = (uint16_t)(pc + 2 + _off); \
+            int _taken_cycles = 1 + ((((pc + 2) & 0xFF00) != (_tgt & 0xFF00)) ? 1 : 0); \
+            bool _valid_local = is_valid_label_target(_tgt, valid_starts, valid_count, rom, bank); \
+            bool _label_emitted = false; \
+            for (int _ei = 0; _ei < emitted_count; _ei++) { \
+                if (emitted_addrs[_ei] == _tgt) { _label_emitted = true; break; } \
+            } \
+            /* Cross-function if target is not in this function's valid_starts    \
+             * (pre-scan now stops at the function boundary, so valid_starts       \
+             * accurately reflects the function's extent). No need to check        \
+             * is_func_entry — valid_starts is the ground truth. */                \
+            bool _cross = !_valid_local || (_tgt < func_base) || \
+                          (_tgt <= pc && !_label_emitted); \
+            if (_cross) { \
+                if (rom->mapper == 4 || rom->mapper == 40) { \
+                    /* Branches are RELATIVE: the target is always in the      \
+                     * EXECUTING window. Preserve its signed displacement from \
+                     * the source 8KB base so branches crossing an 8KB boundary \
+                     * reach the adjacent CPU window instead of wrapping within \
+                     * the source window. */ \
+                    int _live_off = (int)_tgt - (int)(pc & 0xE000); \
+                    if (_live_off >= 0) \
+                        fprintf(f, "if (" cond_str ") { maybe_trigger_vblank(%d); call_by_address_tail((uint16_t)(g_code_window_base + 0x%04X), %d); return; }\n", \
+                                _taken_cycles, _live_off, bank == fixed_bank ? -1 : bank); \
+                    else \
+                        fprintf(f, "if (" cond_str ") { maybe_trigger_vblank(%d); call_by_address_tail((uint16_t)(g_code_window_base - 0x%04X), %d); return; }\n", \
+                                _taken_cycles, -_live_off, bank == fixed_bank ? -1 : bank); \
+                } else \
+                    fprintf(f, "if (" cond_str ") { maybe_trigger_vblank(%d); call_by_address(0x%04X); return; }\n", _taken_cycles, _tgt); \
+            } else if (_tgt <= pc) { \
+                /* Backward branch (loop) — emit VBlank trigger + watchdog check */ \
+                fprintf(f, "if (" cond_str ") {\n    %s(0x%04X, %d);\n#ifdef WATCHDOG_ENABLED\n    watchdog_check();\n#endif\n    goto label_%04X;\n    }\n", insn_boundary, _tgt, _taken_cycles, _tgt); \
+            } else { \
+                fprintf(f, "if (" cond_str ") { maybe_trigger_vblank(%d); goto label_%04X; }\n", _taken_cycles, _tgt); \
+            } \
+        } while(0)
+        case MN_BCC: EMIT_BRANCH("!g_cpu.C"); break;
+        case MN_BCS: EMIT_BRANCH("g_cpu.C");  break;
+        case MN_BEQ: EMIT_BRANCH("g_cpu.Z");  break;
+        case MN_BNE: EMIT_BRANCH("!g_cpu.Z"); break;
+        case MN_BMI: EMIT_BRANCH("g_cpu.N");  break;
+        case MN_BPL: EMIT_BRANCH("!g_cpu.N"); break;
+        case MN_BVC: EMIT_BRANCH("!g_cpu.V"); break;
+        case MN_BVS: EMIT_BRANCH("g_cpu.V");  break;
+        #undef EMIT_BRANCH
+
+        /* Jumps */
+        case MN_JSR: {
+            /* Check against game-config trampolines (e.g. JSR $F859 for Faxanadu MMC1).
+             * The inline_bytes after the JSR are data [bank, addr_lo, addr_hi], not code.
+             * Inline the full dispatch+call+restore sequence and consume 3+inline_bytes. */
+            {
+                const TrampolineEntry *tramp = NULL;
+                uint16_t resolved_tramp = resolve_jmp_thunk(rom, fixed_bank, abs16);
+                for (int ti = 0; ti < cfg->trampoline_count; ti++) {
+                    if (resolved_tramp == cfg->trampolines[ti].addr) { tramp = &cfg->trampolines[ti]; break; }
+                }
+                if (tramp && tramp->kind == TRAMP_MMC3_REGION) {
+                    /* MMC3 8KB-window region trampoline (e.g. Kirby $D805).
+                     * Inline bytes are [lo, hi, bank]; the target hi byte picks
+                     * the window.  The window is switched (bank passed in A via
+                     * the region switch fn), the target is called directly with
+                     * the statically-resolved 16KB name, then the window is
+                     * restored from its saved-bank ZP byte. */
+                    uint8_t t_lo   = rom_read(rom, bank, pc + 3);
+                    uint8_t t_hi   = rom_read(rom, bank, pc + 4);
+                    uint8_t t_bank = rom_read(rom, bank, pc + 5);
+                    uint16_t target = (uint16_t)((t_lo | ((uint16_t)t_hi << 8)) + tramp->addr_adjust);
+                    char region = mmc3_tramp_region(t_hi);
+                    /* Each callee here ends in RTS.  Under push_all_jsr that RTS
+                     * unconditionally pops a 2-byte return address (g_cpu.S += 2),
+                     * so — exactly like a normal JSR site — we must push a dummy
+                     * return before every direct call or S drifts up by 2 per call
+                     * (corrupting the stack pointer; S wraps $FF -> $01). */
+                    const char *pre = cfg->push_all_jsr ? DUMMY_JSR_PRE : "";
+                    const char *post = cfg->push_all_jsr ? DUMMY_JSR_POST : "";
+                    if (region == 'F') {
+                        fprintf(f, "/* trampoline $%04X (mmc3 no-switch): target=$%04X */\n",
+                                tramp->addr, target);
+                        if (target >= 0xC000)
+                            fprintf(f, "%sfunc_%04X();%s\n", pre, target, post);
+                        else
+                            fprintf(f, "%scall_by_address(0x%04X);%s\n", pre, target, post);
+                    } else {
+                        uint16_t emit_addr; int emit_bank;
+                        mmc3_region_target(target, t_bank, region, &emit_addr, &emit_bank);
+                        uint16_t bs_fn = (region == '8') ? tramp->bs_fn_8000 : tramp->bs_fn_a000;
+                        uint16_t save  = (region == '8') ? tramp->bank_save_8000 : tramp->bank_save_a000;
+                        char nm[32];
+                        format_func_name(nm, sizeof nm, emit_addr, emit_bank, fixed_bank);
+                        fprintf(f, "/* trampoline $%04X (mmc3 $%c000): target=$%04X raw_bank=$%02X -> %s */\n",
+                                tramp->addr, region, target, t_bank, nm);
+                        fprintf(f, "{ uint8_t _sa=g_cpu.A,_sx=g_cpu.X,_sy=g_cpu.Y;\n");
+                        fprintf(f, "  uint8_t _sbank=g_ram[0x%04X];\n", save);
+                        fprintf(f, "  g_cpu.A=0x%02X; %sfunc_%04X();%s\n", t_bank, pre, bs_fn, post);
+                        fprintf(f, "  g_cpu.A=_sa; g_cpu.X=_sx; g_cpu.Y=_sy;\n");
+                        if (cfg->push_all_jsr)
+                            fprintf(f, "  { uint16_t _swb=g_code_window_base; g_code_window_base=0x%04X; uint8_t _cbs=g_cpu.S; uint64_t _irq_epoch=runtime_get_interrupt_epoch(); g_rti_target=0; g_rti_source=0; g_rti_bank=-1; " DUMMY_PUSH_PAIR "%s(); int _ok=nes_jsr_stack_ok_after_call(_cbs, _irq_epoch); g_code_window_base=_swb; if (!_ok) return; }\n",
+                                    (uint16_t)(target & 0xE000), nm);
+                        else
+                            fprintf(f, "  { uint16_t _swb=g_code_window_base; g_code_window_base=0x%04X; %s(); g_code_window_base=_swb; }\n",
+                                    (uint16_t)(target & 0xE000), nm);
+                        fprintf(f, "  g_cpu.A=_sbank; %sfunc_%04X();%s }\n", pre, bs_fn, post);
+                    }
+                    return 3 + tramp->inline_bytes;
+                }
+                if (tramp) {
+                    uint8_t disp_bank = rom_read(rom, bank, pc + 3);
+                    uint8_t disp_lo   = rom_read(rom, bank, pc + 4);
+                    uint8_t disp_hi   = rom_read(rom, bank, pc + 5);
+                    uint16_t disp_addr = (disp_lo | ((uint16_t)disp_hi << 8)) + tramp->addr_adjust;
+                    const char *breg = (tramp->bank_reg == 'A') ? "A" : "X";
+                    fprintf(f, "/* trampoline $%04X dispatch: bank=%d addr=$%04X */\n",
+                            tramp->addr, disp_bank, disp_addr);
+                    fprintf(f, "{ uint8_t _sa=g_cpu.A,_sx=g_cpu.X,_sy=g_cpu.Y;\n");
+                    if (tramp->bank_save_addr >= 0x8000)
+                        fprintf(f, "  uint8_t _sbank=nes_read(0x%04X);\n", tramp->bank_save_addr);
+                    else
+                        fprintf(f, "  uint8_t _sbank=g_ram[0x%04X];\n", tramp->bank_save_addr);
+                    /* push_all_jsr: each callee's RTS pops a 2-byte return, so
+                     * push a dummy before every direct call (see MMC3_REGION). */
+                    const char *pre = cfg->push_all_jsr ? DUMMY_JSR_PRE : "";
+                    const char *post = cfg->push_all_jsr ? DUMMY_JSR_POST : "";
+                    fprintf(f, "  g_cpu.%s=0x%02X; %sfunc_%04X();%s\n", breg, disp_bank, pre, tramp->bs_fn_addr, post);
+                    fprintf(f, "  g_cpu.A=_sa; g_cpu.X=_sx; g_cpu.Y=_sy;\n");
+                    /* Dispatch directly to the statically-known bank+addr target.
+                     * Using call_by_address() would race with NMI (which can change
+                     * g_current_bank between the bank switch and the dispatch). */
+                    if (disp_addr >= 0xC000) {
+                        if (cfg->push_all_jsr)
+                            fprintf(f, "  { uint16_t _swb=g_code_window_base; g_code_window_base=0x%04X; uint8_t _cbs=g_cpu.S; uint64_t _irq_epoch=runtime_get_interrupt_epoch(); g_rti_target=0; g_rti_source=0; g_rti_bank=-1; " DUMMY_PUSH_PAIR "func_%04X(); int _ok=nes_jsr_stack_ok_after_call(_cbs, _irq_epoch); g_code_window_base=_swb; if (!_ok) return; }\n",
+                                    (uint16_t)(disp_addr & 0xE000), disp_addr);
+                        else
+                            fprintf(f, "  { uint16_t _swb=g_code_window_base; g_code_window_base=0x%04X; func_%04X(); g_code_window_base=_swb; }\n",
+                                    (uint16_t)(disp_addr & 0xE000), disp_addr);
+                    } else if (disp_addr >= 0x8000) {
+                        if (cfg->push_all_jsr)
+                            fprintf(f, "  { uint16_t _swb=g_code_window_base; g_code_window_base=0x%04X; uint8_t _cbs=g_cpu.S; uint64_t _irq_epoch=runtime_get_interrupt_epoch(); g_rti_target=0; g_rti_source=0; g_rti_bank=-1; " DUMMY_PUSH_PAIR "func_%04X_b%d(); int _ok=nes_jsr_stack_ok_after_call(_cbs, _irq_epoch); g_code_window_base=_swb; if (!_ok) return; }\n",
+                                    (uint16_t)(disp_addr & 0xE000), disp_addr, disp_bank);
+                        else
+                            fprintf(f, "  { uint16_t _swb=g_code_window_base; g_code_window_base=0x%04X; func_%04X_b%d(); g_code_window_base=_swb; }\n",
+                                    (uint16_t)(disp_addr & 0xE000), disp_addr, disp_bank);
+                    } else {
+                        fprintf(f, "  %scall_by_address(0x%04X);%s\n", pre, disp_addr, post);
+                    }
+                    fprintf(f, "  _sa=g_cpu.A;\n");
+                    fprintf(f, "  g_cpu.%s=_sbank; %sfunc_%04X();%s\n", breg, pre, tramp->bs_fn_addr, post);
+                    fprintf(f, "  g_cpu.A=_sa; }\n");
+                    return 3 + tramp->inline_bytes;
+                }
+            }
+            /* Check against inline_dispatch: JSR to an indexed-dispatch routine.
+             * Bytes after the JSR are a 2-byte LE address table indexed by A.
+             * Table ends when hi byte < 0x80.  Emit a switch on g_cpu.A. */
+            {
+                const InlineDispatch *idsp = NULL;
+                uint16_t resolved_idsp = resolve_jmp_thunk(rom, fixed_bank, abs16);
+                for (int ti = 0; ti < cfg->inline_dispatch_count; ti++) {
+                    if (resolved_idsp == cfg->inline_dispatches[ti].addr) { idsp = &cfg->inline_dispatches[ti]; break; }
+                }
+                if (idsp) {
+                    /* Determine which bank to use for switchable-range targets
+                     * BEFORE counting table entries, so the validator can check
+                     * targets against the discovered function list. */
+                    int dispatch_bank = -1;
+                    if (bank != fixed_bank) {
+                        dispatch_bank = bank;
+                    } else {
+                        /* Fixed bank: scan backward from this JSR for the nearest
+                         * LDA #imm; JSR SwitchBank pattern (within ~64 bytes). */
+                        for (int bk = 5; bk <= 64; bk++) {
+                            if (pc < (uint16_t)(0xC000 + bk)) break;
+                            uint16_t probe = (uint16_t)(pc - bk);
+                            for (int bi2 = 0; bi2 < cfg->bank_switch_count; bi2++) {
+                                uint16_t bs_addr = cfg->bank_switches[bi2].addr;
+                                if (rom_read(rom, bank, probe) == 0x20 &&
+                                    rom_read(rom, bank, probe + 1) == (bs_addr & 0xFF) &&
+                                    rom_read(rom, bank, probe + 2) == ((bs_addr >> 8) & 0xFF) &&
+                                    probe >= 2 && rom_read(rom, bank, probe - 2) == 0xA9) {
+                                    int bval = rom_read(rom, bank, probe - 1);
+                                    if (bval < fixed_bank) {
+                                        int is_tail = 0;
+                                        for (int fwd = 3; fwd <= 8; fwd++) {
+                                            if (rom_read(rom, bank, probe + fwd) == 0x4C) {
+                                                is_tail = 1; break;
+                                            }
+                                        }
+                                        if (!is_tail) {
+                                            dispatch_bank = bval;
+                                            goto dispatch_bank_found;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        dispatch_bank_found:;
+                    }
+
+                    uint16_t tpc = pc + 3;
+                    int entry_count = 0;
+                    /* Count entries: require each target to have a discovered
+                     * function.  This prevents table over-reads into trailing
+                     * data (e.g. zero-fill regions with bytes like $FE, $FF
+                     * that look like high ROM addresses). */
+                    while (1) {
+                        uint8_t lo = rom_read(rom, bank, tpc);
+                        uint8_t hi = rom_read(rom, bank, tpc + 1);
+                        uint16_t addr = (uint16_t)lo | ((uint16_t)hi << 8);
+                        if (!is_valid_dispatch_target(cfg, addr, funcs, dispatch_bank, fixed_bank, rom)) break;
+                        tpc += 2;
+                        entry_count++;
+                    }
+                    fprintf(f, "/* inline_dispatch $%04X: %d entries (bank=%d) */\n",
+                            idsp->addr, entry_count, dispatch_bank);
+                    /* inline_dispatch is a computed JMP: the dispatch routine does
+                     * PLA/PLA then JMP (indirect), bypassing any code after the table.
+                     * Emit `return` after each case (not `break`) so the containing
+                     * function terminates immediately after the dispatch. */
+                    /* Validate dispatch_bank: every switchable-range target
+                     * must have a generated function for that bank.  If any
+                     * target is missing, fall back to call_by_address(). */
+                    if (!rom_mapper40(rom) && dispatch_bank >= 0 && funcs) {
+                        uint16_t vpc = pc + 3;
+                        for (int vi = 0; vi < entry_count; vi++) {
+                            uint8_t vlo = rom_read(rom, bank, vpc);
+                            uint8_t vhi = rom_read(rom, bank, vpc + 1);
+                            uint16_t vdest = (uint16_t)vlo | ((uint16_t)vhi << 8);
+                            if (vdest >= 0x8000 && vdest < 0xC000) {
+                                if (!function_list_contains(funcs, vdest, dispatch_bank)) {
+                                    dispatch_bank = -1; /* fall back */
+                                    break;
+                                }
+                            }
+                            vpc += 2;
+                        }
+                    }
+                    /* Inline dispatch replaces the trampoline (stack pulls,
+                     * table lookup, JMP indirect) with a compile-time switch,
+                     * but the trampoline body's side effects stay visible to
+                     * game code: RAM stores, final register/flag state, and
+                     * consumed cycles.  Derive them by symbolically executing
+                     * the body — concrete per dispatch case — instead of
+                     * hardcoding any one game's pattern (SMB's JumpEngine
+                     * writes $04-$07; a previously hardcoded STX $27/STY $28,
+                     * correct only for Gumshoe, corrupted SMB's
+                     * Block_State[1]/Misc_State[0] at those addresses). */
+                    /* Bank for reading the trampoline BODY.  rom_read routes
+                     * $C000+ to the fixed bank by address, so this only
+                     * matters for a trampoline in the switchable window
+                     * reached from fixed-bank code: prefer the propagated
+                     * dispatch bank; on carts with a single switchable bank
+                     * candidate (e.g. NROM-256) that bank is always mapped. */
+                    int tramp_bank = bank;
+                    uint16_t tramp_addr = resolved_idsp;
+                    if (rom_mapper40(rom)) {
+                        rom_mapper40_cpu_to_generated(rom, resolved_idsp, 0,
+                                                      &tramp_addr, &tramp_bank);
+                    } else if (resolved_idsp < 0xC000 && bank == fixed_bank) {
+                        if (dispatch_bank >= 0)
+                            tramp_bank = dispatch_bank;
+                        else if (!rom_mapper_full_32k_switch(rom) && rom->prg_banks <= 2)
+                            tramp_bank = 0;
+                    }
+                    int tramp_ok;
+                    {
+                        TrampEffects tprobe;
+                        uint16_t tfail_pc = 0; uint8_t tfail_op = 0;
+                        tramp_ok = derive_trampoline_effects(
+                            rom, tramp_bank, tramp_addr, pc, 0,
+                            rom_mapper40(rom),
+                            &tprobe, &tfail_pc, &tfail_op);
+                        if (!tramp_ok)
+                            fprintf(stderr, "[CodeGen] inline_dispatch $%04X (JSR at $%04X): "
+                                    "cannot derive trampoline side effects "
+                                    "(op $%02X at $%04X) — emitting none\n",
+                                    idsp->addr, pc, tfail_op, tfail_pc);
+                    }
+                    if (rom_mapper40(rom))
+                        fprintf(f, "{ uint16_t _inline_ret = (uint16_t)((g_code_window_base | 0x%04X) + 2);\n",
+                                pc & 0x1FFF);
+                    fprintf(f, "switch(g_cpu.A) {\n");
+                    tpc = pc + 3;
+                    for (int ei = 0; ei < entry_count; ei++) {
+                        uint8_t lo = rom_read(rom, bank, tpc);
+                        uint8_t hi = rom_read(rom, bank, tpc + 1);
+                        uint16_t dest = (uint16_t)lo | ((uint16_t)hi << 8);
+                        EmitCallOpts o = { .tail_return = true };
+                        fprintf(f, "  case %d: ", ei);
+                        if (tramp_ok) {
+                            TrampEffects tfx;
+                            uint16_t tfail_pc = 0; uint8_t tfail_op = 0;
+                            uint16_t effect_addr =
+                                rom_mapper40(rom) ? tramp_addr : resolved_idsp;
+                            if (derive_trampoline_effects(
+                                    rom, tramp_bank, effect_addr, pc,
+                                    (uint8_t)ei, rom_mapper40(rom),
+                                    &tfx, &tfail_pc, &tfail_op))
+                                emit_trampoline_effects(f, &tfx, (uint8_t)ei, dest);
+                        }
+                        if (rom_mapper40(rom) && dest >= 0x6000) {
+                            o.force_dynamic = true;
+                            emit_call_target(f, rom, dest, bank, fixed_bank, o);
+                        } else if (dest >= 0xC000) {
+                            emit_call_target(f, rom, dest, fixed_bank, fixed_bank, o);
+                        } else if (dest >= 0x8000) {
+                            if (dispatch_bank >= 0) {
+                                /* Bank known from register propagation, validated */
+                                emit_call_target(f, rom, dest, dispatch_bank, fixed_bank, o);
+                            } else if (bank != fixed_bank) {
+                                emit_call_target(f, rom, dest, bank, fixed_bank, o);
+                            } else {
+                                /* Fixed bank, no bank-switch or missing targets: runtime */
+                                o.force_dynamic = true;
+                                emit_call_target(f, rom, dest, bank, fixed_bank, o);
+                            }
+                        } else {
+                            /* Check if SRAM-mapped address */
+                            int sram_bank = -1;
+                            uint16_t rom_addr = codegen_sram_translate(cfg, dest, &sram_bank);
+                            if (rom_addr) {
+                                int target_bank = (rom_addr >= 0xC000) ? fixed_bank : sram_bank;
+                                emit_call_target(f, rom, rom_addr, target_bank, fixed_bank, o);
+                            } else {
+                                o.force_dynamic = true;
+                                emit_call_target(f, rom, dest, bank, fixed_bank, o);
+                            }
+                        }
+                        tpc += 2;
+                    }
+                    fprintf(f, "  default: nes_log_inline_miss(0x%04X, g_cpu.A); return;\n", pc);
+                    fprintf(f, "}\n");
+                    if (rom_mapper40(rom)) fprintf(f, "}\n");
+                    return (int)(tpc - pc);
+                }
+            }
+            /* Check against nop_jsr: JSR to skip entirely (emit nothing) */
+            for (int ni = 0; ni < cfg->nop_jsr_count; ni++) {
+                if (abs16 == cfg->nop_jsrs[ni]) {
+                    fprintf(f, "/* nop_jsr $%04X — skipped */\n", abs16);
+                    return 3;
+                }
+            }
+            /* Push 6502 return address before call, matching real JSR behavior.
+             * Needed for any code that reads the 6502 stack (e.g., coroutine
+             * schedulers using TXS/TSX + PLA/RTS to save/resume contexts).
+             * JSR pushes (PC+2) hi then lo; RTS pops and adds 1.
+             * push_all_jsr: every JSR pushes.  push_jsr: only listed targets. */
+            bool did_push_jsr = cfg->push_all_jsr;
+            if (!did_push_jsr) {
+                for (int ni = 0; ni < cfg->push_jsr_count; ni++) {
+                    if (abs16 == cfg->push_jsrs[ni]) { did_push_jsr = true; break; }
+                }
+            }
+            bool did_return_adjust_jsr = did_push_jsr && return_adjust_func_matches(cfg, abs16);
+            bool use_tolerant_jsr_stack =
+                (cfg->return_adjust_func_count > 0 ||
+                 cfg->indirect_continuation_count > 0);
+            if (did_push_jsr) {
+                /* Universal bail detection: save S before push so we
+                 * can detect post-call stack unwind (PLA PLA RTS etc.).
+                 * If S changed after the call, the callee unwound one
+                 * or more frames — propagate by returning immediately.
+                 * Subsumes per-function stack_bail_func / cond_bail_func. */
+                if (use_tolerant_jsr_stack)
+                    fprintf(f, "{ uint8_t _cbs = g_cpu.S; uint64_t _irq_epoch = runtime_get_interrupt_epoch(); g_rti_target = 0; g_rti_source = 0; g_rti_bank = -1; ");
+                else
+                    fprintf(f, "{ uint8_t _cbs = g_cpu.S; ");
+                uint16_t ret_addr = pc + 2; /* 6502 JSR pushes PC+2 (last byte of JSR) */
+                if (rom->mapper == 4 || rom->mapper == 40) {
+                    /* Banked mapper: gen-layout PC constants are NOT the CPU
+                     * address when the code executes in a window that differs
+                     * from its gen labels. Stack-reading idioms (DynJump-style
+                     * inline-table dispatchers, PLA/RTS gotos) interpret the
+                     * pushed return as a CPU address, so mint it from the live
+                     * executing window (g_code_window_base) + the in-window
+                     * offset. RTS itself ignores the value (C return), and the
+                     * bail check compares S only. */
+                    fprintf(f, "uint16_t _rp = (uint16_t)(g_code_window_base | 0x%04X); ",
+                            ret_addr & 0x1FFF);
+                    if (did_return_adjust_jsr) fprintf(f, "g_rts_target = 0; ");
+                    fprintf(f, "g_ram[0x100 + g_cpu.S] = (uint8_t)(_rp >> 8); g_cpu.S--; ");
+                    fprintf(f, "g_ram[0x100 + g_cpu.S] = (uint8_t)_rp; g_cpu.S--; ");
+                } else {
+                    if (use_tolerant_jsr_stack)
+                        fprintf(f, "uint16_t _rp = 0x%04X; ", ret_addr);
+                    if (did_return_adjust_jsr) fprintf(f, "g_rts_target = 0; ");
+                    fprintf(f, "g_ram[0x100 + g_cpu.S] = 0x%02X; g_cpu.S--; ",
+                            (ret_addr >> 8) & 0xFF);
+                    fprintf(f, "g_ram[0x100 + g_cpu.S] = 0x%02X; g_cpu.S--; ",
+                            ret_addr & 0xFF);
+                }
+            }
+            /* Check against inline_pointer: JSR to a routine that reads 2
+             * inline bytes as a data pointer into zero page. */
+            {
+                const InlinePointer *ipp = NULL;
+                for (int ti = 0; ti < cfg->inline_pointer_count; ti++) {
+                    if (abs16 == cfg->inline_pointers[ti].addr) { ipp = &cfg->inline_pointers[ti]; break; }
+                }
+                if (ipp) {
+                    uint8_t lo = rom_read(rom, bank, pc + 3);
+                    uint8_t hi = rom_read(rom, bank, pc + 4);
+                    fprintf(f, "/* inline_pointer $%04X: load $%02X%02X into $%02X/$%02X */\n",
+                            ipp->addr, hi, lo, ipp->zp_lo, ipp->zp_hi);
+                    fprintf(f, "g_ram[0x%02X] = 0x%02X; g_ram[0x%02X] = 0x%02X;\n",
+                            ipp->zp_lo, lo, ipp->zp_hi, hi);
+                    if (!ipp->call) {
+                        /* getPointer_fromStack leaves Y=2 after reading 2 bytes */
+                        fprintf(f, "g_cpu.Y = 2; FLAG_NZ(g_cpu.Y);\n");
+                    }
+                    if (ipp->call) {
+                        uint16_t alias_owner = 0;
+                        int alias_bank = -1;
+                        int alias_entry = 0;
+                        if (abs16 >= 0xC000) {
+                            if (codegen_lookup_body_alias(abs16, fixed_bank,
+                                                          &alias_owner, &alias_bank, &alias_entry))
+                                fprintf(f, "func_%04X_body(%d);\n", alias_owner, alias_entry);
+                            else
+                                fprintf(f, "func_%04X();\n", abs16);
+                        } else if (bank == fixed_bank) {
+                            if (cfg->push_all_jsr)
+                                fprintf(f, "if (!call_by_address(0x%04X)) g_cpu.S += 2;\n", abs16);
+                            else
+                                fprintf(f, "call_by_address(0x%04X);\n", abs16);
+                        } else {
+                            int tb = gxrom_paired_bank(rom, bank, abs16);
+                            if (codegen_lookup_body_alias(abs16, tb,
+                                                          &alias_owner, &alias_bank, &alias_entry))
+                                fprintf(f, "func_%04X_b%d_body(%d);\n",
+                                        alias_owner, alias_bank, alias_entry);
+                            else
+                                fprintf(f, "func_%04X_b%d();\n", abs16, tb);
+                        }
+                    }
+                    return 5;
+                }
+            }
+            {
+                EmitCallOpts jsr_opts = { .jsr_pop_fallback = cfg->push_all_jsr };
+                if (rom->mapper == 40 && abs16 >= 0x6000) {
+                    jsr_opts.force_dynamic = true;
+                    jsr_opts.use_caller_bank = true;
+                    jsr_opts.caller_bank = bank;
+                    emit_call_target(f, rom, abs16, bank, fixed_bank, jsr_opts);
+                } else if (abs16 >= 0xC000) {
+                    /* GxROM (full 32K switch) pairs both halves of the 32KB
+                     * window together; $C000+ is the source's source_bank|1,
+                     * NOT a fixed bank.  Traditional mappers (UxROM/MMC1/MMC3)
+                     * route $C000+ through the fixed bank regardless of source.
+                     * Pass the right source so emit_call_target's
+                     * gxrom_paired_bank() resolves the correct lookup_bank.
+                     * (Mirrors the call_by_address pairing fix in 49f9fe3.) */
+                    int call_src;
+                    if (rom_mapper_full_32k_switch(rom)) {
+                        call_src = bank;
+                        if (sram_sourced) jsr_opts.force_dynamic = true;
+                    } else {
+                        call_src = fixed_bank;
+                    }
+                    /* MMC3 PRG mode 1 swaps $C000-$DFFF via R6 (e.g. SMB3), so a
+                     * $C000-$DFFF operand is a window selection, not a fixed-bank
+                     * address.  Only $E000+ is fixed in both modes. */
+                    if (rom->mapper == 4 && abs16 < 0xE000) {
+                        jsr_opts.force_dynamic = true;
+                        if (bank != fixed_bank) {
+                            jsr_opts.use_caller_bank = true;
+                            jsr_opts.caller_bank = bank;
+                        }
+                    }
+                    emit_call_target(f, rom, abs16, call_src, fixed_bank, jsr_opts);
+                } else if (abs16 >= 0x8000) {
+                    /* MMC3 (mapper 4): 8KB banks at $8000-$9FFF and $A000-$BFFF
+                     * are switched independently.  An absolute operand SELECTS a
+                     * window by its value; which physical bank answers there is
+                     * runtime mapper state.  A switchable bank's code can execute
+                     * in EITHER window (e.g. SMB3 maps even banks at $A000), so
+                     * even a same-gen-half `JSR $96E5` from code running in the
+                     * $A000 window really targets the $8000 window (fixed/R6) —
+                     * a static same-bank bind runs the wrong function (measured:
+                     * SMB3 bank-26 $8CBF JSR $96E5 bound to func_96E5_b13 while
+                     * hardware executes fixed-bank-30 $96E5; the misdirected flow
+                     * ended in a DynJump table misread jumping to $6622 WRAM).
+                     * Therefore EVERY absolute JSR into $8000-$BFFF from
+                     * switchable-bank mapper-4 code dispatches dynamically:
+                     * call_by_address_cb resolves the operand through the live
+                     * window (g_mmc3_win_bank8k) and falls back to the
+                     * interpreter when the resolved variant was not generated. */
+                    int cross_8kb = (rom->mapper == 4);
+                    /* A cross-8KB call crosses the $8000/$A000 window boundary, so
+                     * its target lives in whichever window the mapper points the
+                     * OTHER 8KB slot at — and that is a RUNTIME fact, not a static
+                     * one.  The recompiler models a 16KB bank as low-half@$8000 +
+                     * high-half@$A000, but MMC3 can map the SAME physical 8KB bank
+                     * into EITHER window (R6 odd puts a bank's high half at $8000;
+                     * R7 even puts a bank's low half at $A000).  The identical
+                     * generated function therefore executes at $8000 in one frame
+                     * and $A000 in another, and its internal `JSR $80xx` resolves to
+                     * a DIFFERENT physical target each time.  No static binding can
+                     * be right for both mappings, so a cross-8KB call MUST dispatch
+                     * dynamically: call_by_address applies the R6/R7 odd/even remap
+                     * and selects the correct func_<addr>_b<bank> at runtime.
+                     *   (An earlier same_bank_target guard bound these statically to
+                     *   func_<abs16>_<bank>.  That mis-fired when the caller's half
+                     *   was mapped at $8000 by an odd R6: e.g. bank14 high-half code
+                     *   at model $A148 does `JSR $80CC`; with R6=29 the $8000 window
+                     *   IS bank14's high half, so $80CC means high-half $A0CC, but
+                     *   the static bind went to func_80CC_b14 — a data-as-code stub
+                     *   whose body BRKs at $80D5.  Dynamic dispatch resolves it to
+                     *   func_A0CC_b14 correctly.  This matches the MN_JMP cross-8KB
+                     *   path, which has always forced dynamic.) */
+                    if (bank == fixed_bank || sram_sourced || cross_8kb) {
+                        /* Cross-bank call from fixed bank, call from SRAM-sourced
+                         * function, or MMC3 cross-8KB call: the target bank is
+                         * determined at runtime by the mapper, so dispatch via
+                         * call_by_address. */
+                        jsr_opts.force_dynamic = true;
+                        if (cross_8kb && bank != fixed_bank) {
+                            /* Pass the caller's bank as the dispatch fallback (see
+                             * emit_call_target): if the window lookup misses, the
+                             * target still resolves to the caller's own 16KB bank. */
+                            jsr_opts.use_caller_bank = true;
+                            jsr_opts.caller_bank = bank;
+                        }
+                    }
+                    emit_call_target(f, rom, abs16, bank, fixed_bank, jsr_opts);
+                } else {
+                    /* JSR to non-ROM address (RAM/PPU): dispatch at runtime */
+                    jsr_opts.force_dynamic = true;
+                    emit_call_target(f, rom, abs16, bank, fixed_bank, jsr_opts);
+                }
+            }
+            /* Universal bail propagation: if S changed after the call
+             * (callee did PLA PLA RTS or similar stack unwind), propagate
+             * the unwind by returning immediately.
+             *
+             * Skip bail for:
+             *  - call_by_address() targets: dynamic dispatch may reach
+             *    coroutine yields or context switches that legitimately
+             *    change S mid-call.
+             *  - the coroutine yield function: the scheduler's RESUME
+             *    path (PLA+PLA+S+=2) changes S by +4 while the yield
+             *    only pushed 3 bytes.  The +1 mismatch always triggers
+             *    the bail, and on game-state transitions the bail
+             *    cascades to the coroutine entry, killing the fiber. */
+            if (did_push_jsr) {
+                if (is_yield_func(abs16)) {
+                    /* Yield function: close the brace but skip the bail check */
+                    fprintf(f, "}\n");
+                } else if (restore_jsr_matches(cfg, abs16)) {
+                    /* Callee leaves the pushed frame on the 6502 stack (its
+                     * RTS is a plain C return): restore S, no bail, and fall
+                     * through to site+3 like a normal 3-byte JSR. */
+                    fprintf(f, "if (g_cpu.S != _cbs) g_cpu.S = _cbs; }\n");
+                } else if (absorb_jsr_ret_matches(cfg, abs16)) {
+                    /* Callee consumed the pushed return address as data
+                     * (inline bytecode trampoline): restore S, no bail. */
+                    fprintf(f, "if (g_cpu.S != _cbs) g_cpu.S = _cbs; }\n");
+                    /* The interpreter's exit RTS resumes at site+5: it pops
+                     * the pushed return (site+2) and the callee consumed the
+                     * 2 inline data bytes after the operand. Falling through
+                     * to site+3 would execute script DATA as code (verified
+                     * on Tetris: $8217's site+3/4 are $17 $AD — script bytes,
+                     * not instructions). Return 5 so the emitter continues at
+                     * site+5 and emits its label there, making the goto valid.
+                     * Same consumption model as inline_pointer (also returns
+                     * 5). Non-trivial-bank mappers keep the old fall-through:
+                     * window boundaries could leave label_site5 unemitted. */
+                    if (rom->mapper != 4 && rom->mapper != 40) {
+                        fprintf(f, "nes_cpu_instruction_boundary(0x%04X, 1); goto label_%04X; return;\n",
+                                (uint16_t)(pc + 2), (uint16_t)(pc + 5));
+                        return 5;
+                    }
+                } else {
+                    if (did_return_adjust_jsr) {
+                        fprintf(f, "if (g_cpu.S == (uint8_t)(_cbs - 2) && g_rts_target != 0 && g_rts_target != _rp) { call_by_address((uint16_t)(g_rts_target + 1)); }\n");
+                        fprintf(f, "if (g_cpu.S == _cbs && g_rts_target != 0 && g_rts_target != _rp) { call_by_address((uint16_t)(g_rts_target + 1)); return; }\n");
+                    }
+                    if (use_tolerant_jsr_stack)
+                        fprintf(f, "if (!nes_jsr_stack_ok_after_call(_cbs, _irq_epoch)) {\n#ifdef RECOMP_STACK_TRACKING\n    bail_trace(0x%04X, _cbs);\n    recomp_stack_pop();\n#endif\n    return; } }\n", pc);
+                    else
+                        fprintf(f, "if (g_cpu.S != _cbs) {\n#ifdef RECOMP_STACK_TRACKING\n    bail_trace(0x%04X, _cbs);\n    recomp_stack_pop();\n#endif\n    return; } }\n", pc);
+                }
+            }
+            break;
+        }
+        case MN_JMP:
+            if (e->addr_mode == AM_ABS) {
+                uint16_t cont = 0;
+                if (configured_indirect_continuation(rom, cfg, bank, func_base, pc, &cont)) {
+                    /* A configured pushed-return continuation may use a direct
+                     * JMP just as easily as JMP (ind). The target's eventual
+                     * RTS consumes the manually pushed operand; resume in this
+                     * generated body instead of unwinding its C caller. */
+                    fprintf(f, "nes_cpu_instruction_boundary(0x%04X, 2); if (nes_dispatch_indirect_continuation(0x%04X, %d, 0x%04X)) goto label_%04X; return;\n",
+                            abs16, abs16, bank, (uint16_t)(cont - 1), cont);
+                    return (int)(cont - pc);
+                }
+                if (abs16 >= 0xC000) {
+                    uint16_t alias_owner = 0;
+                    int alias_bank = -1;
+                    int alias_entry = 0;
+                    if (pc >= 0xC003 &&
+                        rom_read(rom, bank, pc - 3) == 0xBA /* TSX */ &&
+                        rom_read(rom, bank, pc - 2) == 0x96 /* STX zp,Y */) {
+                        /* Coroutine yield pattern: TSX; STX $NN,Y; JMP $scheduler.
+                         * This must take precedence over the generic fixed-bank
+                         * backward-JMP handling. A large merged body can cover both
+                         * the yield tail and the lower-address scheduler target
+                         * (MM3: $FF39 -> $FEAA); treating that as an in-body goto or
+                         * tail dispatch re-enters the scheduler without unwinding
+                         * the coroutine fiber and kills the game task. */
+                        fprintf(f, "coroutine_yield(); return;\n");
+                    } else if (abs16 == func_base && pc == func_base) {
+                        /* JMP $self at function start: true idle spin (single-instr).
+                         * while(1) polls VBlank without recursion. */
+                        fprintf(f, "while(1) { %s(0x%04X, 2); }\n", insn_boundary, abs16);
+                    } else if (abs16 == func_base) {
+                        /* JMP to own entry from within body: loop-back. */
+                        fprintf(f, "goto label_%04X;\n", abs16);
+                    } else if (abs16 >= func_base && abs16 < pc) {
+                        /* JMP to an address already emitted within this function body.
+                         * Use goto to avoid mutual tail-call recursion: if $C0BC's body
+                         * includes $C0CB as a label, JMP $C0CB must be a goto, not a
+                         * call to the separate func_C0CB() — otherwise they recurse
+                         * every frame and overflow the C stack.
+                         * Verify the label actually exists (function may have gaps). */
+                        bool label_exists = false;
+                        for (int ei = 0; ei < emitted_count; ei++) {
+                            if (emitted_addrs[ei] == abs16) { label_exists = true; break; }
+                        }
+                        if (label_exists)
+                            fprintf(f, "goto label_%04X;\n", abs16);
+                        else if (rom->mapper == 4)
+                            /* Mapper 4: the operand is a window selection; the
+                             * tail dispatch resolves it and maintains the code
+                             * window base for the callee's JSR pushes. */
+                            fprintf(f, "nes_cpu_instruction_boundary(0x%04X, 2); call_by_address_tail(0x%04X, -1); return;\n", abs16, abs16);
+                        else if (codegen_lookup_body_alias(abs16, fixed_bank,
+                                                           &alias_owner, &alias_bank, &alias_entry))
+                            fprintf(f, "func_%04X_body(%d); return;\n", alias_owner, alias_entry);
+                        else if (codegen_has_emitted_wrapper(abs16, fixed_bank))
+                            fprintf(f, "nes_cpu_instruction_boundary(0x%04X, 2); func_%04X(); return;\n", abs16, abs16);
+                        else
+                            fprintf(f, "nes_cpu_instruction_boundary(0x%04X, 2); call_by_address(0x%04X); return;\n", abs16, abs16);
+                    } else {
+                        /* Check push_jmp: bail-containing targets need a dummy
+                         * push so the bail's RTS has something safe to pop.
+                         * source=0 matches any JMP site; nonzero matches only that PC. */
+                        bool need_jmp_push = push_jmp_matches(cfg, pc, abs16);
+                        EmitCallOpts o = {
+                            .vblank_prefix = true,
+                            .push_dummy_static = need_jmp_push,
+                            .tail_return = true,
+                        };
+                        /* MMC3 PRG mode 1: $C000-$DFFF is the R6 window, not the
+                         * fixed bank — resolve through the live window. Tail
+                         * trampoline keeps loop chains flat. */
+                        if (rom->mapper == 4 && abs16 < 0xE000) {
+                            o.force_dynamic = true;
+                            o.push_dummy_static = false;
+                            o.push_dummy_dynamic = need_jmp_push;
+                        }
+                        emit_call_target(f, rom, abs16, fixed_bank, fixed_bank, o);
+                    }
+                } else if (abs16 >= 0x8000) {
+                    /* Check if target is a merge partner (use goto, not function call) */
+                    bool is_merge = false;
+                    for (int mi = 0; mi < merge_partner_count; mi++) {
+                        if (abs16 == merge_partners[mi]) { is_merge = true; break; }
+                    }
+                    /* For overlapping entries within a merge_range that can't be
+                     * fully merged: their JMP to a target within the range becomes
+                     * a call to the canonical merged function. This is safe because
+                     * the merged function's internal loop-back is a goto, and its
+                     * final RTS properly pops the caller's return address. */
+                    /* MMC3 cross-8KB check (same as JSR path above) */
+                    int jmp_cross_8kb = (rom->mapper == 4 &&
+                                         pc >= 0x8000 && pc < 0xC000 &&
+                                         (pc < 0xA000) != (abs16 < 0xA000));
+                    int mapper4_switchable_jmp =
+                        (rom->mapper == 4 && bank != fixed_bank &&
+                         abs16 >= 0x8000 && abs16 < 0xC000);
+                    if (bank == fixed_bank || sram_sourced || jmp_cross_8kb ||
+                        mapper4_switchable_jmp) {
+                        /* push_jmp check for cross-bank JMP via dispatch */
+                        bool need_jmp_push = push_jmp_matches(cfg, pc, abs16);
+                        EmitCallOpts o = {
+                            .force_dynamic = true,
+                            .vblank_prefix = true,
+                            .push_dummy_dynamic = need_jmp_push,
+                            .tail_return = true,
+                            /* Cross-8KB JMP carries the caller-bank hint too (same
+                             * runtime-mapping ambiguity as the JSR path). */
+                            .use_caller_bank = jmp_cross_8kb || mapper4_switchable_jmp,
+                            .caller_bank = bank,
+                        };
+                        emit_call_target(f, rom, abs16, bank, fixed_bank, o);
+                    } else if (abs16 == func_base && pc == func_base) {
+                        /* JMP $self at function start: true idle spin. */
+                        fprintf(f, "while(1) { %s(0x%04X, 2); }\n", insn_boundary, abs16);
+                    } else if (abs16 == func_base || is_merge) {
+                        /* JMP to own entry or merge partner: loop-back via goto. */
+                        fprintf(f, "%s(0x%04X, 2);\n    goto label_%04X;\n", insn_boundary, abs16, abs16);
+                    } else {
+                        /* Prefer in-body goto when the target address has already
+                         * been emitted as a label in THIS function's body.  This
+                         * handles the case where function_finder over-aliased a
+                         * mid-body re-entry point (e.g. $8030 inside Gumshoe's
+                         * $8000 main loop) as a separate function: a wrapper
+                         * func_NNNN_b%d() exists, but the in-body label_NNNN
+                         * also exists.  Without this check, JMP NNNN would
+                         * tail-call the wrapper, which then tail-calls back into
+                         * the outer function, growing the C stack indefinitely
+                         * (Gumshoe bank-6 main loop overflowed at depth 510). */
+                        bool label_in_body = false;
+                        for (int ei = 0; ei < emitted_count; ei++) {
+                            if (emitted_addrs[ei] == abs16) { label_in_body = true; break; }
+                        }
+                        if (label_in_body) {
+                            /* Same-gen-half in-body target (cross-half JMPs went
+                             * dynamic above): caller and target share a window at
+                             * runtime, so the goto is sound for any mapping. */
+                            fprintf(f, "%s(0x%04X, 2);\n    goto label_%04X;\n", insn_boundary, abs16, abs16);
+                        } else {
+                            /* push_jmp check for same-bank JMP */
+                            bool need_jmp_push = push_jmp_matches(cfg, pc, abs16);
+                            EmitCallOpts o = {
+                                .vblank_prefix = true,
+                                .push_dummy_static = need_jmp_push,
+                                .tail_return = true,
+                            };
+                            if (rom->mapper == 4) {
+                                /* Same window-selection ambiguity as the JSR path:
+                                 * the operand names a window, not this bank — go
+                                 * through the live-window dispatch. The tail
+                                 * trampoline keeps JMP loop chains flat. */
+                                o.force_dynamic = true;
+                                o.push_dummy_static = false;
+                                o.push_dummy_dynamic = need_jmp_push;
+                                o.use_caller_bank = true;
+                                o.caller_bank = bank;
+                            }
+                            emit_call_target(f, rom, abs16, bank, fixed_bank, o);
+                        }
+                    }
+                } else {
+                    /* JMP to non-ROM address: dispatch at runtime */
+                    EmitCallOpts o = {
+                        .force_dynamic = true,
+                        .vblank_prefix = true,
+                        .tail_return = true,
+                    };
+                    emit_call_target(f, rom, abs16, bank, fixed_bank, o);
+                }
+            } else {
+                /* JMP (ind) — dispatch */
+                if (abs16 < 0x100) {
+                    /* Zero-page indirect: read the pointer BEFORE triggering VBlank. */
+                    if (sched_reset_addr) {
+                        /* Coroutine scheduler START: create fiber, dispatch to
+                         * coroutine entry, loop back when it yields. */
+                        fprintf(f, "{ uint16_t _jt = nes_read16zp(0x%02X); nes_cpu_instruction_boundary(_jt, 2); coroutine_start(g_ram[0x91], _jt); goto label_%04X; }\n",
+                                (uint8_t)abs16, sched_reset_addr);
+                    } else if (pc >= 6 &&
+                               rom_read(rom, bank, pc - 6) == 0xA9 &&
+                               rom_read(rom, bank, pc - 4) == 0x48 &&
+                               rom_read(rom, bank, pc - 3) == 0xA9 &&
+                               rom_read(rom, bank, pc - 1) == 0x48) {
+                        /* 2-PHA indirect JSR: LDA #hi/PHA/LDA #lo/PHA/JMP (zp).
+                         * The pushed return address is (hi:lo)+1.  The callee's
+                         * RTS consumes the 2 pushed bytes, so after call_by_address
+                         * returns, S is restored and we fall through to the
+                         * continuation address. */
+                        uint8_t cont_hi = rom_read(rom, bank, pc - 5);
+                        uint8_t cont_lo = rom_read(rom, bank, pc - 2);
+                        uint16_t cont = (((uint16_t)cont_hi << 8) | cont_lo) + 1;
+                        fprintf(f, "{ uint16_t _jt = nes_read16zp(0x%02X); nes_cpu_instruction_boundary(_jt, 2); call_by_address(_jt); call_by_address_tail(0x%04X, %d); return; }\n",
+                                (uint8_t)abs16, cont, bank);
+                    } else {
+                        uint16_t cont = 0;
+                        if (configured_indirect_continuation(rom, cfg, bank, func_base, pc, &cont)) {
+                            fprintf(f, "{ uint16_t _jt = nes_read16zp(0x%02X); nes_cpu_instruction_boundary(_jt, 2); if (nes_dispatch_indirect_continuation(_jt, %d, 0x%04X)) goto label_%04X; return; }\n",
+                                    (uint8_t)abs16, bank, (uint16_t)(cont - 1), cont);
+                            return (int)(cont - pc);
+                        }
+                        fprintf(f, "{ uint16_t _jt = nes_read16zp(0x%02X); nes_cpu_instruction_boundary(_jt, 2); call_by_address_tail(_jt, -1); return; }\n",
+                                (uint8_t)abs16);
+                    }
+                } else {
+                    /* Non-ZP indirect: NMOS 6502 page-wrap erratum applies via
+                     * nes_read16_jmpbug — fetches hi from same page as lo when
+                     * the indirect address ends in $FF. Mandatory for hardware
+                     * accuracy on JMP ($xxFF). */
+                    if (pc >= 6 &&
+                        rom_read(rom, bank, pc - 6) == 0xA9 &&
+                        rom_read(rom, bank, pc - 4) == 0x48 &&
+                        rom_read(rom, bank, pc - 3) == 0xA9 &&
+                        rom_read(rom, bank, pc - 1) == 0x48) {
+                        uint8_t cont_hi = rom_read(rom, bank, pc - 5);
+                        uint8_t cont_lo = rom_read(rom, bank, pc - 2);
+                        uint16_t cont = (((uint16_t)cont_hi << 8) | cont_lo) + 1;
+                        fprintf(f, "{ uint16_t _jt = nes_read16_jmpbug(0x%04X); nes_cpu_instruction_boundary(_jt, 2); call_by_address(_jt); call_by_address_tail(0x%04X, %d); return; }\n",
+                                abs16, cont, bank);
+                    } else {
+                        uint16_t cont = 0;
+                        if (configured_indirect_continuation(rom, cfg, bank, func_base, pc, &cont)) {
+                            fprintf(f, "{ uint16_t _jt = nes_read16_jmpbug(0x%04X); nes_cpu_instruction_boundary(_jt, 2); if (nes_dispatch_indirect_continuation(_jt, %d, 0x%04X)) goto label_%04X; return; }\n",
+                                    abs16, bank, (uint16_t)(cont - 1), cont);
+                            return (int)(cont - pc);
+                        }
+                        fprintf(f, "{ uint16_t _jt = nes_read16_jmpbug(0x%04X); nes_cpu_instruction_boundary(_jt, 2); call_by_address_tail(_jt, -1); return; }\n",
+                                abs16);
+                    }
+                }
+            }
+            break;
+        case MN_RTS:
+            /* Coroutine scheduler RESUME: after TXS restored the coroutine's
+             * stack pointer, PLA/TAY/PLA/TAX/RTS resumes the coroutine.
+             * The RTS should dispatch to the saved PC on the 6502 stack,
+             * then loop back to the scheduler when the coroutine yields.
+             * Pattern: 68 A8 68 AA 60 (PLA TAY PLA TAX RTS) with sched active. */
+            if (sched_reset_addr && pc >= 4 &&
+                rom_read(rom, bank, pc - 4) == 0x68 /* PLA */ &&
+                rom_read(rom, bank, pc - 3) == 0xA8 /* TAY */ &&
+                rom_read(rom, bank, pc - 2) == 0x68 /* PLA */ &&
+                rom_read(rom, bank, pc - 1) == 0xAA /* TAX */) {
+                /* Coroutine resume: longjmp to the saved coroutine context.
+                 * The 6502 stack pop (PLA/PLA/RTS) is conceptual — the real
+                 * resume is via longjmp to where the coroutine last yielded.
+                 * Pop the 6502 return address to keep the simulated stack correct,
+                 * but dispatch via coroutine_resume, not call_by_address.
+                 * Channel index comes from $91 (set by scheduler at $FECB). */
+                fprintf(f, "{ g_cpu.S += 2; /* skip RTS addr */ coroutine_resume(g_ram[0x91]); goto label_%04X; }\n", sched_reset_addr);
+                break;
+            }
+            /* Detect 4-PHA dispatch: LDA #cont_hi/PHA / LDA #cont_lo/PHA /
+             * LDA tbl_hi,Y/PHA / LDA tbl_lo,Y/PHA / RTS.
+             * PHAs at pc-12, pc-9, pc-5, pc-1.  Continuation = pc+1.
+             * The 2 cont bytes must be cleaned off the stack unconditionally
+             * (target may have internal PHA/PLA imbalance — can't be conditional). */
+            if (pc >= 0x800D && (pc - 12) >= func_base &&
+                rom_read(rom, bank, pc-1)  == 0x48 &&
+                rom_read(rom, bank, pc-5)  == 0x48 &&
+                rom_read(rom, bank, pc-9)  == 0x48 &&
+                rom_read(rom, bank, pc-12) == 0x48 &&
+                is_insn_boundary_from(rom, bank, func_base, (uint16_t)(pc - 1), pc)) {
+                fprintf(f, "{ uint8_t _s4=g_cpu.S; g_cpu.S++; uint8_t _lo=g_ram[0x100+g_cpu.S]; g_cpu.S++; uint8_t _hi=g_ram[0x100+g_cpu.S]; call_by_address(((uint16_t)_hi<<8|_lo)+1); g_cpu.S=(uint8_t)(_s4+4); } goto label_%04X;\n    ", (uint16_t)(pc+1));
+            /* Detect 2-PHA RTS-as-JMP: LDA hi/PHA / LDA lo/PHA / RTS.
+             * Also detect "outer continuation" pattern: function starts with
+             * LDA #cont_hi/PHA / LDA #cont_lo/PHA, then does computation, then
+             * LDA tbl_hi/PHA / LDA tbl_lo/PHA / RTS.  The 4-PHA detector above
+             * misses this because the PHAs are not at fixed offsets (computation
+             * breaks the pc-9/pc-12 spacing).  After calling the inner handler,
+             * we must also call the static outer continuation. */
+            } else if (pc >= 0x8001 && (pc - 1) >= func_base && rom_read(rom, bank, pc - 1) == 0x48 /* PHA */ &&
+                       is_insn_boundary_from(rom, bank, func_base, (uint16_t)(pc - 1), pc)) {
+                /* Check for outer continuation: scan backwards for LDA #hi/PHA/LDA #lo/PHA.
+                 * Works both when the pattern is at func_base (original case) and when it
+                 * starts at a branch-target block entry within the function (e.g., $BAD9
+                 * is a goto target inside an outer function, but func_base is the outer
+                 * function start — the backward scan finds the inner block's push). */
+                int has_outer_cont = 0;
+                uint16_t outer_cont_target = 0;
+                for (int _back = 6; _back <= 128; _back++) {
+                    if (pc < (uint16_t)(0x8000 + _back + 5)) break;
+                    uint16_t _probe = (uint16_t)(pc - _back);
+                    if (_probe < func_base) break;  /* don't scan into preceding function */
+                    if (rom_read(rom, bank, _probe)   == 0xA9 /* LDA #imm */ &&
+                        rom_read(rom, bank, _probe+2) == 0x48 /* PHA */ &&
+                        rom_read(rom, bank, _probe+3) == 0xA9 /* LDA #imm */ &&
+                        rom_read(rom, bank, _probe+5) == 0x48 /* PHA */) {
+                        uint8_t hi_val = rom_read(rom, bank, _probe+1);
+                        uint8_t lo_val = rom_read(rom, bank, _probe+4);
+                        uint16_t tgt = (uint16_t)(((uint16_t)hi_val << 8) | lo_val) + 1;
+                        /* Outer continuations must be in the fixed bank ($C000+).
+                         * Switchable-bank addresses are false positives — the bank
+                         * may have changed by the time we'd return to them. */
+                        if (tgt >= 0xC000 && tgt != (uint16_t)(pc + 1)) {
+                            outer_cont_target = tgt;
+                            has_outer_cont = 1;
+                            break;
+                        }
+                    }
+                }
+                if (has_outer_cont) {
+                    /* Pop inner handler, call it, discard outer cont bytes, call cont.
+                     * The dispatched function's RTS consumes the caller's JSR push,
+                     * so skip the standard RTS pop below. */
+                    fprintf(f, "{ g_cpu.S++; uint8_t _lo=g_ram[0x100+g_cpu.S]; g_cpu.S++; uint8_t _hi=g_ram[0x100+g_cpu.S]; call_by_address(((uint16_t)_hi<<8|_lo)+1); g_cpu.S+=2; call_by_address(0x%04X); }\n    ", outer_cont_target);
+                } else {
+                    /* Pop pushed address, dispatch to computed target.
+                     * The dispatched function's RTS consumes the caller's JSR push,
+                     * so skip the standard RTS pop below. */
+                    fprintf(f, "{ g_cpu.S++; uint8_t _lo=g_ram[0x100+g_cpu.S]; g_cpu.S++; uint8_t _hi=g_ram[0x100+g_cpu.S]; call_by_address_tail(((uint16_t)_hi<<8|_lo)+1, -1); }\n    ");
+                }
+                /* RTS-as-JMP: the dispatched function's own RTS pops the
+                 * caller's JSR return from the 6502 stack. Don't double-pop. */
+                goto rts_done;
+            }
+            if (s_abort_idiom_func) {
+                /* "PLA PLA RTS = return two levels up" idiom (see emit_function).
+                 * The discarded own return address does not exist in the
+                 * direct-call model, so the idiom's PLAs underflowed g_cpu.S.
+                 * Undo any small net rise (1..8 bytes) so S never wanders into
+                 * low RAM. Runtime S-compare: a no-op on the balanced
+                 * PHA..PLA..RTS shape (S == _entryS) and on the normal path of a
+                 * conditional guard (the PLAs were branched over). */
+                fprintf(f, "{ uint8_t _r=(uint8_t)(g_cpu.S - _entryS); if (_r>=1 && _r<=8) g_cpu.S = _entryS; }\n");
+            }
+            if (cfg->push_all_jsr) {
+                fprintf(f, "{ g_cpu.S++; uint8_t _rts_lo = g_ram[0x100 + g_cpu.S]; g_cpu.S++; uint8_t _rts_hi = g_ram[0x100 + g_cpu.S]; g_rts_target = (uint16_t)(((uint16_t)_rts_hi << 8) | _rts_lo); } /* pop JSR return address */\n");
+            }
+            rts_done:
+            fprintf(f, "\n#ifdef RECOMP_STACK_TRACKING\n    recomp_stack_pop();\n#endif\n    return;\n");
+            break;
+        case MN_RTI:
+            fprintf(f, "/* RTI */ g_rti_source = 0x%04X; g_rti_bank = %d; g_cpu.S++; ", pc, bank);
+            fprintf(f,
+                "{ uint8_t p=g_ram[0x100+g_cpu.S]; "
+                "g_cpu.N=(p>>7)&1; g_cpu.V=(p>>6)&1; g_cpu.D=(p>>3)&1; "
+                "g_cpu.I=(p>>2)&1; g_cpu.Z=(p>>1)&1; g_cpu.C=p&1; }\n"
+                "    g_cpu.S++; { uint8_t _rti_lo = g_ram[0x100+g_cpu.S];\n"
+                "    g_cpu.S++; uint8_t _rti_hi = g_ram[0x100+g_cpu.S];\n"
+                "    g_rti_target = (_rti_hi << 8) | _rti_lo; }\n"
+                "#ifdef RECOMP_STACK_TRACKING\n    recomp_stack_pop();\n#endif\n"
+                "    return;\n");
+            break;
+
+        /* Flags */
+        case MN_CLC: fprintf(f, "g_cpu.C = 0;\n"); break;
+        case MN_SEC: fprintf(f, "g_cpu.C = 1;\n"); break;
+        case MN_CLD: fprintf(f, "g_cpu.D = 0;\n"); break;
+        case MN_SED: fprintf(f, "g_cpu.D = 1;\n"); break;
+        case MN_CLI: fprintf(f, "g_cpu.I = 0;\n"); break;
+        case MN_SEI: fprintf(f, "g_cpu.I = 1;\n"); break;
+        case MN_CLV: fprintf(f, "g_cpu.V = 0;\n"); break;
+
+        case MN_NOP: fprintf(f, "/* NOP */\n"); break;
+        case MN_NOP_READ:
+            /* DOP/TOP — unofficial NOP that performs a single operand read.
+             * The result is discarded but the read side-effect (e.g. on
+             * \$2002 PPUSTATUS clearing the latch) must occur for bus-
+             * accurate behavior. AM_IMM operands have no read; the size
+             * field already accounts for the immediate byte. */
+            if (e->addr_mode == AM_IMM) {
+                fprintf(f, "/* NOP* (unofficial NOP, immediate operand discarded) */\n");
+            } else {
+                fprintf(f, "(void)nes_read(%s); /* NOP* (unofficial DOP/TOP read, result discarded) */\n",
+                        operand_addr_expr(e->addr_mode, op1, op2));
+            }
+            break;
+        case MN_SAX:
+            /* SAX — unofficial: M = A & X. No flags affected, no register
+             * changes. Stable across NMOS variants per NESdev. */
+            fprintf(f, "nes_write(%s, g_cpu.A & g_cpu.X); /* SAX */\n",
+                    operand_addr_expr(e->addr_mode, op1, op2));
+            break;
+        case MN_BRK:
+            /* BRK was previously emitted as a comment, leaving execution to
+             * fall through past the $00 byte. That's silent control-flow
+             * loss when the BRK is actually reachable. The runtime hook
+             * nes_brk_executed records the site and applies the configured
+             * BrkPolicy (DIAG/FATAL/TRAP); we then `return;` so the
+             * enclosing function exits at the BRK site rather than
+             * continuing past it. Real BRK semantics (push PC+2, push P|B,
+             * IRQ-vector dispatch) are not implemented yet — see
+             * nes_runtime.h. */
+            fprintf(f, "nes_brk_executed(0x%04X); return;\n", pc);
+            break;
+
+        default:
+            fprintf(f, "/* unhandled mnemonic %d */\n", e->mnemonic);
+            break;
+    }
+
+    return e->size;
+}
+
+/* Determine if an address is a branch target within this function's range */
+static bool is_branch_target(const NESRom *rom, int bank,
+                              uint16_t func_start, int func_size_bytes,
+                              uint16_t addr) {
+    /* Scan the function for branch instructions pointing to addr */
+    uint16_t pc = func_start;
+    int fixed = rom->prg_banks - 1;
+    int scan_bank = (func_start >= 0xC000) ? fixed : bank;
+    int bytes = 0;
+
+    while (bytes < func_size_bytes && bytes < MAX_INSNS_PER_FUNC * 3) {
+        uint8_t opcode = rom_read(rom, scan_bank, pc);
+        const OpcodeEntry *e = &g_opcode_table[opcode];
+        if (e->size == 0) break;
+
+        /* Check if this is a branch */
+        switch (e->mnemonic) {
+            case MN_BCC: case MN_BCS: case MN_BEQ: case MN_BNE:
+            case MN_BMI: case MN_BPL: case MN_BVC: case MN_BVS: {
+                int8_t off = (int8_t)rom_read(rom, scan_bank, pc+1);
+                uint16_t target = pc + 2 + off;
+                if (target == addr) return true;
+                break;
+            }
+            default: break;
+        }
+        pc += e->size;
+        bytes += e->size;
+    }
+    return false;
+}
+
+/* Check if a function address+bank falls within an SRAM-to-ROM mapped region.
+ * SRAM functions run from RAM and bank-switch during execution, so JSR calls
+ * to the switchable bank range ($8000-$BFFF) must use dynamic dispatch. */
+static int is_sram_sourced(const GameConfig *cfg, int bank, uint16_t addr) {
+    for (int i = 0; i < cfg->sram_map_count; i++) {
+        const SramMap *m = &cfg->sram_maps[i];
+        if (bank == m->bank && addr >= m->rom_start && addr < m->rom_start + m->size)
+            return 1;
+    }
+    return 0;
+}
+
+/* Open a standalone function: signature, optional symbol comment, and
+ * stack-tracking push. Caller must close with `}`. */
+static void emit_function_open(FILE *f, const GameConfig *cfg,
+                               uint16_t addr, int bank, int fixed_bank,
+                               const char *sym_name) {
+    char nm[32];
+    format_func_name(nm, sizeof nm, addr, bank, fixed_bank);
+    codegen_record_actual_wrapper(addr, bank);
+    fprintf(f, "void %s(void) {", nm);
+    if (sym_name) fprintf(f, " /* %s */", sym_name);
+    fprintf(f, "\n");
+    emit_mod_function_hook(f, cfg, fixed_bank, addr, bank);
+    fprintf(f, "#ifdef RECOMP_STACK_TRACKING\n");
+    fprintf(f, "    recomp_stack_push(\"%s\");\n", nm);
+    fprintf(f, "#endif\n");
+}
+
+/* Open a multi-entry _body function: signature and optional symbol comment.
+ * Stack-tracking is handled by the wrapper, not here.
+ * EXTERNAL linkage (not `static`): bank sub-sharding can place a body in a
+ * different part TU than its own wrapper(s) or a same-bank BodyAlias caller,
+ * so every body needs a real forward declaration in the shared decls header
+ * (see codegen_record_body_owner / the split-TU note near codegen_emit). */
+static void emit_function_body_open(FILE *f, uint16_t addr, int bank, int fixed_bank,
+                                    const char *sym_name) {
+    char nm[32];
+    format_func_name(nm, sizeof nm, addr, bank, fixed_bank);
+    fprintf(f, "void %s_body(int _entry) {", nm);
+    if (sym_name) fprintf(f, " /* %s */", sym_name);
+    fprintf(f, "\n");
+    codegen_record_body_owner(addr, bank);
+}
+
+/* Emit a thin wrapper that pushes the stack-tracker, calls the multi-entry body
+ * with `entry_index`, and pops. Used for the primary entry (entry_index=0) and
+ * for each public secondary entry. */
+static void emit_wrapper(FILE *f, const GameConfig *cfg,
+                         uint16_t wrapper_addr, int wrapper_bank,
+                         uint16_t body_addr, int body_bank, int fixed_bank,
+                         int entry_index, const char *sym_name) {
+    char wname[32], bname[32];
+    format_func_name(wname, sizeof wname, wrapper_addr, wrapper_bank, fixed_bank);
+    format_func_name(bname, sizeof bname, body_addr, body_bank, fixed_bank);
+    codegen_record_actual_wrapper(wrapper_addr, wrapper_bank);
+    fprintf(f, "void %s(void) {", wname);
+    if (sym_name) fprintf(f, " /* %s */", sym_name);
+    fprintf(f, "\n");
+    /* Per ENTRY, not per body: a multi-entry function's secondary entries are
+     * distinct 6502 addresses and a mod may claim one without the others. */
+    emit_mod_function_hook(f, cfg, fixed_bank, wrapper_addr, wrapper_bank);
+    fprintf(f, "#ifdef RECOMP_STACK_TRACKING\n");
+    fprintf(f, "    recomp_stack_push(\"%s\");\n", wname);
+    fprintf(f, "#endif\n");
+    fprintf(f, "    %s_body(%d);\n", bname, entry_index);
+    fprintf(f, "#ifdef RECOMP_STACK_TRACKING\n");
+    fprintf(f, "    recomp_stack_pop();\n");
+    fprintf(f, "#endif\n");
+    fprintf(f, "}\n\n");
+}
+
+static void emit_function(FILE *f, const NESRom *rom, const FunctionEntry *fe,
+                          const FunctionList *funcs, const AnnotationTable *at,
+                          const GameConfig *cfg) {
+    int fixed_bank = rom->prg_banks - 1;
+    int bank = fe->bank;
+    uint16_t pc = fe->addr;
+    int sram_sourced = is_sram_sourced(cfg, bank, fe->addr);
+
+    /* Skip functions marked as replace_func — their bodies are provided
+     * by custom C implementations in extras.c. */
+    if (replace_func_matches_member(cfg, fixed_bank, pc, bank)) return;
+    if (!should_emit_native_body(rom, cfg, fe)) return;
+
+    /* Function-level annotation (appears before the signature) */
+    const char *fann = annotation_lookup(at, bank, pc);
+    if (fann) fprintf(f, "/* NOTE: %s */\n", fann);
+
+    /* Pre-scan: collect all valid instruction-start addresses within this function.
+     * Mimics the emission loop's stop logic (stops at RTS/JMP/RTI/BRK when no pending
+     * forward branches remain). This prevents overrunning into neighboring functions. */
+    uint16_t valid_starts[MAX_INSNS_PER_FUNC];
+    int valid_count = 0;
+    /* Collect merge partner addresses for this function */
+    uint16_t merge_partners[256];
+    int merge_partner_count = 0;
+    for (int mi = 0; mi < cfg->merge_func_count; mi++) {
+        if (cfg->merge_funcs[mi].bank != bank) continue;
+        if (cfg->merge_funcs[mi].addr_lo == pc) {
+            if (merge_partner_count < 256)
+                merge_partners[merge_partner_count++] = cfg->merge_funcs[mi].addr_hi;
+        }
+    }
+    /* Expand merge_range: if this function is the canonical (lowest) entry in
+     * a merge_range, collect ALL other functions in the range as partners. */
+    for (int ri = 0; ri < cfg->merge_range_count; ri++) {
+        if (cfg->merge_ranges[ri].bank != bank) continue;
+        if (pc < cfg->merge_ranges[ri].addr_lo || pc > cfg->merge_ranges[ri].addr_hi) continue;
+        /* Find canonical (lowest) function entry in this range */
+        uint16_t canonical = 0xFFFF;
+        for (int fi = 0; fi < funcs->count; fi++) {
+            uint16_t fa = funcs->entries[fi].addr;
+            int fb = funcs->entries[fi].bank;
+            if (fb != bank) continue;
+            if (fa >= cfg->merge_ranges[ri].addr_lo && fa <= cfg->merge_ranges[ri].addr_hi) {
+                if (fa < canonical) canonical = fa;
+            }
+        }
+        if (pc != canonical) break; /* only canonical collects partners */
+        /* Add all other functions in the range as merge partners */
+        for (int fi = 0; fi < funcs->count; fi++) {
+            uint16_t fa = funcs->entries[fi].addr;
+            int fb = funcs->entries[fi].bank;
+            if (fb != bank || fa == pc) continue;
+            if (fa < cfg->merge_ranges[ri].addr_lo || fa > cfg->merge_ranges[ri].addr_hi) continue;
+            /* Deduplicate */
+            bool dup = false;
+            for (int di = 0; di < merge_partner_count; di++)
+                if (merge_partners[di] == fa) { dup = true; break; }
+            if (!dup && merge_partner_count < 256)
+                merge_partners[merge_partner_count++] = fa;
+        }
+        break;
+    }
+
+    {
+        uint16_t scan = pc;
+        uint16_t ps_pending[MAX_SECONDARY_ENTRIES];
+        int ps_pending_count = 0;
+        /* Seed pending list with merge partners so scanning includes their code */
+        for (int mi = 0; mi < merge_partner_count; mi++) {
+            ps_pending[ps_pending_count++] = merge_partners[mi];
+        }
+        for (int i = 0; i < MAX_INSNS_PER_FUNC; i++) {
+            if (scan < 0x8000) break;
+            if (rom_mapper40(rom) &&
+                (scan >= 0xC000 || (scan & 0xE000) != (pc & 0xE000)))
+                break;
+            /* Remove this address from ps_pending (we're visiting it now) */
+            for (int p = 0; p < ps_pending_count; p++) {
+                if (ps_pending[p] == scan) {
+                    ps_pending[p] = ps_pending[--ps_pending_count];
+                    break;
+                }
+            }
+            valid_starts[valid_count++] = scan;
+            uint8_t op = rom_read(rom, bank, scan);
+            const OpcodeEntry *e2 = &g_opcode_table[op];
+            int sz = (e2->size > 0) ? e2->size : 1;
+            bool ps_base_straddles = false;
+            if (mapper40_reaches_8k_boundary(rom, scan, sz,
+                                             &ps_base_straddles) &&
+                ps_base_straddles)
+                break;
+            /* Trampoline / inline_dispatch JSR: may consume more than 3 bytes */
+            if (e2->mnemonic == MN_JSR) {
+                uint8_t _lo = rom_read(rom, bank, scan + 1);
+                uint8_t _hi = rom_read(rom, bank, scan + 2);
+                uint16_t _tgt = _lo | ((uint16_t)_hi << 8);
+                for (int _ti = 0; _ti < cfg->trampoline_count; _ti++) {
+                    if (_tgt == cfg->trampolines[_ti].addr) {
+                        sz = 3 + cfg->trampolines[_ti].inline_bytes;
+                        break;
+                    }
+                }
+                for (int _ti = 0; _ti < cfg->inline_dispatch_count; _ti++) {
+                    if (_tgt == cfg->inline_dispatches[_ti].addr) {
+                        /* Count inline table bytes */
+                        uint16_t _tpc = scan + 3;
+                        uint8_t _min_hi = rom_mapper40(rom) ? 0x60 : 0x80;
+                        while (rom_read(rom, bank, _tpc + 1) >= _min_hi) _tpc += 2;
+                        sz = (int)(_tpc - scan);
+                        break;
+                    }
+                }
+                for (int _ti = 0; _ti < cfg->inline_pointer_count; _ti++) {
+                    if (_tgt == cfg->inline_pointers[_ti].addr) {
+                        sz = 5;
+                        break;
+                    }
+                }
+                for (int _ti = 0; _ti < cfg->nop_jsr_count; _ti++) {
+                    if (_tgt == cfg->nop_jsrs[_ti]) {
+                        sz = 3; /* just the JSR, no inline data */
+                        break;
+                    }
+                }
+            }
+            bool ps_straddles = false;
+            int ps_instruction_size = e2->size > 0 ? e2->size : 1;
+            if (mapper40_reaches_8k_boundary(rom, scan, ps_instruction_size,
+                                             &ps_straddles))
+                break;
+            /* Track forward branch targets so we continue past early RTS/JMP */
+            switch (e2->mnemonic) {
+                case MN_BCC: case MN_BCS: case MN_BEQ: case MN_BNE:
+                case MN_BMI: case MN_BPL: case MN_BVC: case MN_BVS: {
+                    int8_t off = (int8_t)rom_read(rom, bank, scan + 1);
+                    uint16_t tgt = scan + 2 + (int16_t)off;
+                    if (tgt > scan && tgt >= pc && ps_pending_count < MAX_SECONDARY_ENTRIES) {
+                        bool found = false;
+                        for (int p = 0; p < ps_pending_count; p++)
+                            if (ps_pending[p] == tgt) { found = true; break; }
+                        if (!found) ps_pending[ps_pending_count++] = tgt;
+                    }
+                    break;
+                }
+                default: break;
+            }
+            /* For JMP to merge partner: add target as pending (continue scan through it) */
+            if (e2->mnemonic == MN_JMP && e2->addr_mode == AM_ABS) {
+                uint8_t jmp_lo = rom_read(rom, bank, scan + 1);
+                uint8_t jmp_hi = rom_read(rom, bank, scan + 2);
+                uint16_t jmp_tgt = jmp_lo | ((uint16_t)jmp_hi << 8);
+                for (int mi = 0; mi < merge_partner_count; mi++) {
+                    if (jmp_tgt == merge_partners[mi] && ps_pending_count < MAX_SECONDARY_ENTRIES) {
+                        bool found = false;
+                        for (int p = 0; p < ps_pending_count; p++)
+                            if (ps_pending[p] == jmp_tgt) { found = true; break; }
+                        if (!found) ps_pending[ps_pending_count++] = jmp_tgt;
+                    }
+                }
+                /* Also add the function's own base as a merge partner target */
+                if (jmp_tgt == pc && ps_pending_count < MAX_SECONDARY_ENTRIES) {
+                    bool found = false;
+                    for (int p = 0; p < ps_pending_count; p++)
+                        if (ps_pending[p] == jmp_tgt) { found = true; break; }
+                    if (!found) ps_pending[ps_pending_count++] = jmp_tgt;
+                }
+            }
+            if (e2->mnemonic == MN_JMP && e2->addr_mode == AM_IND) {
+                uint16_t cont = 0;
+                if (configured_indirect_continuation(rom, cfg, bank, pc, scan, &cont)) {
+                    bool found = false;
+                    for (int p = 0; p < ps_pending_count; p++)
+                        if (ps_pending[p] == cont) { found = true; break; }
+                    if (!found && ps_pending_count < MAX_SECONDARY_ENTRIES)
+                        ps_pending[ps_pending_count++] = cont;
+                }
+            }
+            if (mn_finder_illegal(e2->mnemonic)) { scan += sz; continue; }
+            /* 4-PHA dispatch RTS: continuation (scan+1) must be included in scan */
+            if (e2->mnemonic == MN_RTS && scan >= 0x800D &&
+                rom_read(rom, bank, scan-1)  == 0x48 &&
+                rom_read(rom, bank, scan-5)  == 0x48 &&
+                rom_read(rom, bank, scan-9)  == 0x48 &&
+                rom_read(rom, bank, scan-12) == 0x48 &&
+                is_insn_boundary_from(rom, bank, pc, (uint16_t)(scan - 1), scan)) {
+                uint16_t cont = scan + 1;
+                bool found = false;
+                for (int p = 0; p < ps_pending_count; p++)
+                    if (ps_pending[p] == cont) { found = true; break; }
+                if (!found && ps_pending_count < MAX_SECONDARY_ENTRIES) ps_pending[ps_pending_count++] = cont;
+            }
+            /* Stop at terminal instructions when no pending forward branches */
+            if (e2->mnemonic == MN_RTS || e2->mnemonic == MN_RTI ||
+                e2->mnemonic == MN_BRK || e2->mnemonic == MN_JMP) {
+                if (ps_pending_count == 0) break;
+                if (e2->mnemonic == MN_JMP) {
+                    uint16_t next = next_pending_after(scan, ps_pending, ps_pending_count);
+                    if (next) {
+                        scan = next;
+                        continue;
+                    }
+                }
+            }
+            scan += sz;
+        }
+    }
+
+    /* Detect the "PLA PLA RTS = return two levels up (abort caller)" JSR idiom:
+     * a contiguous 68 68 60 at a real instruction boundary. On real hardware the
+     * two PLAs discard THIS subroutine's own return address (pushed by the JSR
+     * that called it), so the following RTS returns to the caller's caller — a
+     * "if condition, abort my caller too" guard. The recompiler models JSR as a
+     * direct C call that does NOT push the return address onto g_cpu.S, so the two
+     * PLAs UNDERFLOW: S climbs and can wrap past $FF into the $0100 stack page,
+     * corrupting anything a game parks there (e.g. Yoshi's Cookie's VRAM update
+     * buffer -> stage-clear tile-overrun). The mirror idiom PHA-PHA-RTS
+     * (RTS-as-computed-JMP) is already handled at the RTS emitter; this is its
+     * unhandled twin. We flag the function here and, at each plain RTS, undo any
+     * net stack rise (see MN_RTS). push_all_jsr games keep the real return chain
+     * on the 6502 stack, so the idiom is already faithful there — skip them. */
+    s_abort_idiom_func = false;
+    if (!cfg->push_all_jsr) {
+        for (int v = 0; v < valid_count; v++) {
+            uint16_t s = valid_starts[v];
+            if (rom_read(rom, bank, s)     == 0x68 &&   /* PLA */
+                rom_read(rom, bank, s + 1) == 0x68 &&   /* PLA */
+                rom_read(rom, bank, s + 2) == 0x60) {   /* RTS */
+                s_abort_idiom_func = true;
+                break;
+            }
+        }
+    }
+
+    /* Detect secondary entry points (extra_label and merge_func addresses inside this function).
+     * Also add alias-only entry labels for omitted in-body function entries so direct
+     * JMPs can target the owning body without requiring a standalone wrapper. */
+    uint16_t secondary_addrs[MAX_SECONDARY_ENTRIES];
+    int owner_index = codegen_find_function_index(funcs, pc, bank);
+    int secondary_count = collect_secondary_addrs(
+        rom, funcs, cfg, owner_index, secondary_addrs, MAX_SECONDARY_ENTRIES);
+    int public_secondary_count = secondary_count;
+    uint16_t internal_alias_addrs[MAX_SECONDARY_ENTRIES];
+    int internal_alias_count = collect_internal_alias_addrs(rom, funcs, cfg,
+                                                            codegen_find_function_index(funcs, pc, bank),
+                                                            secondary_addrs, secondary_count,
+                                                            internal_alias_addrs, MAX_SECONDARY_ENTRIES);
+    for (int ai = 0; ai < internal_alias_count && secondary_count < MAX_SECONDARY_ENTRIES; ai++) {
+        secondary_addrs[secondary_count++] = internal_alias_addrs[ai];
+    }
+
+    int is_multi_entry = (secondary_count > 0);
+
+    /* Emit function signature — for multi-entry, emit a static _body function */
+    const char *sym_name = g_symtab ? symbol_lookup_bank(g_symtab, pc, bank) : NULL;
+    if (is_multi_entry) {
+        emit_function_body_open(f, pc, bank, fixed_bank, sym_name);
+        /* Capture entry S before the entry-dispatch switch so it is initialized
+         * on every secondary-entry path (the switch's gotos must not skip it). */
+        if (s_abort_idiom_func) fprintf(f, "    uint8_t _entryS = g_cpu.S; (void)_entryS;\n");
+        /* Entry dispatch — jump to secondary entry label */
+        fprintf(f, "    switch (_entry) {\n");
+        for (int si = 0; si < secondary_count; si++) {
+            fprintf(f, "        case %d: goto label_%04X;\n", si + 1, secondary_addrs[si]);
+        }
+        fprintf(f, "    }\n");
+    } else {
+        emit_function_open(f, cfg, pc, bank, fixed_bank, sym_name);
+        if (s_abort_idiom_func) fprintf(f, "    uint8_t _entryS = g_cpu.S; (void)_entryS;\n");
+    }
+
+    /* Pending forward branch targets — branches that jump past a RTS/JMP.
+     * We continue emitting after the stop instruction until all pending are covered.
+     * Seed with merge partners so emission continues through their code. */
+    uint16_t pending[MAX_SECONDARY_ENTRIES];
+    int pending_count = 0;
+    for (int mi = 0; mi < merge_partner_count && pending_count < MAX_SECONDARY_ENTRIES; mi++) {
+        pending[pending_count++] = merge_partners[mi];
+    }
+    for (int si = 0; si < secondary_count && pending_count < MAX_SECONDARY_ENTRIES; si++) {
+        uint16_t sa = secondary_addrs[si];
+        if (sa == pc) continue;
+        if (!contains_addr(pending, pending_count, sa))
+            pending[pending_count++] = sa;
+    }
+    /* Branch-target set: RTS addresses that are direct branch targets bypass PHA setup;
+     * they must be emitted as regular returns, not 2-PHA dispatches. */
+    uint16_t branch_targets[256];
+    int branch_targets_count = 0;
+    int pending_pha_count = 0; /* net PHAs pushed without matching PLA (for non-adjacent dispatch) */
+
+    /* Track addresses emitted as labels in this function, so JMP can use goto
+     * for backward jumps within the function body (avoiding mutual tail-call recursion). */
+    uint16_t emitted_addrs[MAX_INSNS_PER_FUNC];
+    int emitted_count = 0;
+
+    /* Coroutine scheduler detection: if we see LDX #$FF; TXS (stack reset to $FF),
+     * this function contains a scheduler loop. Record the LDX address so that
+     * coroutine START (JMP ind) and RESUME (RTS after TXS) can goto it. */
+    uint16_t sched_reset_addr = 0;
+
+    /* effective_bank is passed to emit_instruction for inline_dispatch resolution.
+     * For switchable-bank functions, effective_bank == bank.
+     * For fixed-bank functions, each inline_dispatch does its own backward scan. */
+    int effective_bank = bank;
+
+    uint16_t cursor = pc;
+    for (int insn = 0; insn < MAX_INSNS_PER_FUNC; insn++) {
+        if (rom_mapper40(rom) &&
+            (cursor >= 0xC000 || (cursor & 0xE000) != (pc & 0xE000)))
+            break;
+        fprintf(f, "label_%04X:;", cursor);
+        emit_sym(f, cursor, bank);
+        fprintf(f, "\n");
+        emit_mod_internal_hook(f, cfg, fixed_bank, cursor, bank, is_multi_entry != 0);
+        if (emitted_count < MAX_INSNS_PER_FUNC)
+            emitted_addrs[emitted_count++] = cursor;
+
+        /* Instruction-level annotation (skipped at function start — already shown above) */
+        if (cursor != pc) {
+            const char *iann = annotation_lookup(at, bank, cursor);
+            if (iann) fprintf(f, "    /* NOTE: %s */\n", iann);
+        }
+
+        /* Remove this address from pending (we're emitting it now) */
+        for (int p = 0; p < pending_count; p++) {
+            if (pending[p] == cursor) {
+                pending[p] = pending[--pending_count];
+                break;
+            }
+        }
+
+        uint8_t opcode = rom_read(rom, bank, cursor);
+        const OpcodeEntry *e = &g_opcode_table[opcode];
+        int instruction_size = e->size > 0 ? e->size : 1;
+        bool boundary_straddles = false;
+        bool boundary_after = mapper40_reaches_8k_boundary(
+            rom, cursor, instruction_size, &boundary_straddles);
+
+        if (boundary_straddles) {
+            fprintf(f,
+                    "    /* Mapper 40 instruction fetch crosses an 8KB PRG window. */\n"
+                    "    nes_interp_step_tail((uint16_t)(g_code_window_base | 0x%04X), %d); return;\n",
+                    cursor & 0x1FFF, bank);
+            break;
+        }
+
+        /* Track forward branch targets (only non-cross-function ones go into pending) */
+        switch (e->mnemonic) {
+            case MN_BCC: case MN_BCS: case MN_BEQ: case MN_BNE:
+            case MN_BMI: case MN_BPL: case MN_BVC: case MN_BVS: {
+                int8_t off = (int8_t)rom_read(rom, bank, cursor + 1);
+                uint16_t tgt = cursor + 2 + off;
+                /* Only track as pending if it's a local forward target
+                 * (not a cross-function branch — those get tail-call treatment) */
+                if (tgt > cursor && tgt >= pc
+                        && is_valid_label_target(tgt, valid_starts, valid_count, rom, bank)
+                        && pending_count < MAX_SECONDARY_ENTRIES) {
+                    /* Check not already in pending */
+                    bool found = false;
+                    for (int p = 0; p < pending_count; p++)
+                        if (pending[p] == tgt) { found = true; break; }
+                    if (!found) pending[pending_count++] = tgt;
+                    /* Record as branch target: RTS at tgt would bypass any PHA setup */
+                    bool bt_found = false;
+                    for (int b = 0; b < branch_targets_count; b++)
+                        if (branch_targets[b] == tgt) { bt_found = true; break; }
+                    if (!bt_found && branch_targets_count < 256) branch_targets[branch_targets_count++] = tgt;
+                }
+                break;
+            }
+            default: break;
+        }
+
+        /* Pushed-continuation JMP: the callee's RTS returns into a
+         * forward address in this same body, so keep emitting through that
+         * continuation after skipping any intervening table/data bytes. */
+        if (e->mnemonic == MN_JMP) {
+            uint16_t cont = 0;
+            if (configured_indirect_continuation(rom, cfg, bank, pc, cursor, &cont)) {
+                bool found = false;
+                for (int p = 0; p < pending_count; p++)
+                    if (pending[p] == cont) { found = true; break; }
+                if (!found && pending_count < MAX_SECONDARY_ENTRIES)
+                    pending[pending_count++] = cont;
+            }
+        }
+
+        /* 4-PHA dispatch RTS: add cont (cursor+1) to pending so emit loop continues */
+        if (e->mnemonic == MN_RTS && cursor >= 0x800D &&
+            rom_read(rom, bank, cursor-1)  == 0x48 &&
+            rom_read(rom, bank, cursor-5)  == 0x48 &&
+            rom_read(rom, bank, cursor-9)  == 0x48 &&
+            rom_read(rom, bank, cursor-12) == 0x48 &&
+            is_insn_boundary_from(rom, bank, pc, (uint16_t)(cursor - 1), cursor)) {
+            uint16_t cont = cursor + 1;
+            bool found = false;
+            for (int p = 0; p < pending_count; p++)
+                if (pending[p] == cont) { found = true; break; }
+            if (!found && pending_count < MAX_SECONDARY_ENTRIES) pending[pending_count++] = cont;
+        }
+
+        /* If this RTS is a direct branch target, the PHA setup was bypassed —
+         * emit a regular return instead of a 2-PHA dispatch. */
+        if (e->mnemonic == MN_RTS && cursor >= 0x8001 &&
+            rom_read(rom, bank, cursor - 1) == 0x48) {
+            bool is_branch_tgt = false;
+            for (int b = 0; b < branch_targets_count; b++)
+                if (branch_targets[b] == cursor) { is_branch_tgt = true; break; }
+            if (is_branch_tgt) {
+                fprintf(f, "    /* $%04X: 60 */\n", cursor);
+                if (cfg->push_all_jsr) fprintf(f, "    g_cpu.S += 2; /* pop JSR return address */\n");
+                fprintf(f, "#ifdef RECOMP_STACK_TRACKING\n    recomp_stack_pop();\n#endif\n    return; /* branch-target RTS */\n");
+                if (pending_count == 0) break;
+                cursor += 1;
+                continue;
+            }
+        }
+
+        /* Detect coroutine scheduler stack reset: LDX #$FF ($A2 $FF) followed by
+         * TXS ($9A). When found, record the LDX address as the scheduler loop entry. */
+        if (rom_read(rom, bank, cursor) == 0x9A /* TXS */ &&
+            cursor >= 2 &&
+            rom_read(rom, bank, cursor - 2) == 0xA2 /* LDX #imm */ &&
+            rom_read(rom, bank, cursor - 1) == 0xFF) {
+            sched_reset_addr = cursor - 2;
+        }
+
+        int consumed = emit_instruction(f, rom, bank, cursor, pc, fixed_bank, funcs,
+                                        valid_starts, valid_count, cfg, sram_sourced,
+                                        effective_bank,
+                                        merge_partners, merge_partner_count,
+                                        emitted_addrs, emitted_count,
+                                        sched_reset_addr);
+
+        if (boundary_after && e->mnemonic != MN_JMP &&
+            e->mnemonic != MN_RTS && e->mnemonic != MN_RTI &&
+            e->mnemonic != MN_BRK) {
+            fprintf(f,
+                    "    call_by_address_tail((uint16_t)(g_code_window_base + 0x2000), %d); return;\n",
+                    bank);
+            break;
+        }
+
+        /* If this PHA is immediately followed by a branch-target RTS, the fall-through path
+         * must dispatch now (before reaching the RTS label, which is bypassed by branches).
+         * Emit the 2-PHA dispatch inline and return; the branch path will hit label_RTS: return. */
+        if (e->mnemonic == MN_PHA) {
+            uint16_t next = cursor + 1;
+            if (next >= 0x8001 && rom_read(rom, bank, next) == 0x60) {
+                bool is_branch_tgt = false;
+                for (int b = 0; b < branch_targets_count; b++)
+                    if (branch_targets[b] == next) { is_branch_tgt = true; break; }
+                if (is_branch_tgt) {
+                    fprintf(f, "    { g_cpu.S++; uint8_t _lo=g_ram[0x100+g_cpu.S]; g_cpu.S++; uint8_t _hi=g_ram[0x100+g_cpu.S]; call_by_address_tail(((uint16_t)_hi<<8|_lo)+1, -1); }\n");
+                    fprintf(f, "    return;\n");
+                }
+            }
+        }
+
+        /* Update net PHA count for non-adjacent dispatch detection */
+        if (e->mnemonic == MN_PHA) pending_pha_count++;
+        else if (e->mnemonic == MN_PLA && pending_pha_count > 0) pending_pha_count--;
+
+        /* Non-adjacent 2-PHA dispatch: if the NEXT instruction is a branch-target RTS and
+         * 2 PHAs have been pushed earlier in this function without matching PLAs, emit the
+         * dispatch inline here (fall-through path). The RTS label handles branch paths.
+         * Example: $AC2D/$AC70 — PHA/PHA/LDY $00 / RTS(branch-target). */
+        if (e->mnemonic != MN_PHA && pending_pha_count >= 2) {
+            uint16_t _nxt = (uint16_t)(cursor + consumed);
+            if (_nxt >= 0x8001 && rom_read(rom, bank, _nxt) == 0x60 /* RTS */) {
+                bool _is_bt = false;
+                for (int _b = 0; _b < branch_targets_count; _b++)
+                    if (branch_targets[_b] == _nxt) { _is_bt = true; break; }
+                if (_is_bt) {
+                    fprintf(f, "    { g_cpu.S++; uint8_t _lo=g_ram[0x100+g_cpu.S]; g_cpu.S++; uint8_t _hi=g_ram[0x100+g_cpu.S]; call_by_address_tail(((uint16_t)_hi<<8|_lo)+1, -1); }\n");
+                    fprintf(f, "    return;\n");
+                }
+            }
+        }
+
+        /* Check stop conditions — only stop if no pending forward targets remain */
+        if (e->mnemonic == MN_RTS || e->mnemonic == MN_RTI || e->mnemonic == MN_BRK) {
+            if (pending_count == 0) break;
+            /* pending targets exist — continue emitting (reached only via goto) */
+            cursor += consumed;
+            continue;
+        }
+        if (e->mnemonic == MN_JMP) {
+            if (pending_count == 0) break;
+            uint16_t next = next_pending_after(cursor, pending, pending_count);
+            if (next)
+                cursor = next;
+            else
+                cursor += consumed;
+            continue;
+        }
+
+        cursor += consumed;
+    }
+
+    /* Fallback trampolines: every label referenced by either a "case N: goto"
+     * alias dispatch OR an in-body branch must be emitted somewhere in the
+     * function body.  When the linear emit walk didn't visit a given
+     * valid_starts entry, the goto target would otherwise be undefined.
+     *
+     * The fallback emits a plain return so the function exits cleanly if
+     * the goto ever fires.  Earlier this site dispatched via call_by_address
+     * to support the missing label as a true entry point — but that turned
+     * the fallback into a re-entry into the same function family (e.g.
+     * Gumshoe's bank-0 main loop fell through to label_F3BF and label_8087
+     * fallback trampolines, each call_by_address recursing back into the
+     * caller; the chain overflowed at depth 510).  call_by_address is wrong
+     * here: if the goto was reached, the in-body branch logic has already
+     * decided control should resume at this address inside this function;
+     * dispatching to the standalone wrapper for the same address re-enters
+     * the world from scratch and grows the C stack indefinitely.  Plain
+     * return drops the (possibly-misanalysed) branch and unwinds normally.
+     *
+     * NOTE: the deeper root cause (the title/menu wait-loop auto-advancing)
+     * is that function_finder splits one logical routine — E9B3/E9B6/E9B9/
+     * E950/EC9D — into separate functions, so the routine's BACKWARD branches
+     * (e.g. $E9D2 BEQ $E9B6, $E9E0 BEQ $E9B3) emit as call_by_address and the
+     * loop becomes C recursion.  Neither `return` (drops the loop) nor
+     * call_by_address (recurses) is correct; the fix is to keep intra-routine
+     * branch targets as in-body gotos (merge the mis-split functions). */
+    for (int vi = 0; vi < valid_count; vi++) {
+        uint16_t va = valid_starts[vi];
+        bool emitted = false;
+        for (int ei = 0; ei < emitted_count; ei++) {
+            if (emitted_addrs[ei] == va) { emitted = true; break; }
+        }
+        if (!emitted) {
+            fprintf(f, "label_%04X:; return;\n", va);
+        }
+    }
+
+    fprintf(f, "}\n\n");
+
+    /* For multi-entry functions, emit thin wrappers after the body */
+    if (is_multi_entry) {
+        /* Primary entry wrapper */
+        emit_wrapper(f, cfg, pc, bank, pc, bank, fixed_bank, 0, sym_name);
+        /* Secondary entry wrappers */
+        for (int si = 0; si < secondary_count; si++) {
+            uint16_t sa = secondary_addrs[si];
+            const char *sa_sym = g_symtab ? symbol_lookup_bank(g_symtab, sa, bank) : NULL;
+            if (si < public_secondary_count && suppress_merge_range_wrapper(cfg, bank, pc, sa))
+                continue;
+            if (si < public_secondary_count && prefer_merge_range_wrapper(cfg, bank, pc, sa))
+                continue;
+            emit_wrapper(f, cfg, sa, bank, pc, bank, fixed_bank, si + 1, sa_sym);
+        }
+    }
+}
+
+/* Emit dispatch table */
+static void emit_dispatch(FILE *f, const EmittedWrapper *wrappers, int wrapper_count,
+                          const NESRom *rom, const GameConfig *cfg) {
+    int fixed_bank = rom->prg_banks - 1;
+
+    fprintf(f,
+        "/* AUTO-GENERATED dispatch table. DO NOT EDIT. */\n"
+        "#include \"nes_runtime.h\"\n"
+        "extern int g_current_bank;\n\n"
+    );
+
+    /* push_all_jsr build flag, read by the interpreter fallback: its
+     * stack-boundary contract requires the 6502 RAM stack to mirror the C
+     * call stack, which only holds when every JSR pushes (push_all_jsr). */
+    fprintf(f,
+        "/* Interpreter-fallback precondition flag (see runner/src/interp.c). */\n"
+        "int g_recomp_push_all_jsr = %d;\n\n", cfg->push_all_jsr ? 1 : 0);
+
+    /* Forward-declare every dispatch target. The switch below calls these
+     * func_* wrappers, which are defined in the _full.c translation unit.
+     * Without these declarations the dispatch TU relies on implicit function
+     * declarations, which MSVC tolerates but clang/gcc reject under C99+. */
+    emit_forward_decls(f, wrappers, wrapper_count, rom);
+
+    fprintf(f,
+        "int call_by_address_cb(uint16_t addr, int _caller_bank) {\n"
+    );
+
+    /* MMC3 (mapper 4): 8KB address remapping for dispatch.
+     * The recompiler generates code at 16KB offsets ($8000 or $A000), but
+     * MMC3 swaps 8KB banks independently via R6 ($8000-$9FFF) and R7
+     * ($A000-$BFFF). When R6 is odd, $8000-$9FFF contains the upper 8KB
+     * of a 16KB bank — the recompiler generated this at $A000 offset.
+     * Remap the address so the dispatch finds the right function. */
+    /* Reject sub-$8000 addresses — these are never valid code targets on NES.
+     * They come from data-as-code false positives in the function finder. */
+    if (rom->mapper == 40) {
+        fprintf(f,
+            "    /* Mapper 40: map raw CPU windows to physical-8KB identities. */\n"
+            "    if (addr < 0x6000) { return nes_interp_dispatch(addr); }\n"
+            "    extern int g_mapper40_bank_c000_8k;\n"
+            "    uint16_t _cpu_addr = addr;\n"
+            "    int _b8;\n"
+            "    if (addr < 0x8000) _b8 = 6;\n"
+            "    else if (addr < 0xA000) _b8 = 4;\n"
+            "    else if (addr < 0xC000) _b8 = 5;\n"
+            "    else if (addr < 0xE000) _b8 = g_mapper40_bank_c000_8k;\n"
+            "    else _b8 = 7;\n"
+            "    int _bank = _b8 >> 1;\n"
+            "    (void)_caller_bank;\n"
+            "    addr = (uint16_t)(0x8000 + ((_b8 & 1) ? 0x2000 : 0)\n"
+            "                      + (addr & 0x1FFF));\n"
+        );
+    } else {
+        fprintf(f,
+            "    if (addr < 0x8000) { return nes_interp_dispatch(addr); }\n"
+        );
+    }
+
+    if (rom->mapper == 4) {
+        fprintf(f,
+            "    extern int g_mmc3_win_bank8k[4];\n"
+            "    /* MMC3: resolve the target through the live 8KB bank of its CPU\n"
+            "     * window ($8000/$A000/$C000/$E000).  g_mmc3_win_bank8k is mode-aware\n"
+            "     * (PRG mode 1 fixes $8000 to the second-to-last bank and swaps $C000\n"
+            "     * via R6 — e.g. SMB3), so this stays correct in both PRG modes.\n"
+            "     * Rebase addr into the recompiler's layout: switchable 16KB banks are\n"
+            "     * generated at $8000/$A000 offsets, the fixed pair at $C000/$E000. */\n"
+            "    uint16_t _cpu_addr = addr;\n"
+            "    int _w = (addr >> 13) & 3;\n"
+            "    int _b8 = g_mmc3_win_bank8k[_w];\n"
+            "    int _bank = _b8 >> 1;\n"
+            "    (void)_caller_bank; /* window resolution is authoritative; see miss default */\n"
+            "    addr = (uint16_t)(((_bank == %d) ? 0xC000 : 0x8000)\n"
+            "                      + ((_b8 & 1) ? 0x2000 : 0) + (addr & 0x1FFF));\n",
+            fixed_bank
+        );
+    } else if (rom->mapper == 66) {
+        fprintf(f,
+            "    /* GxROM (mapper 66): the entire 32KB window ($8000-$FFFF) is a unit.\n"
+            "     * The recompiler emits two bank files per window — even=lower 16KB,\n"
+            "     * odd=upper 16KB.  At runtime g_current_bank tracks the lower-half\n"
+            "     * (even) index.  For dispatches into $C000+ we have to look up the\n"
+            "     * paired upper bank (g_current_bank | 1), not the current value, or\n"
+            "     * the inner switch's default fires forever.  Mirrors the compile-time\n"
+            "     * gxrom_paired_bank() logic in code_generator's emit_call_target. */\n"
+            "    int _bank = (addr >= 0xC000) ? (g_current_bank | 1) : g_current_bank;\n"
+        );
+    }
+
+    fprintf(f,
+        "_dispatch_retry:\n"
+        "    switch (addr) {\n"
+    );
+
+    /* Emit one case per unique address. For addresses with multiple bank
+     * variants (switchable banks), emit an inner switch on g_current_bank. */
+    for (int i = 0; i < wrapper_count; i++) {
+        uint16_t addr = wrappers[i].addr;
+
+        /* Skip if already emitted (seen earlier in the list) */
+        bool already = false;
+        for (int j = 0; j < i; j++)
+            if (wrappers[j].addr == addr) {
+                already = true;
+                break;
+            }
+        if (already) continue;
+
+        /* Collect all bank variants for this address */
+        int variants[32];
+        int nv = 0;
+        for (int j = i; j < wrapper_count && nv < 32; j++)
+            if (wrappers[j].addr == addr)
+                variants[nv++] = wrappers[j].bank;
+        if (nv == 0) continue;
+
+        fprintf(f, "        case 0x%04X:\n", addr);
+
+        if (nv == 1) {
+            char nm[32];
+            format_func_name(nm, sizeof nm, addr, variants[0], fixed_bank);
+            /* MMC3: a single-variant switchable-region ($8000-$BFFF) address must
+             * STILL verify the live bank.  An indirectly-dispatched address (e.g. a
+             * boot-script handler pointer reached via JMP ($6038)) can be hit under
+             * a DIFFERENT live bank, where that CPU address holds a different
+             * routine.  An unconditional call silently runs the wrong bank's code
+             * (Kirby: $A295 dispatched with live $A000=bank30 was running bank17's
+             * $A295, which limped on via the caller-bank fallback).  Guard on _bank;
+             * on a live-bank mismatch fall through to interp, which reads the live
+             * bank correctly.  Gated to mapper 4 so non-MMC3 output is unchanged. */
+            if (rom->mapper == 4 && addr >= 0x8000 && addr < 0xC000) {
+                fprintf(f, "            switch (_bank) {\n");
+                fprintf(f, "                case %d: %s(); break;\n", variants[0], nm);
+                fprintf(f, "                default: return nes_interp_dispatch_bank(_cpu_addr, addr, _bank);\n");
+                fprintf(f, "            }\n");
+                fprintf(f, "            break;\n");
+            } else {
+                fprintf(f, "            %s(); break;\n", nm);
+            }
+        } else {
+            /* Multiple bank variants: dispatch by current bank.
+             * For MMC3, use _bank which selects g_mmc3_bank_a000 for
+             * $A000-$BFFF addresses and g_current_bank for $8000-$9FFF.
+             * For GxROM, use _bank which pairs $C000+ to (current | 1). */
+            if (rom->mapper == 4 || rom->mapper == 40 || rom->mapper == 66)
+                fprintf(f, "            switch (_bank) {\n");
+            else
+                fprintf(f, "            switch (g_current_bank) {\n");
+
+            /* Check if bank 15 (fixed) is already a variant. If not, and if the
+             * fixed-bank equivalent (addr + $4000) exists, add a bank-15 alias.
+             * This handles the case where the game maps bank15 into the switchable
+             * slot ($8000-$BFFF) and calls switchable addresses that alias to
+             * fixed-bank functions (switchable $XXXX = fixed $XXXX+$4000). */
+            bool has_fb15 = false;
+            for (int v = 0; v < nv; v++)
+                if (variants[v] == fixed_bank) { has_fb15 = true; break; }
+            if (!has_fb15 && addr >= 0x8000 && addr <= 0xBFFF) {
+                uint16_t fb_equiv = addr + 0x4000;
+                for (int fi = 0; fi < wrapper_count; fi++) {
+                    if (wrappers[fi].addr == fb_equiv &&
+                        wrappers[fi].bank == fixed_bank) {
+                        fprintf(f, "                case %d: func_%04X(); break;\n",
+                                fixed_bank, fb_equiv);
+                        break;
+                    }
+                }
+            }
+
+            bool has_default = false;
+            for (int v = 0; v < nv; v++) {
+                int bk = variants[v];
+                char nm[32];
+                format_func_name(nm, sizeof nm, addr, bk, fixed_bank);
+                if (bk == fixed_bank && addr >= 0xC000) {
+                    fprintf(f, "                default: %s(); break;\n", nm);
+                    has_default = true;
+                } else
+                    fprintf(f, "                case %d: %s(); break;\n", bk, nm);
+            }
+            if (!has_default) {
+                /* Inner-switch miss: the address has variants but none for the
+                 * active runtime bank.  Try the MMC3 R6-odd alias first, then the
+                 * caller-bank fallback (cross-8KB calls whose g_current_bank was
+                 * stale resolve to the caller's own 16KB bank), then interp. */
+                if (rom->mapper == 4 || rom->mapper == 40)
+                    /* No caller-bank / r6-odd retries here: those heuristics
+                     * predate window-resolved dispatch (g_mmc3_win_bank8k) and
+                     * redirect a clean "variant not generated" miss into a
+                     * DIFFERENT bank's code (measured on SMB3: sound-engine
+                     * dispatches at $B293 ran bank-13 title code via the
+                     * caller-bank retry). The window-resolved bank is
+                     * authoritative; a miss goes to the interpreter, which
+                     * executes the true bytes through the live windows. */
+                    fprintf(f, "                default: return nes_interp_dispatch_bank(_cpu_addr, addr, _bank);\n");
+                else if (rom->mapper == 66)
+                    fprintf(f, "                default: return nes_interp_dispatch_bank(addr, addr, _bank);\n");
+                else
+                    fprintf(f, "                default: return nes_interp_dispatch(addr);\n");
+            }
+            fprintf(f, "            }\n");
+            fprintf(f, "            break;\n");
+        }
+    }
+
+    /* Extra_label secondary entries — add dispatch cases for their ROM addresses */
+    if (rom->mapper == 4 || rom->mapper == 40)
+        fprintf(f,
+            "        default:\n"
+            "            return nes_interp_dispatch_bank(_cpu_addr, addr, _bank);\n"
+        );
+    else if (rom->mapper == 66)
+        fprintf(f,
+            "        default:\n"
+            "            return nes_interp_dispatch_bank(addr, addr, _bank);\n"
+        );
+    else
+        fprintf(f,
+            "        default:\n"
+            "            return nes_interp_dispatch(addr);\n"
+        );
+    fprintf(f,
+        "    }\n"
+        "    return 1;\n"
+        "}\n\n"
+        "/* Legacy entry: no caller-bank hint (JMP-indirect, interp, debug server).\n"
+        " * Depth-counted so deferred JMP-tail targets get driven (see runtime.c). */\n"
+        "int call_by_address(uint16_t addr) { return nes_dispatch_call(addr, -1); }\n"
+    );
+}
+
+static void emit_missing_wrapper_stubs(FILE *f, const EmittedWrapper *wrappers,
+                                       int wrapper_count,
+                                       const EmittedWrapper *actual_wrappers,
+                                       int actual_count,
+                                       const NESRom *rom,
+                                       const GameConfig *cfg) {
+    int fixed_bank = rom->prg_banks - 1;
+    int stub_count = 0;
+    for (int i = 0; i < wrapper_count; i++) {
+        uint16_t addr = wrappers[i].addr;
+        int bank = wrappers[i].bank;
+        if (wrapper_list_contains(actual_wrappers, actual_count, addr, bank))
+            continue;
+        if (replace_func_matches(cfg, fixed_bank, addr, bank))
+            continue;
+
+        char nm[32];
+        format_func_name(nm, sizeof nm, addr, bank, fixed_bank);
+        if (stub_count == 0)
+            fprintf(f, "/* Interpreter wrappers for discovered entries that were not emitted natively. */\n");
+        fprintf(f, "void %s(void) {\n", nm);
+        /* A mod claiming this address wins here too: whether the entry ended
+         * up native or interpreted is a codegen detail the mod cannot see. */
+        emit_mod_function_hook(f, cfg, fixed_bank, addr, bank);
+        fprintf(f, "#ifdef RECOMP_STACK_TRACKING\n");
+        fprintf(f, "    recomp_stack_push(\"%s\");\n", nm);
+        fprintf(f, "#endif\n");
+        /* The dispatcher has a concrete wrapper for this entry, so reaching
+         * it is intentional execution rather than an undiscovered-function
+         * miss. Use the strict interpreter entry even when ordinary miss
+         * fallback is disabled, and keep miss telemetry reserved for actual
+         * discovery gaps. */
+        fprintf(f, "    (void)nes_interp_force_generated(0x%04X, %d);\n",
+                addr, bank);
+        fprintf(f, "#ifdef RECOMP_STACK_TRACKING\n");
+        fprintf(f, "    recomp_stack_pop();\n");
+        fprintf(f, "#endif\n");
+        fprintf(f, "}\n\n");
+        stub_count++;
+    }
+    if (stub_count > 0)
+        fprintf(stderr, "[codegen] Emitted %d interpreter fallback wrapper(s) for non-native entries\n",
+                stub_count);
+}
+
+/* ---- per-bank split of <prefix>_full.c ----------------------------------
+ * GitHub hard-caps individual files at 100 MB and <prefix>_full.c crossed it
+ * for large multi-bank games (MM3: 152 MB) — the original motivation for
+ * this split. Function bodies are written to per-bank part files
+ * (<prefix>_full_bank<NN>.c). These are REAL standalone translation units
+ * (not textually #included by the umbrella): each part #includes the shared
+ * <prefix>_full_decls.h (includes, FLAG_NZ/FLAG_NZC_* macros, the
+ * g_rti_target extern, symbol aliases, every func_XXXX forward decl, and
+ * every multi-entry func_XXXX_body forward decl) and compiles independently,
+ * so a full-game build compiles all parts + the (small) umbrella in
+ * parallel across cores instead of as one giant single-TU compile.
+ * Emission is GROUPED BY BANK (banks ordered by first appearance in the
+ * function list, original relative order preserved within each bank — the
+ * list interleaves banks heavily, so naive rotate-on-change fragments into
+ * 100+ files). Grouping across banks is safe because every emitted function
+ * (and secondary label, and multi-entry body) has its forward declaration
+ * in the shared decls header, visible to every part and the umbrella alike.
+ *
+ * SUB-SHARDING: a single PRG bank can itself be too big for one TU to
+ * compile quickly in parallel with the others (e.g. Metroid's fixed bank:
+ * 8.3 MB / 2694 functions, ~60% of the whole game, gated the wall-clock of
+ * an 8-way parallel build almost as badly as the pre-split single-TU
+ * umbrella did). codegen_emit streams each bank's functions into a part
+ * file and tracks the running byte count (via ftell — a good-enough proxy
+ * for "roughly how much text we've written," not an exact byte count);
+ * once a part crosses BANK_PART_BUDGET it is closed and a new sub-part is
+ * opened for the rest of the bank. A bank that never crosses the budget
+ * produces exactly one sub-part, which is then renamed from the tentative
+ * "..._bank<NN>_part00.c" to the plain "..._bank<NN>.c" (no _partPP suffix)
+ * — this is why every part is opened with a provisional sub-shard name and
+ * only renamed at the end, once codegen_emit knows how many sub-parts that
+ * bank actually needed. A bank that DOES cross the budget keeps its
+ * "..._bank<NN>_part<PP>.c" names (PP zero-padded, 00-based) for however
+ * many sub-parts it took. Functions are never split across a sub-part
+ * boundary — the boundary only falls between two emit_function() calls —
+ * so this is purely a re-grouping of already-independent function bodies,
+ * not a change to any function's emitted bytes. This is safe now that
+ * func_XXXX_body functions have external linkage (see the BodyOwner
+ * comment): a wrapper and the body it calls, or a same-bank BodyAlias
+ * caller and the body it calls, can end up in different sub-part TUs of
+ * the same bank and still link correctly via the decls.h forward decl. */
+#define CODEGEN_MAX_FULL_PARTS 512
+#define BANK_PART_BUDGET (1024 * 1024) /* ~1 MiB target per sub-part TU */
+
+typedef struct {
+    char path[512];     /* on-disk path for fopen */
+    char name[128];     /* basename (informational; no longer used for an
+                          * umbrella #include — parts are standalone TUs) */
+} FullPart;
+
+static void codegen_remove_stale_parts(const char *base_noext) {
+    /* Delete every part file a previous run could have produced, so a regen
+     * that yields fewer banks (or fewer/more sub-parts within a bank) never
+     * leaves stale orphans behind in generated/ (they are committed in game
+     * repos). Names are fully enumerable, so plain remove() beats
+     * directory-walking portability. (The seq-suffixed names cover files
+     * from the interim rotate-on-change emitter revision; partPP covers
+     * bank sub-sharding.) */
+    char p[600];
+    for (int bank = 0; bank < 256; bank++) {
+        snprintf(p, sizeof p, "%s_bank%02d.c", base_noext, bank);
+        remove(p);
+        for (int seq = 2; seq <= 64; seq++) {
+            snprintf(p, sizeof p, "%s_bank%02d_%d.c", base_noext, bank, seq);
+            remove(p);
+        }
+        for (int part = 0; part < 256; part++) {
+            snprintf(p, sizeof p, "%s_bank%02d_part%02d.c", base_noext, bank, part);
+            remove(p);
+        }
+    }
+}
+
+/* Opens the sub_part'th part file for `bank` under its PROVISIONAL name
+ * ("..._bank<NN>_part<PP>.c" — sub_part is always >= 0 here; the caller
+ * renames down to the plain "..._bank<NN>.c" name after the fact if the
+ * bank turned out to fit in a single sub-part). See the BANK_PART_BUDGET
+ * comment above for why naming is provisional-then-renamed rather than
+ * decided up front: the emitter streams function bodies and only learns a
+ * bank's total size by having emitted all of it. */
+static FILE *codegen_open_bank_part(const char *base_noext, int bank, int sub_part,
+                                    FullPart *parts, int *part_count,
+                                    const char *decls_name) {
+    if (*part_count >= CODEGEN_MAX_FULL_PARTS) {
+        fprintf(stderr, "codegen: exceeded %d full.c parts\n", CODEGEN_MAX_FULL_PARTS);
+        return NULL;
+    }
+    FullPart *pp = &parts[*part_count];
+    int b = (bank >= 0 && bank < 256) ? bank : 255;
+    const char *slash = strrchr(base_noext, '/');
+    const char *bslash = strrchr(base_noext, '\\');
+    if (bslash && (!slash || bslash > slash)) slash = bslash;
+    const char *base_name = slash ? slash + 1 : base_noext;
+    snprintf(pp->path, sizeof pp->path, "%s_bank%02d_part%02d.c", base_noext, b, sub_part);
+    snprintf(pp->name, sizeof pp->name, "%s_bank%02d_part%02d.c", base_name, b, sub_part);
+    FILE *f = fopen(pp->path, "w");
+    if (!f) {
+        fprintf(stderr, "codegen: cannot open %s\n", pp->path);
+        return NULL;
+    }
+    fprintf(f, "/* %s — PRG bank %d function bodies (sub-part %d).\n"
+               " * STANDALONE translation unit — compiled independently (in\n"
+               " * parallel with every other bank part/sub-part and the\n"
+               " * umbrella %s.c). Do not compile as part of another TU or\n"
+               " * edit directly; the source of truth is the recompiler's\n"
+               " * code_generator.c. Renamed to drop the _partNN suffix if\n"
+               " * this bank turned out to fit in a single sub-part. */\n\n",
+            pp->name, b, sub_part, base_name);
+    fprintf(f, "#include \"%s\"\n\n", decls_name);
+    (*part_count)++;
+    return f;
+}
+
+/* Rename the tentative "..._bank<NN>_part00.c" down to the plain
+ * "..._bank<NN>.c" once codegen_emit knows a bank needed only one
+ * sub-part. Updates `pp` (the FullPart entry codegen_open_bank_part just
+ * filled in) to match, so anything inspecting `parts[]` afterward sees the
+ * final on-disk name. remove(new_path) first: Windows rename() fails if
+ * the destination already exists (codegen_remove_stale_parts ran before
+ * this regen, so it normally won't, but a rename from an interrupted prior
+ * run could leave one behind). */
+static void codegen_flatten_single_subpart(const char *base_noext, int bank, FullPart *pp) {
+    int b = (bank >= 0 && bank < 256) ? bank : 255;
+    char new_path[512], new_name[128];
+    const char *slash = strrchr(base_noext, '/');
+    const char *bslash = strrchr(base_noext, '\\');
+    if (bslash && (!slash || bslash > slash)) slash = bslash;
+    const char *base_name = slash ? slash + 1 : base_noext;
+    snprintf(new_path, sizeof new_path, "%s_bank%02d.c", base_noext, b);
+    snprintf(new_name, sizeof new_name, "%s_bank%02d.c", base_name, b);
+    remove(new_path);
+    if (rename(pp->path, new_path) != 0) {
+        fprintf(stderr, "codegen: warning: could not rename %s -> %s (errno %d); "
+                        "leaving the _part00 name\n", pp->path, new_path, errno);
+        return;
+    }
+    snprintf(pp->path, sizeof pp->path, "%s", new_path);
+    snprintf(pp->name, sizeof pp->name, "%s", new_name);
+}
+
+bool codegen_emit(const NESRom *rom, const FunctionList *funcs,
+                  const char *out_full_path, const char *out_dispatch_path,
+                  const AnnotationTable *at, const GameConfig *cfg,
+                  SymbolTable *st) {
+    g_symtab = st;
+    if (!build_codegen_function_index(funcs)) {
+        fprintf(stderr, "codegen: out of memory allocating function index\n");
+        return false;
+    }
+    if (!build_manual_owner_cache(rom, funcs, cfg)) {
+        fprintf(stderr, "codegen: out of memory allocating manual owner cache\n");
+        return false;
+    }
+    EmittedWrapper *wrappers = (EmittedWrapper *)malloc(
+        (size_t)MAX_EMITTED_WRAPPERS * sizeof(EmittedWrapper));
+    if (!wrappers) {
+        fprintf(stderr, "codegen: out of memory allocating wrapper set\n");
+        return false;
+    }
+    EmittedWrapper *actual_wrappers = (EmittedWrapper *)malloc(
+        (size_t)MAX_EMITTED_WRAPPERS * sizeof(EmittedWrapper));
+    if (!actual_wrappers) {
+        fprintf(stderr, "codegen: out of memory allocating actual wrapper set\n");
+        free(wrappers);
+        return false;
+    }
+    int wrapper_count = collect_emitted_wrappers(rom, funcs, cfg,
+                                                 wrappers, MAX_EMITTED_WRAPPERS);
+    BodyAlias *aliases = (BodyAlias *)malloc((size_t)MAX_BODY_ALIASES * sizeof(BodyAlias));
+    if (!aliases) {
+        fprintf(stderr, "codegen: out of memory allocating alias set\n");
+        free(actual_wrappers);
+        free(wrappers);
+        return false;
+    }
+    g_codegen_wrappers = wrappers;
+    g_codegen_wrapper_count = wrapper_count;
+    g_codegen_actual_wrappers = actual_wrappers;
+    g_codegen_actual_wrapper_count = 0;
+    g_codegen_actual_wrapper_cap = MAX_EMITTED_WRAPPERS;
+    g_codegen_alias_count = collect_body_aliases(rom, funcs, cfg, aliases, MAX_BODY_ALIASES);
+    g_codegen_aliases = aliases;
+
+    /* Body-owner list: populated by emit_function_body_open() as the bank
+     * loop below runs; consumed after the loop to forward-declare every
+     * func_XXXX_body in decls.h. See the BodyOwner comment. Capacity
+     * mirrors MAX_EMITTED_WRAPPERS — an upper bound on the number of
+     * standalone-emitting entries, and therefore on the number that can be
+     * multi-entry. */
+    BodyOwner *body_owners = (BodyOwner *)malloc((size_t)MAX_EMITTED_WRAPPERS * sizeof(BodyOwner));
+    if (!body_owners) {
+        fprintf(stderr, "codegen: out of memory allocating body owner set\n");
+        free(aliases);
+        free(actual_wrappers);
+        free(wrappers);
+        return false;
+    }
+    g_codegen_body_owners = body_owners;
+    g_codegen_body_owner_count = 0;
+    g_codegen_body_owner_cap = MAX_EMITTED_WRAPPERS;
+
+    FILE *f_full = fopen(out_full_path, "w");
+    if (!f_full) {
+        fprintf(stderr, "codegen: cannot open %s\n", out_full_path);
+        free(body_owners);
+        free(aliases);
+        free(actual_wrappers);
+        free(wrappers);
+        return false;
+    }
+
+    int fixed_bank = rom->prg_banks - 1;
+
+    /* base_noext: out_full_path with the trailing ".c" stripped, e.g.
+     * "generated/metroid_full". Used to derive both the per-bank part
+     * paths (<base_noext>_bankNN[_partPP].c) and the shared decls header
+     * path (<base_noext>_decls.h). */
+    char base_noext[512];
+    {
+        size_t bl = strlen(out_full_path);
+        if (bl > 2 && strcmp(out_full_path + bl - 2, ".c") == 0) bl -= 2;
+        if (bl >= sizeof base_noext) bl = sizeof base_noext - 1;
+        memcpy(base_noext, out_full_path, bl);
+        base_noext[bl] = '\0';
+    }
+    char decls_path[600], decls_name[160];
+    {
+        const char *slash = strrchr(base_noext, '/');
+        const char *bslash = strrchr(base_noext, '\\');
+        if (bslash && (!slash || bslash > slash)) slash = bslash;
+        const char *base_name = slash ? slash + 1 : base_noext;
+        snprintf(decls_path, sizeof decls_path, "%s_decls.h", base_noext);
+        snprintf(decls_name, sizeof decls_name, "%s_decls.h", base_name);
+    }
+
+    /* Umbrella <prefix>_full.c is a SMALL standalone TU: just the shared
+     * decls + the g_rti_target definition + the NMI/RESET/IRQ runner entry
+     * points (emitted further below). It does not #include the bank parts
+     * — those are independent TUs compiled in parallel. Writing this
+     * #include line only needs decls_name (a filename), not decls.h's
+     * actual content — the file itself is written further below, AFTER
+     * the bank loop, once every func_XXXX_body forward decl is known. */
+    fprintf(f_full, "/* AUTO-GENERATED by NESRecomp. DO NOT EDIT. */\n");
+    fprintf(f_full, "#include \"%s\"\n\n", decls_name);
+
+    /* Pre-scan: find coroutine yield function entry points.
+     * The yield function contains: TSX ($BA); STX zp,Y ($96 nn);
+     * JMP scheduler ($4C lo hi).  Multiple function entries may alias
+     * into the same body (e.g. $FF14, $FF16, $FF21 all share one body).
+     * Collect ALL function entries within range of the pattern so that
+     * JSR bail checks can be skipped for any of them. */
+    s_yield_func_count = 0;
+    for (uint16_t scan = 0xC003; scan < 0xFFF0; scan++) {
+        if (rom_read(rom, fixed_bank, scan - 3) == 0xBA /* TSX */ &&
+            rom_read(rom, fixed_bank, scan - 2) == 0x96 /* STX zp,Y */ &&
+            rom_read(rom, fixed_bank, scan)     == 0x4C /* JMP abs */) {
+            /* Found the yield tail at 'scan'.  Collect all function entries
+             * whose address falls within [scan-0x40, scan] — these are all
+             * entry points into the yield function body. */
+            for (int fi = 0; fi < funcs->count; fi++) {
+                if (funcs->entries[fi].bank == fixed_bank &&
+                    funcs->entries[fi].addr <= scan &&
+                    funcs->entries[fi].addr >= scan - 0x40 &&
+                    s_yield_func_count < MAX_YIELD_FUNCS) {
+                    s_yield_func_addrs[s_yield_func_count++] = funcs->entries[fi].addr;
+                }
+            }
+            if (s_yield_func_count > 0) {
+                fprintf(stderr, "[codegen] Detected %d coroutine yield function entries:",
+                        s_yield_func_count);
+                for (int yi = 0; yi < s_yield_func_count; yi++)
+                    fprintf(stderr, " $%04X", s_yield_func_addrs[yi]);
+                fprintf(stderr, "\n");
+            }
+            break;
+        }
+    }
+
+    /* Function bodies go to per-bank part files (see FullPart above). Each
+     * part is now a standalone TU (includes decls_name itself, opened in
+     * codegen_open_bank_part) — base_noext/decls_name were computed above,
+     * before the decls header was written. */
+    codegen_remove_stale_parts(base_noext);
+    FullPart *parts = (FullPart *)malloc((size_t)CODEGEN_MAX_FULL_PARTS * sizeof(FullPart));
+    if (!parts) {
+        fprintf(stderr, "codegen: out of memory allocating part list\n");
+        fclose(f_full);
+        free(aliases);
+        free(actual_wrappers);
+        free(wrappers);
+        return false;
+    }
+    int part_count = 0;
+
+    /* Banks in order of first appearance among emitted entries. */
+    int bank_order[256];
+    int bank_order_count = 0;
+    bool bank_seen[256];
+    memset(bank_seen, 0, sizeof bank_seen);
+    for (int i = 0; i < funcs->count; i++) {
+        const FunctionEntry *entry = &funcs->entries[i];
+        if (!entry_should_emit_standalone_body(rom, funcs, cfg, i)) continue;
+        int b = entry->bank;
+        if (b < 0 || b > 255) b = 255;
+        if (!bank_seen[b]) {
+            bank_seen[b] = true;
+            bank_order[bank_order_count++] = b;
+        }
+    }
+
+    int sub_shard_banks = 0; /* banks that needed more than one sub-part */
+    for (int bo = 0; bo < bank_order_count; bo++) {
+        int part_bank = bank_order[bo];
+        int sub_part = 0;
+        FILE *f_part = codegen_open_bank_part(base_noext, part_bank, sub_part,
+                                              parts, &part_count, decls_name);
+        if (!f_part) {
+            fclose(f_full);
+            free(parts);
+            free(body_owners);
+            free(aliases);
+            free(actual_wrappers);
+            free(wrappers);
+            return false;
+        }
+        long bytes_in_part = 0;
+        int first_part_index = part_count - 1; /* parts[] slot for this bank's part00 */
+        for (int i = 0; i < funcs->count; i++) {
+            const FunctionEntry *entry = &funcs->entries[i];
+            if (!entry_should_emit_standalone_body(rom, funcs, cfg, i)) continue;
+            int b = entry->bank;
+            if (b < 0 || b > 255) b = 255;
+            if (b != part_bank) continue;
+
+            coverage_record_emitted_function(entry->bank, entry->addr);
+            long before = ftell(f_part);
+            bool dedup_marked = cfg->deduplicate_functions &&
+                                dedup_entry_eligible(rom, cfg, entry);
+            if (dedup_marked) {
+                char nm[32];
+                format_func_name(nm, sizeof nm, entry->addr, entry->bank, fixed_bank);
+                fprintf(f_part, "/* NESRECOMP_DEDUP_BEGIN %s %d %04X */\n",
+                        nm, entry->bank, entry->addr);
+            }
+            emit_function(f_part, rom, entry, funcs, at, cfg);
+            if (dedup_marked)
+                fprintf(f_part, "/* NESRECOMP_DEDUP_END */\n");
+            long after = ftell(f_part);
+            if (after > before) bytes_in_part += (after - before);
+
+            /* Budget crossed: close this sub-part and open the next one.
+             * Functions are never split — the boundary only falls between
+             * two emit_function() calls (see the BANK_PART_BUDGET note). */
+            if (bytes_in_part >= BANK_PART_BUDGET) {
+                fclose(f_part);
+                sub_part++;
+                f_part = codegen_open_bank_part(base_noext, part_bank, sub_part,
+                                                parts, &part_count, decls_name);
+                if (!f_part) {
+                    fclose(f_full);
+                    free(parts);
+                    free(body_owners);
+                    free(aliases);
+                    free(actual_wrappers);
+                    free(wrappers);
+                    return false;
+                }
+                bytes_in_part = 0;
+            }
+        }
+        fclose(f_part);
+        if (sub_part == 0) {
+            /* Bank fit in one sub-part: drop the provisional _part00 suffix
+             * so small banks keep the plain "..._bank<NN>.c" name (as
+             * before sub-sharding existed). */
+            codegen_flatten_single_subpart(base_noext, part_bank, &parts[first_part_index]);
+        } else {
+            sub_shard_banks++;
+        }
+    }
+
+    /* Bank parts (and sub-parts) are standalone TUs when a game explicitly
+     * compiles them and defines NESRECOMP_SPLIT_PARTS_EXTERNAL. For existing
+     * games that still compile only <prefix>_full.c, textually include the
+     * generated parts here so the split remains backward-compatible. */
+    char dedup_manifest[600];
+    {
+        size_t base_len = strlen(base_noext);
+        if (base_len >= 5 && strcmp(base_noext + base_len - 5, "_full") == 0)
+            base_len -= 5;
+        snprintf(dedup_manifest, sizeof dedup_manifest, "%.*s_function_groups.json",
+                 (int)base_len, base_noext);
+    }
+    if (cfg->deduplicate_functions) {
+        const char **dedup_paths = part_count
+            ? (const char **)malloc((size_t)part_count * sizeof(*dedup_paths))
+            : NULL;
+        if (part_count && !dedup_paths) {
+            fclose(f_full);
+            free(parts);
+            free(body_owners);
+            free(aliases);
+            free(actual_wrappers);
+            free(wrappers);
+            return false;
+        }
+        for (int pi = 0; pi < part_count; pi++) dedup_paths[pi] = parts[pi].path;
+        bool dedup_ok = function_dedup_run(dedup_paths, part_count, cfg, fixed_bank,
+                                           dedup_manifest);
+        free(dedup_paths);
+        if (!dedup_ok) {
+            fclose(f_full);
+            free(parts);
+            free(body_owners);
+            free(aliases);
+            free(actual_wrappers);
+            free(wrappers);
+            return false;
+        }
+    } else {
+        remove(dedup_manifest);
+    }
+
+    printf("[NESRecomp] full.c split: %d standalone bank part TU(s) (%d bank(s) sub-sharded "
+          "across multiple TUs)\n", part_count, sub_shard_banks);
+    fprintf(f_full, "#ifndef NESRECOMP_SPLIT_PARTS_EXTERNAL\n");
+    for (int pi = 0; pi < part_count; pi++) {
+        fprintf(f_full, "#include \"%s\"\n", parts[pi].name);
+    }
+    fprintf(f_full, "#endif\n\n");
+    free(parts);
+
+    /* The wrapper prepass predicts public entry points before bodies are
+     * emitted. Complex ownership and private-range aliases can still expose
+     * a wrapper only during the real body walk. Every wrapper that actually
+     * exists must be declared and dispatchable, so merge those observations
+     * back into the final wrapper set before writing stubs, headers, or the
+     * dispatch table. */
+    for (int ai = 0; ai < g_codegen_actual_wrapper_count; ai++) {
+        wrapper_list_add(wrappers, &wrapper_count, MAX_EMITTED_WRAPPERS,
+                         actual_wrappers[ai].addr, actual_wrappers[ai].bank);
+    }
+
+    emit_missing_wrapper_stubs(f_full, wrappers, wrapper_count,
+                               actual_wrappers, g_codegen_actual_wrapper_count,
+                               rom, cfg);
+
+    /* Shared header, written now (not before the bank loop) because it must
+     * forward-declare every func_XXXX_body, and the body-owner list is only
+     * complete once every bank part has been emitted (see the BodyOwner /
+     * BANK_PART_BUDGET comments above). Every part TU and the umbrella
+     * already reference it by name (decls_name) via the #include lines
+     * written when each was opened — those are just text; the compiler
+     * doesn't read this file until a separate build step runs, well after
+     * codegen_emit returns. Order: pragma once, the runtime includes +
+     * FLAG_NZ/FLAG_NZC_* macros + g_rti_target extern (emit_header), the
+     * optional symbol-name #define aliases, every func_XXXX forward
+     * declaration, then every func_XXXX_body forward declaration. */
+    FILE *f_decls = fopen(decls_path, "w");
+    if (!f_decls) {
+        fprintf(stderr, "codegen: cannot open %s\n", decls_path);
+        fclose(f_full);
+        free(body_owners);
+        free(aliases);
+        free(actual_wrappers);
+        free(wrappers);
+        return false;
+    }
+    fprintf(f_decls, "#pragma once\n\n");
+    emit_header(f_decls);
+    emit_symbol_aliases(f_decls, wrappers, wrapper_count, fixed_bank, st);
+    emit_forward_decls(f_decls, wrappers, wrapper_count, rom);
+    emit_body_forward_decls(f_decls, body_owners, g_codegen_body_owner_count, rom);
+    fclose(f_decls);
+    free(body_owners);
+    g_codegen_body_owners = NULL;
+    g_codegen_body_owner_count = 0;
+    g_codegen_body_owner_cap = 0;
+
+    /* Add NMI/RESET/IRQ entry points for runner.
+     * If the vector target is in the switchable bank ($8000-$BFFF), use _b0 suffix. */
+    fprintf(f_full, "/* Runner entry points */\n");
+    const char *reset_sfx = (rom->reset_vector < 0xC000) ? "_b0" : "";
+    const char *nmi_sfx   = (rom->nmi_vector   < 0xC000) ? "_b0" : "";
+    const char *irq_sfx   = (rom->irq_vector   < 0xC000) ? "_b0" : "";
+    uint16_t mapper40_reset_addr = 0, mapper40_nmi_addr = 0, mapper40_irq_addr = 0;
+    int mapper40_reset_bank = 0, mapper40_nmi_bank = 0, mapper40_irq_bank = 0;
+    bool has_mapper40_reset = rom_mapper40_cpu_to_generated(
+        rom, rom->reset_vector, 0, &mapper40_reset_addr, &mapper40_reset_bank);
+    bool has_mapper40_nmi = rom_mapper40_cpu_to_generated(
+        rom, rom->nmi_vector, 0, &mapper40_nmi_addr, &mapper40_nmi_bank);
+    bool has_mapper40_irq = rom_mapper40_cpu_to_generated(
+        rom, rom->irq_vector, 0, &mapper40_irq_addr, &mapper40_irq_bank);
+    if (has_mapper40_reset) {
+        fprintf(f_full,
+            "void func_RESET(void) { uint16_t _saved_wb = g_code_window_base; "
+            "g_code_window_base = 0x%04X; func_%04X_b%d(); "
+            "g_code_window_base = _saved_wb; }\n",
+            rom->reset_vector & 0xE000, mapper40_reset_addr, mapper40_reset_bank);
+    } else if (rom->reset_vector < 0x8000) {
+        fprintf(f_full, "void func_RESET(void) { (void)nes_interp_interrupt(0x%04X); }\n", rom->reset_vector);
+    } else {
+        fprintf(f_full,
+            "void func_RESET(void) { uint16_t _saved_wb = g_code_window_base; "
+            "g_code_window_base = 0x%04X; func_%04X%s(); "
+            "g_code_window_base = _saved_wb; }\n",
+            rom->reset_vector & 0xE000, rom->reset_vector, reset_sfx);
+    }
+    fprintf(f_full, "uint16_t g_rti_target = 0; /* RTI hijack target (set by RTI, consumed by func_NMI) */\n");
+    fprintf(f_full, "uint16_t g_rti_source = 0; /* last generated RTI instruction address */\n");
+    fprintf(f_full, "int g_rti_bank = -1; /* bank for last generated RTI instruction */\n");
+    fprintf(f_full, "uint16_t g_rts_target = 0; /* last RTS operand popped by generated code */\n\n");
+    fprintf(f_full, "void func_NMI(void)   {\n"
+           "    /* The runner pushes the 6502 NMI hardware frame.\n"
+           "     * Uses $0000 as sentinel PC — RTI stores the target in g_rti_target.\n"
+           "     * If the handler modified the return address (RTI hijack),\n"
+           "     * we dispatch to the hijacked target AFTER the handler returns,\n"
+           "     * so the post-NMI code runs outside the NMI context (depth 0). */\n"
+           "    g_rti_target = 0;\n"
+           "    uint16_t _nmi_saved_wb = g_code_window_base;\n");
+    if (rom->num_windows > 0) {
+        /* GxROM (and other full-32KB-switch mappers): the NMI vector at\n"
+         * $FFFA depends on which 32KB window is currently mapped.  Dispatch\n"
+         * through call_by_address so the runtime picks the right per-window\n"
+         * NMI handler from g_current_bank.  Without this the recompiler\n"
+         * picks one window's NMI vector at codegen time and uses it for\n"
+         * every NMI fire — wrong for any game that boots from a window\n"
+         * other than the one whose vector got picked (Gumshoe boots into\n"
+         * window 0 with NMI=$8031 but the recompiler defaulted to window\n"
+         * 3's $8047, skipping OAM DMA and register saves on every NMI). */
+        fprintf(f_full,
+            "    /* GxROM: dispatch by current bank — vector lives in upper half */\n"
+            "    extern int g_current_bank;\n"
+            "    static const uint16_t s_nmi_vectors[%d] = {",
+            rom->num_windows);
+        for (int w = 0; w < rom->num_windows; w++) {
+            fprintf(f_full, "%s 0x%04X", w ? "," : "", rom->window_nmi[w]);
+        }
+        fprintf(f_full, " };\n");
+        fprintf(f_full,
+            "    int _w = (g_current_bank >> 1);\n"
+            "    if (_w < 0) _w = 0; else if (_w >= %d) _w = %d;\n"
+            "    call_by_address(s_nmi_vectors[_w]);\n",
+            rom->num_windows, rom->num_windows - 1);
+    } else {
+        if (has_mapper40_nmi)
+            fprintf(f_full,
+                "    g_code_window_base = 0x%04X;\n"
+                "    func_%04X_b%d();\n",
+                rom->nmi_vector & 0xE000, mapper40_nmi_addr, mapper40_nmi_bank);
+        else if (rom->nmi_vector < 0x8000)
+            fprintf(f_full, "    (void)nes_interp_interrupt(0x%04X);\n", rom->nmi_vector);
+        else
+            fprintf(f_full,
+                "    g_code_window_base = 0x%04X;\n"
+                "    func_%04X%s();\n",
+                rom->nmi_vector & 0xE000, rom->nmi_vector, nmi_sfx);
+    }
+    fprintf(f_full,
+           "    g_code_window_base = _nmi_saved_wb;\n"
+           "    if (g_rti_target != 0) {\n"
+           "        /* Post-NMI code runs outside NMI context on real hardware\n"
+           "         * (RTI re-enables interrupts, NMI is edge-triggered).\n"
+           "         * Clear pending VBlank to prevent re-entrant NMI during\n"
+               "         * the post-NMI path - real hardware only fires NMI once\n"
+           "         * per VBlank transition. */\n"
+           "        runtime_begin_post_nmi();\n"
+           "        call_by_address(g_rti_target);\n"
+           "        runtime_end_post_nmi();\n"
+           "    }\n"
+           "}\n");
+    if (has_mapper40_irq) {
+        fprintf(f_full,
+            "void func_IRQ(void)   { uint16_t _saved_wb = g_code_window_base; "
+            "g_code_window_base = 0x%04X; func_%04X_b%d(); "
+            "g_code_window_base = _saved_wb; }\n",
+            rom->irq_vector & 0xE000, mapper40_irq_addr, mapper40_irq_bank);
+    } else if (rom->irq_vector < 0x8000) {
+        fprintf(f_full, "void func_IRQ(void)   { (void)nes_interp_interrupt(0x%04X); }\n", rom->irq_vector);
+    } else {
+        fprintf(f_full,
+            "void func_IRQ(void)   { uint16_t _saved_wb = g_code_window_base; "
+            "g_code_window_base = 0x%04X; func_%04X%s(); "
+            "g_code_window_base = _saved_wb; }\n",
+            rom->irq_vector & 0xE000, rom->irq_vector, irq_sfx);
+    }
+
+    fclose(f_full);
+
+    /* Dispatch table */
+    FILE *f_disp = fopen(out_dispatch_path, "w");
+    if (!f_disp) {
+        fprintf(stderr, "codegen: cannot open %s\n", out_dispatch_path);
+        free(aliases);
+        free(actual_wrappers);
+        free(wrappers);
+        return false;
+    }
+    emit_dispatch(f_disp, wrappers, wrapper_count, rom, cfg);
+    fclose(f_disp);
+
+    g_codegen_aliases = NULL;
+    g_codegen_alias_count = 0;
+    g_codegen_wrappers = NULL;
+    g_codegen_wrapper_count = 0;
+    g_codegen_actual_wrappers = NULL;
+    g_codegen_actual_wrapper_count = 0;
+    g_codegen_actual_wrapper_cap = 0;
+    free(g_codegen_function_index);
+    g_codegen_function_index = NULL;
+    g_codegen_function_index_count = 0;
+    free(g_codegen_native_eligibility);
+    g_codegen_native_eligibility = NULL;
+    g_symtab = NULL;
+    free(aliases);
+    free(actual_wrappers);
+    free(wrappers);
+    audit_mod_function_hooks(cfg);
+    return true;
+}

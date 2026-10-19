@@ -1,0 +1,845 @@
+/*
+ * interp.c — 6502 interpreter fallback tier.
+ *
+ * See interp.h and docs/PHASE1_INTERP_FALLBACK_PLAN.md for the design.
+ *
+ * The opcode SEMANTICS here are a faithful mirror of code_generator.c's
+ * emit_instruction: same flag macros (FLAG_NZ / NZC_ADD / NZC_SUB), same
+ * effective-address forms (operand_addr_expr), same bus helpers
+ * (nes_read/nes_write/nes_read16zp/nes_read16_jmpbug). The decode table is
+ * the SAME table the recompiler uses (recompiler/src/cpu6502_decoder.c),
+ * compiled into the runner — so interpreted and recompiled execution cannot
+ * diverge in decode.
+ *
+ * The BOUNDARY CONTRACT (interp_run): the interpreter runs its own program
+ * counter and never call_by_address()es a return address (that re-enters the
+ * world from scratch and grows the C stack without bound — see the depth-510
+ * note in code_generator.c). Nested missed calls stay inside one C frame on
+ * the shared 6502 RAM stack. Control returns to native code when an RTS/RTI
+ * (or an unbalanced stack pop) lifts g_cpu.S above the entry level S_floor —
+ * at which point the native C call stack / continuation carries the return.
+ */
+#include "interp.h"
+#include "nes_runtime.h"
+#include "game_extras.h"
+#include "mapper.h"
+#include "game_extras.h"
+#include "cpu6502_decoder.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---- Tunables ---- */
+#define INTERP_STEP_CAP   2000000   /* per-call cap; explicit resume renews on frames */
+#define INTERP_MAX_DEPTH  64        /* nested interp_run guard (native callee misses) */
+
+/* ---- Config (lazily initialised on first dispatch) ---- */
+static int s_enabled = -1;          /* -1 = uninitialised */
+static int s_native_handoff_mode = -1;
+static int s_active_handoff_mode = -1; /* per-run override; nests with interp calls */
+extern int g_recomp_push_all_jsr;   /* defined by the generated dispatch TU */
+
+/* ---- Covered-ness probe ----
+ * interp_run dispatches a JSR/JMP target through call_by_address. If the
+ * target is covered, call_by_address runs it natively and returns 1. If not,
+ * the generated miss path calls back into nes_interp_dispatch; when that
+ * call's address matches the armed probe we answer "miss" (return 0) WITHOUT
+ * recursing, so interp_run handles the target inline on the 6502 stack. */
+static int      s_probe_armed = 0;
+static uint16_t s_probe_addr  = 0;
+
+static int s_depth = 0;             /* interp_run nesting depth */
+
+/* Generated control-flow uses these sidecars to carry a guest continuation
+ * across C frames. The interpreter must participate in the same contract when
+ * a native handoff returns through an interpreted caller. */
+extern uint16_t g_rts_target;
+extern uint16_t g_rti_target;
+extern uint16_t g_rti_source;
+extern int      g_rti_bank;
+
+/* ---- Stats ---- */
+static NesInterpStats s_stats;
+static char s_last_decline_reason[96] = "interpreter fallback declined";
+static NesInterpExit s_last_exit = {
+    NES_INTERP_EXIT_DECLINED, 0, 0, 0, 0
+};
+
+void nes_interp_get_stats(NesInterpStats *out) { if (out) *out = s_stats; }
+void nes_interp_frame_boundary(void) { s_stats.instrs_this_frame = 0; }
+void nes_interp_get_last_exit(NesInterpExit *out) { if (out) *out = s_last_exit; }
+
+typedef struct {
+    uint8_t used;
+    NesInterpHotspot value;
+} InterpHotspotSlot;
+static InterpHotspotSlot s_hotspots[NES_INTERP_HOTSPOT_CAP];
+
+static void interp_note_hotspot(uint16_t entry, int bank, uint32_t instrs) {
+    uint32_t key = ((uint32_t)(uint16_t)bank << 16) | entry;
+    uint32_t slot = (key * 2654435761u) & (NES_INTERP_HOTSPOT_CAP - 1);
+    for (uint32_t probe = 0; probe < NES_INTERP_HOTSPOT_CAP; probe++) {
+        InterpHotspotSlot *s =
+            &s_hotspots[(slot + probe) & (NES_INTERP_HOTSPOT_CAP - 1)];
+        if (!s->used) {
+            memset(&s->value, 0, sizeof(s->value));
+            s->used = 1;
+            s->value.entry_pc = entry;
+            s->value.bank = (int16_t)bank;
+        }
+        if (s->value.entry_pc == entry && s->value.bank == bank) {
+            s->value.period_calls++;
+            s->value.period_instrs += instrs;
+            if (instrs > s->value.period_max_run)
+                s->value.period_max_run = instrs;
+            s->value.total_calls++;
+            s->value.total_instrs += instrs;
+            return;
+        }
+    }
+}
+
+int nes_interp_get_hotspots(NesInterpHotspot *out, int cap, int clear_period) {
+    if (cap < 0) cap = 0;
+    int copied = 0;
+    for (int i = 0; i < NES_INTERP_HOTSPOT_CAP; i++) {
+        InterpHotspotSlot *s = &s_hotspots[i];
+        if (!s->used || !s->value.period_calls) continue;
+        if (out && copied < cap) out[copied] = s->value;
+        if (copied < cap) copied++;
+        if (clear_period) {
+            s->value.period_calls = 0;
+            s->value.period_instrs = 0;
+            s->value.period_max_run = 0;
+        }
+    }
+    return copied;
+}
+
+void nes_interp_set_enabled(int enabled) { s_enabled = enabled ? 1 : 0; }
+int  nes_interp_is_enabled(void) { return s_enabled == 1; }
+
+void nes_interp_set_native_handoff_mode(NesInterpHandoffMode mode) {
+    if (mode < NES_INTERP_HANDOFF_ISLAND || mode > NES_INTERP_HANDOFF_LEGACY)
+        mode = NES_INTERP_HANDOFF_ISLAND;
+    s_native_handoff_mode = (int)mode;
+}
+
+static void interp_lazy_init(void) {
+    if (s_enabled != -1 && s_native_handoff_mode != -1) return;
+    /* Default: on when the build supports the stack contract; env can force off. */
+    int on = g_recomp_push_all_jsr ? 1 : 0;
+    const char *e = getenv("NESRECOMP_INTERP_FALLBACK");
+    if (e) {
+        if (!strcmp(e, "off") || !strcmp(e, "0")) on = 0;
+        else if (!strcmp(e, "on") || !strcmp(e, "1")) on = g_recomp_push_all_jsr ? 1 : 0;
+    }
+    if (s_enabled == -1) {
+        s_enabled = on;
+        if (on && !g_recomp_push_all_jsr) s_enabled = 0; /* contract needs push_all_jsr */
+    }
+
+    /* Native collaboration policy while already inside the interpreter.
+     * off/island (default): the interpreter owns all nested control flow until
+     * an architectural exit. This is the correctness floor: a stack/return
+     * rewriting helper cannot be split across two execution models.
+     * safe: allow balanced JSR handoffs, keep JMP tails in the island.
+     * on/legacy: probe and hand off both JSR and JMP. */
+    if (s_native_handoff_mode == -1) {
+        int mode = NES_INTERP_HANDOFF_ISLAND;
+        const char *h = getenv("NESRECOMP_INTERP_NATIVE_HANDOFF");
+        if (h && *h) {
+            if (!strcmp(h, "on") || !strcmp(h, "1") || !strcmp(h, "legacy"))
+                mode = NES_INTERP_HANDOFF_LEGACY;
+            else if (!strcmp(h, "off") || !strcmp(h, "0") || !strcmp(h, "island"))
+                mode = NES_INTERP_HANDOFF_ISLAND;
+            else if (!strcmp(h, "safe"))
+                mode = NES_INTERP_HANDOFF_SAFE;
+        }
+        const char *island = getenv("NESRECOMP_INTERP_ISLAND");
+        if (island && *island) {
+            if (!strcmp(island, "on") || !strcmp(island, "1"))
+                mode = NES_INTERP_HANDOFF_ISLAND;
+            else if (!strcmp(island, "off") || !strcmp(island, "0"))
+                mode = NES_INTERP_HANDOFF_LEGACY;
+        }
+        s_native_handoff_mode = mode;
+    }
+}
+
+NesInterpHandoffMode nes_interp_get_native_handoff_mode(void) {
+    if (s_native_handoff_mode < 0) interp_lazy_init();
+    return (NesInterpHandoffMode)s_native_handoff_mode;
+}
+
+static void interp_note_decline(uint16_t entry, uint16_t ipc, const char *reason) {
+    const char *why = (reason && *reason) ? reason : "interpreter fallback declined";
+    snprintf(s_last_decline_reason, sizeof(s_last_decline_reason),
+             "%s (entry=$%04X ipc=$%04X bank=%d)",
+             why, entry, ipc, g_current_bank);
+    s_stats.declines++;
+}
+
+static int interp_native_handoff_allowed(int is_tail) {
+    if (s_native_handoff_mode < 0) interp_lazy_init();
+    int mode = (s_active_handoff_mode >= 0)
+             ? s_active_handoff_mode : s_native_handoff_mode;
+    if (mode == NES_INTERP_HANDOFF_LEGACY) return 1;
+    if (mode == NES_INTERP_HANDOFF_ISLAND) return 0;
+    return is_tail ? 0 : 1; /* safe */
+}
+
+/* ---- Side-effect-free instruction fetch (bank-correct) ---- */
+static inline uint8_t interp_fetch(uint16_t pc) {
+    if (pc >= 0x8000)              return mapper_peek_prg(pc);
+    if (pc >= 0x6000 && mapper_get_type() == 40)
+        return mapper_peek_prg(pc);
+    if (pc < 0x2000)              return g_ram[pc & 0x07FF];
+    if (pc >= 0x6000) {
+        uint8_t v = g_sram[pc - 0x6000];
+        nes_trace_sram_fetch(pc, v);
+        return v;
+    }
+    return 0x00; /* $2000-$5FFF: not a code region — decodes as BRK and bails */
+}
+
+/* ---- Effective address — mirrors operand_addr_expr() exactly ---- */
+static inline uint16_t interp_ea(AddrMode am, uint8_t op1, uint8_t op2) {
+    uint16_t abs16 = (uint16_t)(op1 | ((uint16_t)op2 << 8));
+    switch (am) {
+        case AM_ZP:   return op1;
+        case AM_ZPX:  return (uint8_t)(op1 + g_cpu.X);
+        case AM_ZPY:  return (uint8_t)(op1 + g_cpu.Y);
+        case AM_ABS:  return abs16;
+        case AM_ABSX: return (uint16_t)(abs16 + g_cpu.X);
+        case AM_ABSY: return (uint16_t)(abs16 + g_cpu.Y);
+        case AM_INDX: return nes_read16zp((uint8_t)(op1 + g_cpu.X));
+        case AM_INDY: return (uint16_t)(nes_read16zp(op1) + g_cpu.Y);
+        default:      return 0;
+    }
+}
+
+/* Read the operand value for a read-type op (immediate vs memory). */
+static inline uint8_t interp_rd(AddrMode am, uint8_t op1, uint8_t op2) {
+    if (am == AM_IMM) return op1;
+    return nes_read(interp_ea(am, op1, op2));
+}
+
+/* ---- Flag helpers (identical to generated FLAG_NZ / NZC_ADD / NZC_SUB) ---- */
+#define I_NZ(v) do { g_cpu.N = ((uint8_t)(v) >> 7) & 1; g_cpu.Z = ((uint8_t)(v) == 0) ? 1 : 0; } while (0)
+
+/* Forward decl: the generated dispatcher. */
+extern int call_by_address(uint16_t addr);
+
+/* Probe + dispatch a control-transfer target.
+ * Returns 1 if the target was covered and executed natively; 0 on miss
+ * (caller interprets the target inline). */
+static int interp_probe_native_target(uint16_t target) {
+    nes_dring_mark('P', target);   /* interp probe (pre-dispatch) */
+    g_rts_target = 0;
+    g_rti_target = 0;
+    g_rti_source = 0;
+    g_rti_bank = -1;
+    s_probe_armed = 1;
+    s_probe_addr  = target;
+    int hit = call_by_address(target);
+    s_probe_armed = 0;
+    if (hit) s_stats.native_handoffs++;
+    return hit;
+}
+
+static int interp_dispatch_target(uint16_t target, int is_tail) {
+    if (!interp_native_handoff_allowed(is_tail)) {
+        s_stats.native_handoffs_suppressed++;
+        return 0;
+    }
+    return interp_probe_native_target(target);
+}
+
+static NesInterpExit make_exit(NesInterpExitKind kind, uint16_t entry,
+                               uint16_t next_pc, uint8_t entry_s) {
+    NesInterpExit out;
+    out.kind = kind;
+    out.entry_pc = entry;
+    out.next_pc = next_pc;
+    out.entry_s = entry_s;
+    out.exit_s = g_cpu.S;
+    return out;
+}
+
+/*
+ * interp_run — execute the missed routine at `entry`, returning when control
+ * leaves it back to native code (RTS/RTI/unbalanced-pop lifting S above the
+ * entry level). The typed exit is the architectural boundary contract; the
+ * public generated-code ABI converts it to handled/not-handled for now.
+ */
+static NesInterpExit interp_run_ex(uint16_t entry, int stop_on_stack_lift,
+                                    NesInterpHandoffMode handoff_mode,
+                                    uint32_t max_steps) {
+    const uint8_t entry_s = g_cpu.S;
+    const int entry_bank = g_current_bank;
+    if (s_depth >= INTERP_MAX_DEPTH) {
+        interp_note_decline(entry, entry, "interpreter depth guard");
+        s_last_exit = make_exit(NES_INTERP_EXIT_DECLINED, entry, entry, entry_s);
+        return s_last_exit;
+    }
+    s_depth++;
+    int previous_handoff_mode = s_active_handoff_mode;
+    s_active_handoff_mode = (int)handoff_mode;
+    s_stats.runs++;
+    nes_dring_mark('I', entry);   /* interp run start (cpu pc) */
+
+    const uint8_t S_floor = entry_s;
+    uint16_t ipc = entry;
+    long budget = INTERP_STEP_CAP;
+    uint64_t budget_frame = g_frame_count;
+    uint32_t this_run = 0;
+    NesInterpExit result =
+        make_exit(NES_INTERP_EXIT_NATIVE_ESCAPE, entry, entry, entry_s);
+
+    for (;;) {
+        /* An explicit save-state continuation owns the whole program and may
+         * legitimately stay here forever (Metroid's multi-instruction NMI
+         * wait loop). Cap instructions WITHOUT frame progress, not the total
+         * lifetime after loading. Ordinary fallback calls keep their original
+         * per-call guard, including calls nested inside a resumed program. */
+        if (!stop_on_stack_lift && budget_frame != g_frame_count) {
+            budget_frame = g_frame_count;
+            budget = INTERP_STEP_CAP;
+        }
+        if (--budget < 0) {
+            fprintf(stderr, "[interp] WATCHDOG: run from $%04X exceeded %d instrs "
+                            "%s (bank=%d, ipc=$%04X) — bailing\n",
+                    entry, INTERP_STEP_CAP,
+                    stop_on_stack_lift ? "in one call" : "without frame progress",
+                    g_current_bank, ipc);
+            s_stats.watchdog_trips++;
+            interp_note_decline(entry, ipc, "interpreter watchdog");
+            result = make_exit(NES_INTERP_EXIT_DECLINED, entry, ipc, entry_s);
+            break;
+        }
+
+        uint8_t opcode = interp_fetch(ipc);
+        const OpcodeEntry *e = &g_opcode_table[opcode];
+        uint8_t op1 = (e->size > 1) ? interp_fetch((uint16_t)(ipc + 1)) : 0;
+        uint8_t op2 = (e->size > 2) ? interp_fetch((uint16_t)(ipc + 2)) : 0;
+        uint16_t abs16 = (uint16_t)(op1 | ((uint16_t)op2 << 8));
+
+        /* NMI is sampled between instructions (mirrors codegen's per-insn call). */
+        nes_cpu_instruction_boundary(ipc, e->cycles);
+        s_stats.instrs_total++;
+        s_stats.instrs_this_frame++;
+        if (this_run < UINT32_MAX) this_run++;
+
+        uint16_t next = (uint16_t)(ipc + e->size); /* default sequential advance */
+
+        switch (e->mnemonic) {
+            /* ---- Load / Store ---- */
+            case MN_LDA: g_cpu.A = interp_rd(e->addr_mode, op1, op2); I_NZ(g_cpu.A); break;
+            case MN_LDX: g_cpu.X = interp_rd(e->addr_mode, op1, op2); I_NZ(g_cpu.X); break;
+            case MN_LDY: g_cpu.Y = interp_rd(e->addr_mode, op1, op2); I_NZ(g_cpu.Y); break;
+            case MN_LAX: g_cpu.A = g_cpu.X = interp_rd(e->addr_mode, op1, op2); I_NZ(g_cpu.A); break;
+            case MN_STA: nes_write(interp_ea(e->addr_mode, op1, op2), g_cpu.A); break;
+            case MN_STX: nes_write(interp_ea(e->addr_mode, op1, op2), g_cpu.X); break;
+            case MN_STY: nes_write(interp_ea(e->addr_mode, op1, op2), g_cpu.Y); break;
+            case MN_SAX: nes_write(interp_ea(e->addr_mode, op1, op2), (uint8_t)(g_cpu.A & g_cpu.X)); break;
+
+            /* ---- Transfers ---- */
+            case MN_TAX: g_cpu.X = g_cpu.A; I_NZ(g_cpu.X); break;
+            case MN_TAY: g_cpu.Y = g_cpu.A; I_NZ(g_cpu.Y); break;
+            case MN_TXA: g_cpu.A = g_cpu.X; I_NZ(g_cpu.A); break;
+            case MN_TYA: g_cpu.A = g_cpu.Y; I_NZ(g_cpu.A); break;
+            case MN_TSX: g_cpu.X = g_cpu.S; I_NZ(g_cpu.X); break;
+            case MN_TXS: g_cpu.S = g_cpu.X; break;
+
+            /* ---- Stack ---- */
+            case MN_PHA: g_ram[0x100 + g_cpu.S] = g_cpu.A; g_cpu.S--; break;
+            case MN_PLA: g_cpu.S++; g_cpu.A = g_ram[0x100 + g_cpu.S]; I_NZ(g_cpu.A); break;
+            case MN_PHP: {
+                uint8_t p = (uint8_t)((g_cpu.N << 7) | (g_cpu.V << 6) | 0x30 |
+                                      (g_cpu.D << 3) | (g_cpu.I << 2) | (g_cpu.Z << 1) | g_cpu.C);
+                g_ram[0x100 + g_cpu.S] = p; g_cpu.S--;
+                break;
+            }
+            case MN_PLP: {
+                g_cpu.S++; uint8_t p = g_ram[0x100 + g_cpu.S];
+                g_cpu.N = (p >> 7) & 1; g_cpu.V = (p >> 6) & 1; g_cpu.D = (p >> 3) & 1;
+                g_cpu.I = (p >> 2) & 1; g_cpu.Z = (p >> 1) & 1; g_cpu.C = p & 1;
+                break;
+            }
+
+            /* ---- ALU ---- */
+            case MN_ADC: {
+                uint8_t m = interp_rd(e->addr_mode, op1, op2);
+                uint16_t r = (uint16_t)(g_cpu.A + m + g_cpu.C);
+                g_cpu.C = (r > 0xFF) ? 1 : 0;
+                g_cpu.N = (r >> 7) & 1;
+                g_cpu.Z = ((r & 0xFF) == 0) ? 1 : 0;
+                g_cpu.V = (~((g_cpu.A) ^ (m)) & ((g_cpu.A) ^ r) & 0x80) ? 1 : 0;
+                g_cpu.A = (uint8_t)(r & 0xFF);
+                break;
+            }
+            case MN_SBC: {
+                uint8_t m = interp_rd(e->addr_mode, op1, op2);
+                int16_t r = (int16_t)(g_cpu.A - m - (1 - g_cpu.C));
+                g_cpu.C = (r >= 0) ? 1 : 0;
+                g_cpu.N = ((r & 0xFF) >> 7);
+                g_cpu.Z = ((r & 0xFF) == 0) ? 1 : 0;
+                g_cpu.V = (((g_cpu.A) ^ (m)) & ((g_cpu.A) ^ r) & 0x80) ? 1 : 0;
+                g_cpu.A = (uint8_t)(r & 0xFF);
+                break;
+            }
+            case MN_AND: g_cpu.A &= interp_rd(e->addr_mode, op1, op2); I_NZ(g_cpu.A); break;
+            case MN_ORA: g_cpu.A |= interp_rd(e->addr_mode, op1, op2); I_NZ(g_cpu.A); break;
+            case MN_EOR: g_cpu.A ^= interp_rd(e->addr_mode, op1, op2); I_NZ(g_cpu.A); break;
+
+            /* ---- Shifts / Rotates ---- */
+            case MN_ASL:
+                if (e->addr_mode == AM_ACC) {
+                    g_cpu.C = (g_cpu.A >> 7) & 1; g_cpu.A = (uint8_t)(g_cpu.A << 1); I_NZ(g_cpu.A);
+                } else {
+                    uint16_t a = interp_ea(e->addr_mode, op1, op2); uint8_t v = nes_read(a);
+                    g_cpu.C = (v >> 7) & 1; v = (uint8_t)(v << 1); nes_write(a, v); I_NZ(v);
+                }
+                break;
+            case MN_LSR:
+                if (e->addr_mode == AM_ACC) {
+                    g_cpu.C = g_cpu.A & 1; g_cpu.A >>= 1; I_NZ(g_cpu.A);
+                } else {
+                    uint16_t a = interp_ea(e->addr_mode, op1, op2); uint8_t v = nes_read(a);
+                    g_cpu.C = v & 1; v >>= 1; nes_write(a, v); I_NZ(v);
+                }
+                break;
+            case MN_ROL:
+                if (e->addr_mode == AM_ACC) {
+                    uint8_t c = g_cpu.C; g_cpu.C = (g_cpu.A >> 7) & 1;
+                    g_cpu.A = (uint8_t)((g_cpu.A << 1) | c); I_NZ(g_cpu.A);
+                } else {
+                    uint16_t a = interp_ea(e->addr_mode, op1, op2); uint8_t v = nes_read(a);
+                    uint8_t c = g_cpu.C; g_cpu.C = (v >> 7) & 1;
+                    v = (uint8_t)((v << 1) | c); nes_write(a, v); I_NZ(v);
+                }
+                break;
+            case MN_ROR:
+                if (e->addr_mode == AM_ACC) {
+                    uint8_t c = g_cpu.C; g_cpu.C = g_cpu.A & 1;
+                    g_cpu.A = (uint8_t)((g_cpu.A >> 1) | (c << 7)); I_NZ(g_cpu.A);
+                } else {
+                    uint16_t a = interp_ea(e->addr_mode, op1, op2); uint8_t v = nes_read(a);
+                    uint8_t c = g_cpu.C; g_cpu.C = v & 1;
+                    v = (uint8_t)((v >> 1) | (c << 7)); nes_write(a, v); I_NZ(v);
+                }
+                break;
+
+            /* ---- Inc / Dec ---- */
+            case MN_INC: {
+                uint16_t a = interp_ea(e->addr_mode, op1, op2);
+                uint8_t v = (uint8_t)(nes_read(a) + 1); nes_write(a, v); I_NZ(v);
+                break;
+            }
+            case MN_DEC: {
+                uint16_t a = interp_ea(e->addr_mode, op1, op2);
+                uint8_t v = (uint8_t)(nes_read(a) - 1); nes_write(a, v); I_NZ(v);
+                break;
+            }
+            case MN_INX: g_cpu.X = (uint8_t)(g_cpu.X + 1); I_NZ(g_cpu.X); break;
+            case MN_DEX: g_cpu.X = (uint8_t)(g_cpu.X - 1); I_NZ(g_cpu.X); break;
+            case MN_INY: g_cpu.Y = (uint8_t)(g_cpu.Y + 1); I_NZ(g_cpu.Y); break;
+            case MN_DEY: g_cpu.Y = (uint8_t)(g_cpu.Y - 1); I_NZ(g_cpu.Y); break;
+
+            /* ---- Compare ---- */
+            case MN_CMP: { uint8_t m = interp_rd(e->addr_mode, op1, op2); int r = g_cpu.A - m; g_cpu.C = (g_cpu.A >= m) ? 1 : 0; I_NZ(r & 0xFF); break; }
+            case MN_CPX: { uint8_t m = interp_rd(e->addr_mode, op1, op2); int r = g_cpu.X - m; g_cpu.C = (g_cpu.X >= m) ? 1 : 0; I_NZ(r & 0xFF); break; }
+            case MN_CPY: { uint8_t m = interp_rd(e->addr_mode, op1, op2); int r = g_cpu.Y - m; g_cpu.C = (g_cpu.Y >= m) ? 1 : 0; I_NZ(r & 0xFF); break; }
+            case MN_BIT: {
+                uint8_t m = interp_rd(e->addr_mode, op1, op2);
+                g_cpu.Z = (g_cpu.A & m) ? 0 : 1; g_cpu.N = (m >> 7) & 1; g_cpu.V = (m >> 6) & 1;
+                break;
+            }
+
+            /* ---- Flags ---- */
+            case MN_CLC: g_cpu.C = 0; break;
+            case MN_SEC: g_cpu.C = 1; break;
+            case MN_CLD: g_cpu.D = 0; break;
+            case MN_SED: g_cpu.D = 1; break;
+            case MN_CLI: g_cpu.I = 0; break;
+            case MN_SEI: g_cpu.I = 1; break;
+            case MN_CLV: g_cpu.V = 0; break;
+
+            /* ---- NOPs (NOP_READ performs the operand read for MMIO side effects) ---- */
+            case MN_NOP: break;
+            case MN_NOP_READ:
+                if (e->addr_mode != AM_IMP && e->addr_mode != AM_ACC && e->addr_mode != AM_IMM)
+                    (void)nes_read(interp_ea(e->addr_mode, op1, op2));
+                break;
+
+            /* ---- Branches (relative) ---- */
+            case MN_BCC: if (!g_cpu.C) next = (uint16_t)(ipc + 2 + (int8_t)op1); break;
+            case MN_BCS: if ( g_cpu.C) next = (uint16_t)(ipc + 2 + (int8_t)op1); break;
+            case MN_BEQ: if ( g_cpu.Z) next = (uint16_t)(ipc + 2 + (int8_t)op1); break;
+            case MN_BNE: if (!g_cpu.Z) next = (uint16_t)(ipc + 2 + (int8_t)op1); break;
+            case MN_BMI: if ( g_cpu.N) next = (uint16_t)(ipc + 2 + (int8_t)op1); break;
+            case MN_BPL: if (!g_cpu.N) next = (uint16_t)(ipc + 2 + (int8_t)op1); break;
+            case MN_BVC: if (!g_cpu.V) next = (uint16_t)(ipc + 2 + (int8_t)op1); break;
+            case MN_BVS: if ( g_cpu.V) next = (uint16_t)(ipc + 2 + (int8_t)op1); break;
+
+            /* ---- Jumps / Calls / Returns (the boundary contract) ---- */
+            case MN_JSR: {
+                uint16_t target = abs16;
+                uint16_t ret = (uint16_t)(ipc + 2);   /* 6502 pushes PC+2 */
+                uint8_t call_s = g_cpu.S;
+                g_ram[0x100 + g_cpu.S] = (uint8_t)((ret >> 8) & 0xFF); g_cpu.S--;
+                g_ram[0x100 + g_cpu.S] = (uint8_t)(ret & 0xFF);        g_cpu.S--;
+                if (interp_dispatch_target(target, 0)) {
+                    /* Covered: ran natively. A normal RTS restores call_s and
+                     * resumes just after this JSR. A non-local native return
+                     * can instead pop an interpreted ancestor; preserve that
+                     * guest continuation and let the floor check below decide
+                     * whether it belongs to this interpreter frame or the
+                     * still-live native caller. */
+                    if (g_cpu.S == call_s) {
+                        /* Normal native RTS pops the JSR operand we pushed
+                         * below (ipc+2), so execution resumes at ipc+3. Some
+                         * games use JSR helpers that rewrite that return
+                         * operand before RTSing (Kirby $D805 skips inline
+                         * bank/target bytes). In that case S is still
+                         * restored, but the architectural continuation is the
+                         * popped RTS operand + 1. */
+                        uint16_t ret = (uint16_t)(ipc + 2);
+                        if (g_rti_target != 0)
+                            next = g_rti_target;
+                        else if (g_rts_target != 0 && g_rts_target != ret)
+                            next = (uint16_t)(g_rts_target + 1);
+                        else
+                            next = (uint16_t)(ipc + 3);
+                    } else if (g_rti_target != 0) {
+                        next = g_rti_target;
+                    } else if (g_rts_target != 0) {
+                        next = (uint16_t)(g_rts_target + 1);
+                    } else {
+                        result = make_exit(NES_INTERP_EXIT_NATIVE_ESCAPE,
+                                           entry, next, entry_s);
+                        goto done;
+                    }
+                } else {
+                    next = target;  /* miss: interpret inline (push stays on 6502 stack) */
+                }
+                break;
+            }
+            case MN_JMP: {
+                uint16_t target = (e->addr_mode == AM_IND)
+                                  ? nes_read16_jmpbug(abs16) : abs16;
+                /* A save-state can capture the PC at a ROM's permanent
+                 * frame-driver loop (SMB1 $8057 is `JMP $8057`). Safe
+                 * handoff normally keeps JMP tails inside the interpreter,
+                 * because a returning native tail can discard an interpreted
+                 * ancestor. A direct self-loop at the explicit resume entry
+                 * has no such ancestor or return path. If that exact address
+                 * is generated, hand it back to native execution so a long-
+                 * lived game does not consume the per-run interpreter budget
+                 * and terminate at the watchdog cap. Misses remain in the
+                 * interpreter, including RAM loops and non-entry loops. */
+                int resume_self_loop =
+                    !stop_on_stack_lift && e->addr_mode == AM_ABS &&
+                    entry >= 0x8000 && ipc == entry && target == entry;
+                int native_hit = resume_self_loop
+                    ? interp_probe_native_target(target)
+                    : interp_dispatch_target(target, 1);
+                if (native_hit) {
+                    /* A native tail target may RTS/RTI into an interpreted
+                     * ancestor. Resume it while still below this run's stack
+                     * floor; otherwise the floor check returns to native. */
+                    if (g_rti_target != 0)
+                        next = g_rti_target;
+                    else if (g_rts_target != 0)
+                        next = (uint16_t)(g_rts_target + 1);
+                    else {
+                        result = make_exit(NES_INTERP_EXIT_NATIVE_ESCAPE,
+                                           entry, next, entry_s);
+                        goto done;
+                    }
+                    break;
+                }
+                next = target;               /* miss: interpret inline */
+                break;
+            }
+            case MN_RTS: {
+                g_cpu.S++; uint8_t lo = g_ram[0x100 + g_cpu.S];
+                g_cpu.S++; uint8_t hi = g_ram[0x100 + g_cpu.S];
+                g_rts_target = (uint16_t)(((uint16_t)hi << 8) | lo);
+                g_rti_target = 0;
+                uint16_t ret = (uint16_t)(g_rts_target + 1);
+                if (stop_on_stack_lift && g_cpu.S > S_floor) {
+                    result = make_exit(NES_INTERP_EXIT_RETURN,
+                                       entry, ret, entry_s);
+                    goto done;  /* returned to a still-live native caller */
+                }
+                next = ret;                                        /* nested return */
+                break;
+            }
+            case MN_RTI: {
+                g_cpu.S++; uint8_t p = g_ram[0x100 + g_cpu.S];
+                g_cpu.N = (p >> 7) & 1; g_cpu.V = (p >> 6) & 1; g_cpu.D = (p >> 3) & 1;
+                g_cpu.I = (p >> 2) & 1; g_cpu.Z = (p >> 1) & 1; g_cpu.C = p & 1;
+                g_cpu.S++; uint8_t lo = g_ram[0x100 + g_cpu.S];
+                g_cpu.S++; uint8_t hi = g_ram[0x100 + g_cpu.S];
+                uint16_t ret = (uint16_t)(((uint16_t)hi << 8) | lo);  /* RTI does NOT +1 */
+                g_rti_target = ret;
+                g_rti_source = ipc;
+                g_rti_bank = g_current_bank;
+                g_rts_target = 0;
+                if (stop_on_stack_lift && g_cpu.S > S_floor) {
+                    result = make_exit(NES_INTERP_EXIT_RTI,
+                                       entry, ret, entry_s);
+                    goto done;
+                }
+                next = ret;
+                break;
+            }
+
+            /* ---- BRK / illegal: mirror codegen (BRK hook; illegal = sized skip) ---- */
+            case MN_BRK:
+                nes_brk_executed(ipc);
+                result = make_exit(NES_INTERP_EXIT_BRK,
+                                   entry, ipc, entry_s);
+                goto done;   /* codegen returns from the enclosing fn at BRK */
+            case MN_ILLEGAL:
+            default:
+                /* code_generator.c treats MN_ILLEGAL as a sized NOP skip — match it. */
+                break;
+        }
+
+        ipc = next;
+
+        if (max_steps && this_run >= max_steps) {
+            result = make_exit(NES_INTERP_EXIT_NATIVE_ESCAPE,
+                               entry, ipc, entry_s);
+            goto done;
+        }
+
+        /* Miss fallback boundary rule: any instruction that lifts S above the
+         * entry frame means we've returned to native code. Explicit continuation
+         * resumes disable this because their entry may intentionally restore
+         * state with PLA/PLP-style stack reads. */
+        if (stop_on_stack_lift && g_cpu.S > S_floor) {
+            result = make_exit(NES_INTERP_EXIT_STACK_ESCAPE,
+                               entry, next, entry_s);
+            goto done;
+        }
+    }
+
+done:
+    if (this_run > s_stats.max_instrs_run) s_stats.max_instrs_run = this_run;
+    interp_note_hotspot(entry, entry_bank, this_run);
+    s_active_handoff_mode = previous_handoff_mode;
+    s_depth--;
+    result.exit_s = g_cpu.S;
+    s_last_exit = result;
+    return result;
+}
+
+static NesInterpExit interp_run(uint16_t entry) {
+    return interp_run_ex(entry, 1, nes_interp_get_native_handoff_mode(), 0);
+}
+
+static int interp_exit_handled(NesInterpExit exit) {
+    return exit.kind != NES_INTERP_EXIT_DECLINED;
+}
+
+int nes_interp_step_tail(uint16_t addr, int caller_bank) {
+    interp_lazy_init();
+    static int s_step_trace = -1;
+    static unsigned s_step_trace_count = 0;
+    if (s_step_trace < 0) {
+        const char *e = getenv("NESRECOMP_INTERP_STEP_TRACE");
+        s_step_trace = (e && *e && *e != '0') ? 1 : 0;
+    }
+    unsigned trace_id = s_step_trace_count++;
+    if (s_step_trace && trace_id < 128) {
+        fprintf(stderr,
+                "[InterpStep] #%u enter pc=$%04X op=$%02X bank=%d window=$%04X S=$%02X caller=%d\n",
+                trace_id, addr, interp_fetch(addr), g_current_bank,
+                g_code_window_base, g_cpu.S, caller_bank);
+    }
+
+    /* A Mapper 40 instruction which straddles an 8KB PRG window cannot be
+     * emitted safely as native C. Execute exactly that one instruction, then
+     * resume through the normal bank-aware tail dispatcher. Interpreting the
+     * whole island here can swallow a frame-driving loop before native code
+     * regains control. This is intentional execution, not a dispatch miss. */
+    NesInterpExit exit =
+        interp_run_ex(addr, 0, NES_INTERP_HANDOFF_ISLAND, 1);
+    if (s_step_trace && trace_id < 128) {
+        fprintf(stderr,
+                "[InterpStep] #%u exit kind=%d next=$%04X bank=%d window=$%04X S=$%02X\n",
+                trace_id, (int)exit.kind, exit.next_pc, g_current_bank,
+                g_code_window_base, g_cpu.S);
+    }
+    if (!interp_exit_handled(exit))
+        return 0;
+
+    if (exit.kind == NES_INTERP_EXIT_NATIVE_ESCAPE && exit.next_pc != 0)
+        return call_by_address_tail(exit.next_pc, caller_bank);
+
+    return 1;
+}
+
+/* ---- Entry from the generated dispatcher ----
+ * Bank-aware form: cpu_addr is the live 6502 target (what the interpreter
+ * must execute — it fetches through the live windows), gen_addr/bank are the
+ * recompiler-layout coordinates for miss recording ([[extra_func]] advice). */
+int nes_interp_dispatch_bank(uint16_t cpu_addr, uint16_t gen_addr, int bank) {
+    interp_lazy_init();
+
+    uint16_t addr = cpu_addr;
+
+    /* Per-game manual override still wins (e.g. Zelda SRAM remap). */
+    if (game_dispatch_override(addr)) return 1;
+
+    /* Covered-ness probe answer for an in-flight interp_run dispatch. */
+    if (s_probe_armed && addr == s_probe_addr) {
+        s_probe_armed = 0;
+        if (addr >= 0x8000)
+            nes_record_dispatch_miss_bank(gen_addr, cpu_addr, bank);
+        return 0;   /* "miss" — interp_run will handle the target inline */
+    }
+
+    /* CPU RAM and cartridge SRAM code cannot have a generated function. It is
+     * intentional dynamic execution rather than static-discovery fallback, so
+     * keep it available under fallback=off. Mapper 40 is the exception: its
+     * $6000-$7FFF window is PRG ROM and must retain normal strict dispatch. */
+    if (addr < 0x2000 ||
+        (addr >= 0x6000 && addr < 0x8000 && mapper_get_type() != 40)) {
+        if (interp_exit_handled(interp_run(addr)))
+            return 1;
+        fprintf(stderr, "[Interp] RAM/SRAM entry $%04X could not be interpreted\n", addr);
+        return 0;
+    }
+
+    if (s_enabled == 1) {
+        if (!nes_dispatch_miss_last_target_is_code()) {
+            s_stats.policy_traps++;
+            nes_dispatch_miss_interp_declined(addr, "non-code dispatch target");
+            return 0;
+        }
+        if (interp_exit_handled(interp_run(addr))) return 1;   /* handled by fallback */
+        s_stats.policy_traps++;
+        nes_dispatch_miss_interp_declined(addr, s_last_decline_reason);
+        return 0;
+    }
+
+    nes_record_dispatch_miss_bank(gen_addr, cpu_addr, bank);
+    nes_dispatch_miss_apply_policy(addr);
+    return 0;
+}
+
+/* Legacy entry: cpu==gen address, g_current_bank attribution. */
+int nes_interp_dispatch(uint16_t addr) {
+    extern int g_current_bank;
+    return nes_interp_dispatch_bank(addr, addr, g_current_bank);
+}
+
+int nes_interp_force_bank(uint16_t cpu_addr, uint16_t gen_addr, int bank) {
+    interp_lazy_init();
+
+    /* A forced wrapper can be reached by the covered-ness probe from an
+     * already-running interpreter island. The generated wrapper is void, so
+     * the dispatcher cannot propagate a "miss" answer back to the probe.
+     * Execute the forced island here so the caller observes the real RTS/RTI
+     * sidecar state instead of treating an unpopped JSR as native success. */
+    if (s_probe_armed && cpu_addr == s_probe_addr) {
+        s_probe_armed = 0;
+        return interp_exit_handled(
+            interp_run_ex(cpu_addr, 1, NES_INTERP_HANDOFF_ISLAND, 0));
+    }
+
+    if (interp_exit_handled(
+            interp_run_ex(cpu_addr, 1, NES_INTERP_HANDOFF_ISLAND, 0)))
+        return 1;
+
+    char reason[160];
+    const char *why = s_last_decline_reason;
+    snprintf(reason, sizeof(reason),
+             "forced interpreter entry $%04X (generated $%04X bank=%d) could not execute: %s",
+             cpu_addr, gen_addr, bank, why);
+    fprintf(stderr, "[Interp] %s\n", reason);
+    s_stats.policy_traps++;
+    nes_write_runtime_fault(reason);
+    debug_server_request_pause(reason);
+    return 0;
+}
+
+int nes_interp_force_generated(uint16_t gen_addr, int bank) {
+    uint16_t cpu_addr = gen_addr;
+    int mapper = mapper_get_type();
+    if ((mapper == 4 || mapper == 40) && gen_addr >= 0x8000)
+        cpu_addr = (uint16_t)(g_code_window_base | (gen_addr & 0x1FFF));
+    return nes_interp_force_bank(cpu_addr, gen_addr, bank);
+}
+
+int nes_interp_force(uint16_t addr) {
+    return nes_interp_force_bank(addr, addr, g_current_bank);
+}
+
+int nes_interp_interrupt(uint16_t addr) {
+    interp_lazy_init();
+
+    /* RAM/SRAM interrupt vectors are intentional code entries, not missed
+     * generated functions. Keep dispatch_misses.log reserved for discovery
+     * defects while still executing the handler against live memory. */
+    if (interp_exit_handled(
+            interp_run_ex(addr, 1, NES_INTERP_HANDOFF_ISLAND, 0)))
+        return 1;
+
+    fprintf(stderr, "[Interp] RAM/SRAM interrupt vector $%04X could not be interpreted\n", addr);
+    return 0;
+}
+
+int nes_interp_resume(uint16_t addr) {
+    interp_lazy_init();
+    /* A restored PC is the continuation of the whole suspended program, not
+     * a missed function with a native caller waiting above it. It therefore
+     * cooperates with covered native JSRs while interpreter fallbacks nested
+     * beneath those native calls still install their own island policy. */
+    NesInterpHandoffMode mode =
+        (s_native_handoff_mode == NES_INTERP_HANDOFF_LEGACY)
+        ? NES_INTERP_HANDOFF_LEGACY : NES_INTERP_HANDOFF_SAFE;
+    uint16_t pc = addr;
+    for (;;) {
+        NesInterpExit exit = interp_run_ex(pc, 0, mode, 0);
+        if (exit.kind != NES_INTERP_EXIT_NATIVE_ESCAPE)
+            return interp_exit_handled(exit);
+
+        /*
+         * A cooperative native call may unwind without an RTS/RTI sidecar.
+         * This is not a guest-program exit: generated tail-cycle flattening
+         * deliberately discards host C frames while the architectural 6502
+         * continuation remains live. Resume from the instruction boundary
+         * recorded by the runtime instead of returning out of the permanent
+         * save-state driver.
+         */
+        uint16_t resume_pc = 0;
+        int tick_charged = 0;
+        if (!runtime_get_savestate_resume(&resume_pc, &tick_charged) ||
+            resume_pc == 0) {
+            interp_note_decline(pc, exit.next_pc,
+                                "native escape had no guest continuation");
+            s_last_exit = make_exit(NES_INTERP_EXIT_DECLINED, pc,
+                                    exit.next_pc, exit.entry_s);
+            return 0;
+        }
+
+        s_stats.native_resume_reentries++;
+        runtime_prepare_guest_resume(resume_pc, tick_charged);
+        pc = resume_pc;
+    }
+}
+
+void nes_interp_reset_context(void) {
+    s_probe_armed = 0;
+    s_probe_addr = 0;
+    s_depth = 0;
+    s_active_handoff_mode = -1;
+    s_last_exit = make_exit(NES_INTERP_EXIT_DECLINED, 0, 0, g_cpu.S);
+}

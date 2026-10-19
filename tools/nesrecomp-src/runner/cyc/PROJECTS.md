@@ -1,0 +1,333 @@
+# Using the cycle backend in an existing game project
+
+Cycle is the compiler default. New games should use `nesrecomp_add_cycle_game`
+below, and migrated projects default `NESRECOMP_BACKEND` to `cycle`. Retain an
+explicit `legacy` branch in CMake when an older host is needed. Its generation
+command must pass `--legacy`; a missing backend choice now generates cycle code.
+
+Cycle targets can call `nesrecomp_enable_recomp_net(target)` after adding their
+game and launcher. This reuses the shared NES session facade, recomp-net's
+rollback driver and recomp-ui's lobby. Snapshots contain the complete cycle
+save domain and four logical seats; frame admission runs at returning frame
+boundaries. Replays suppress presentation and audio, online menus keep the
+match running and lock simulation settings, and guests use host-authoritative
+cartridge storage without touching their personal saves. The title must seal
+every enhancement setting it permits online. SMB1 carries the first binding;
+its separate-machine/WAN qualification is still pending.
+
+MMC1 and MMC3 projects can opt into extra CPU time with `cyc_set_extra_scanlines(128)`
+between frames, or with the host's `--extra-scanlines 128` option. Zero restores
+stock timing. This enhancement adds blank scanlines before NMI and pauses APU
+clocks during those lines; the window continues at the normal frame rate. Keep
+the setting visible and reversible in a game's menu. Stock hardware parity is
+tested with zero extra lines; enhanced runs compare native and interpreted CPU
+execution instead. Other boards currently reject nonzero values. DMA bus
+arbitration keeps alternating during the audio pause, so pending sample or
+sprite transfers cannot consume the added budget waiting for an audio edge.
+
+Cycle save states now write version 2 with the enhancement's selection and
+progress. The reader accepts version 1 states with the same program and hardware
+layout, restoring stock timing. Version 1 readers reject version 2 files.
+
+The cycle backend now has a CMake entry point for existing game checkouts.
+It uses their ROM and game configuration and builds the cartridge hardware
+documented in [MAPPERS.md](MAPPERS.md), including the new mapper families.
+All generated code stays in the build directory. The original game's source,
+ROM, generated files and submodule checkout are read only.
+
+Requires CMake 3.20+, a C11 compiler and Python 3.11+. The host recompiler is
+built automatically during configure. Cross builds must supply an already
+built host compiler with `NESRECOMP_HOST_COMPILER` or `RECOMPILER` below.
+
+Windows game repositories can call `tools/build_cycle_windows.ps1` with
+`-ProjectRoot`, `-Rom` and optional `-BuildDir`, `-EngineRoot`, `-RecompUi` and
+`-CMakeArgs`. It uses the installed CMake executable and hidden native
+processes, generates cycle code during configure and builds Release.
+`tools/package_cycle_windows.ps1` adds `-Target` and `-Title` and creates a
+ROM-free ZIP with SDL2, launcher assets, pristine preloaded packages and
+licenses. `-SkipBuild` requires an existing cycle production cache. Games
+with specialized assets or variant packaging should keep their own staging
+recipe; this helper is for the ordinary cartridge titles.
+
+## Build alongside the existing project
+
+Configure this framework's standalone entry point with the existing game's
+absolute paths (quote paths containing spaces):
+
+```sh
+cmake -S /path/to/nesrecomp/runner/cyc/project -B build-cycle \
+  -DNESRECOMP_ROM="/path/to/game/Game.nes" \
+  -DNESRECOMP_GAME_CONFIG="/path/to/game/game.toml" \
+  -DNESRECOMP_HEADLESS=ON
+cmake --build build-cycle --config Release --parallel 4
+```
+
+Run `build-cycle/nes_game` (or `build-cycle/Release/nes_game.exe` with Visual
+Studio), followed by the same ROM path and `--frames 600`. Leave `HEADLESS`
+off to include SDL2 when available; running without headless options opens
+its window. Building or headless verification never launches a game window.
+The compiled program checks ROM identity before execution.
+
+## Default the game's CMakeLists.txt to cycle
+
+After `project(...)`, before any legacy SDL/UI dependency setup:
+
+```cmake
+set(NESRECOMP_BACKEND "cycle" CACHE STRING "CPU backend: cycle or legacy")
+set_property(CACHE NESRECOMP_BACKEND PROPERTY STRINGS cycle legacy)
+if(NESRECOMP_BACKEND STREQUAL "cycle")
+    include("${NESRECOMP_ROOT}/runner/cyc/project.cmake")
+    nesrecomp_add_cycle_game(MyGame
+        ROM "${CMAKE_SOURCE_DIR}/Game.nes"
+        GAME_CONFIG "${CMAKE_SOURCE_DIR}/game.toml")
+    return()
+endif()
+if(NOT NESRECOMP_BACKEND STREQUAL "legacy")
+    message(FATAL_ERROR "Unknown NESRECOMP_BACKEND: ${NESRECOMP_BACKEND}")
+endif()
+# Existing legacy target follows here. Its generator must pass --legacy.
+```
+
+Set `NESRECOMP_ROOT` before this block. The function also accepts `HEADLESS`,
+`RECOMPILER /path/to/NESRecomp`, `SEED_FILE /path/to/seeds.txt` and
+`CAPTURE_FILE /path/to/captures.txt`. Relative
+paths are relative to the calling CMake source directory; a seed path inside
+`game.toml` is relative to that configuration file. `GAME_CONFIG` is optional.
+Existing legacy-generated C and `extras.c` are not cycle-backend inputs.
+
+`PLAYERS 1` through `PLAYERS 4` sets the launcher's controller count for the title;
+omitting it retains two controllers. Seats three and four are independent
+host inputs for trusted Mods; the physical NES still has two controller ports.
+The hosts publish all seats before game callbacks, and `nes_input_seat(1..4)`
+reads their mapped buttons. Headless input files accept `3:` and `4:` seat
+prefixes. Keep an explicit `legacy` selection in
+projects migrating their default build, with separate build directories for
+the two backends. Enhancements using legacy runtime globals need a cycle
+adapter before the project's migration is complete.
+
+Windowed cartridge games with battery storage automatically load and atomically
+save `<executable dir>/saves/<ROM stem>.sav`. Headless runs persist only with
+`--save-file FILE`; `--no-save` disables loading and writing. A damaged save is
+refused before execution, and a save path pointing at the ROM is refused.
+Cartridge save-state shortcuts use `.cycstate`, leaving previous `.state` files
+available. Save states from the legacy CPU backend are incompatible; raw battery
+RAM can be copied after checking its size. FDS state-slot paths keep `.state`.
+Known MMC1 cartridges use their recorded chip sizes rather than the ambiguous
+iNES compatibility allocation. Zelda USA's SNROM battery is 8 KiB, so its
+legacy raw battery file imports directly. Unknown MMC1 payloads retain the
+32 KiB compatibility allocation; patched derivatives should specify their
+actual RAM geometry in the header. NES 2.0 and explicit iNES MMC1 RAM sizes
+take precedence over inferred sizes.
+
+For owner playtests, `--pause-unfocused` pauses the window while it lacks
+keyboard focus. This allows several separately built titles to remain open.
+The option is off by default; hidden automated windows keep running.
+
+## Famicom Disk System titles
+
+Point `ROM` (or `NESRECOMP_ROM`) at the `.fds`/`.qd` image. The BIOS comes from
+`BIOS` (`NESRECOMP_FDS_BIOS`), else `game.toml` `[fds] bios`, else
+`bios/disksys.rom` beside the image; configure fails unless it matches the
+identity in its `.toml` (`bios/disksys.toml`: size, CRC32, SHA-1). The BIOS
+and its identity file are configure dependencies. The built program runs the
+image and BIOS named at configure time when started without arguments; any
+image and `--fds-bios` can be given on its command line. See the FDS section
+of [README.md](README.md) for the host's disk options.
+
+```cmake
+nesrecomp_add_cycle_game(MyFdsGame
+    ROM "${CMAKE_SOURCE_DIR}/Game.fds"
+    GAME_CONFIG "${CMAKE_SOURCE_DIR}/game.toml")   # [game] fds = true, [fds] bios = "bios/disksys.rom"
+```
+
+## The window: recomp-ui, dev builds, game additions
+
+A windowed build (not `HEADLESS`, SDL2 found) takes recomp-ui's launcher and
+in-game menu from the game's `recomp-ui/` submodule when that checkout has
+what the cycle host needs (the runtime toast and the ROM-picker override);
+`-DNESRECOMP_RECOMP_UI=<checkout>` names another, `OFF` builds without it,
+and `NO_RECOMP_UI` opts one target out. An older submodule builds without it
+and says so. `BOXART file.tga` gives the launcher its art. Settings and every
+binding live in config.ini beside the executable
+([README.md, The window](README.md#the-window)).
+
+`-DNESRECOMP_DEV_UI=ON` builds the developer surface (the FDS drive bar, the
+F1-F4 and F6+ keys, coverage in the title bar); release builds leave it off.
+
+`HOST_EXTRAS <sources>` adds a game's own code: `cyc_host_extras()`
+(`cyc_host_extras.h`) can present a wider picture (widescreen), offer view
+modes to the menu, add menu rows, keep its own config.ini `[Game]` keys, run
+per-frame work, take developer options and add TCP commands. Headless builds
+compile it too.
+
+`MODS GAME_ID <id>` builds the mod runtime in (packages beside the executable
+in `mods/`, the launcher's Mods screen, the runtime menu's rows, mod records in
+save states); game.toml `[[mod_function_hook]]` sites give its plugins hooks
+into the program. See [README.md, Game mods](README.md#game-mods). The
+project needs `CXX` among its languages.
+
+Trusted character adapters can use `cyc_mod_set_ram_read_hook` to change a
+final RAM operand value at a specific instruction PC. The original read,
+bus value and clocks still occur. Opcode fetches, dummy reads, device reads,
+and read-modify-write operands bypass this policy. The callback must be pure;
+registering `NULL` restores ordinary reads. Generated code, compiled RAM
+views and the interpreter use the same policy.
+
+`cyc_render_capture_background(true)` optionally retains the actual physical
+background before the sprite priority mux. Sprite replacement can compose
+against it without changing hardware sprite evaluation or sprite-zero timing.
+Capture is off by default. Its registered save record and isolated-call
+snapshot preserve the current picture and output pipeline when enabled.
+
+Host extras can request `audio_rate` and provide `audio_mix` for trusted PCM
+or stream overlays. Both hosts mix on the emulation thread before SDL queues
+audio or the headless host writes WAV, including audio that the host drops
+while paused or fast-forwarding. `state_loaded` lets a game resynchronize
+its host-side presentation and audio after loading a complete cycle save.
+
+## Optional HD texture packs
+
+New cycle integrations add `MODS HD_PACKS GAME_ID "my-game"` to
+`nesrecomp_add_cycle_game`. The common host loads installed `[[hd_pack]]`
+assets, optionally applies a verified IPS in memory, and presents the native
+PPU through the shared sampler. No game-specific HD callbacks are needed.
+See [Mod packages](../../docs/MOD_PACKAGES.md#mesen-hd-pack-features) for the
+default-off importer, asset/patch identity and launcher selection lifecycle.
+
+The older folder/config adapter is retained: a game that links
+`cyc_presentation.c` can add the shared Mesen-format texture
+sampler with `include("${NESRECOMP_ROOT}/runner/cyc/hdpack.cmake")` and
+`nesrecomp_cyc_enable_hdpack(MyGame)`. Its host extras call
+`cyc_hdpack_power_on()` after cartridge initialization and return
+`cyc_hdpack_present(native, width, height)` from their presentation callback.
+The launcher exposes the existing HD toggle and pack directory only for these
+targets; its values persist in config.ini. Headless overrides can call
+`cyc_hdpack_config(enabled, directory)` before power-on.
+
+The cycle adapter observes the actual PPU fetch, shift and output pipeline.
+It records owned CHR content keys, mapped CHR ROM indices, palettes, flips
+and visible sprite priority without bus reads or additional guest cycles.
+Native pictures stay 256x240; HD presentation can be up to 2560x2400. An
+unmatched pack preserves every original pixel with nearest-neighbor scaling.
+When a window is smaller than its picture, SDL temporarily scales to fit;
+the saved integer-scaling preference resumes after the window is enlarged.
+Five validated save records preserve the current picture and in-flight
+metadata. Loading a state with a different HD enablement, scale or package
+asset/patch fingerprint is refused
+before changing the machine. See [HDPACK.md](../HDPACK.md) for the existing
+format support and limitations; replacement audio is not implemented.
+
+## Audio output stage
+
+`game.toml` `[game] console = "nes"` or `"famicom"` compiles in the console
+whose analog output stage the audio goes through (see the APU section of
+[README.md](README.md)); `"default"` or no key picks by board (famicom for the
+FDS, Namco 163, VRC6 and VRC7, nes otherwise). The program's `--console`
+option overrides it. Any other value fails code generation.
+
+## Native coverage and rebuilding
+
+Unseen code runs through the cycle interpreter. Profile a route with
+`nes_game ROM --frames 3000 --input route.txt --miss-log seeds.txt`, then set
+`NESRECOMP_CYCLE_SEEDS` (or `SEED_FILE`) to the resulting file. This overrides
+`[game].cycle_seed_file`. It is a build input, not a save or RAM image.
+
+Code in RAM that no compiled view covered (copied or generated code, disk code
+reached only through indirect jumps, code the program rewrites) is captured the
+same way: `nes_game ROM --frames 3000 --input route.txt --capture-log
+captures.txt`, then `NESRECOMP_CYCLE_CAPTURES` (or `CAPTURE_FILE`), which
+overrides `[game].cycle_capture_file`. See [Code in RAM](README.md#code-in-ram).
+
+CMake reconfigures when the ROM, configuration, seed or capture file, host compiler or
+code-generator sources change. Each input revision gets its own generated
+directory, preventing obsolete bank translation units from entering the
+target. Prior revisions remain in the build directory and can be discarded
+with that build directory. A missing configured seed or capture file is an error.
+Generation logs and the selected source list are under `cycle-<target>`.
+
+`tools/cyc/test_cyc_project.py` checks the integration with an original ROM,
+including rebuilds after ROM/config/seed edits, paths containing spaces and
+`#`, native coverage, wrong-ROM rejection and source-tree isolation.
+`tools/cyc/test_cyc_owner_roms.py` separately compares a supplied local ROM
+inventory across native, embedded interpreter, standalone interpreter and
+reference core at every CPU/PPU alignment. Its `--resume` option reuses only
+completed runs with matching input, executable and output digests.
+
+## Current migration boundary
+
+This provides cartridge hardware, cycle timing, the cycle host's input/audio/
+video options, persistent cartridge saves, recomp-ui's launcher and runtime
+menu with host-owned bindings (above), save states, and game mods (packages,
+hook sites, isolated calls, custom renderer). The shared modern HD Mod provider
+above replaces game-specific HD integration. Custom `extras.c` hooks, Lua
+interfaces, netplay and the older runtime's save-state
+format use the older runtime APIs and are not automatically ported by this
+build switch; a game's additions go through `HOST_EXTRAS` instead of
+`extras.c`.
+The older scanline runtime still has its original mapper set. Its renderer
+does not emit the PPU bus events needed for accurate MMC2/MMC4/MMC5 behavior;
+the integration therefore runs the validated cycle implementation directly.
+
+## NTSC and PAL regions
+
+`REGION NTSC` or `REGION PAL` on `nesrecomp_add_cycle_game` selects the
+title's hardware timing. The host's `--region ntsc|pal` overrides it. Without
+a project or CLI choice, a NES 2.0 PAL header selects PAL; other headers use
+NTSC because old dumps often omit region. FDS remains NTSC only; Dendy and
+arcade console variants remain unsupported.
+
+PAL runs the 2A07 CPU at 26.6017125 MHz / 16, with the 2C07 PPU at / 5:
+16 PPU dots per five CPU cycles, 341 dots per line, 312 lines and about
+50.007 frames per second. It has no odd-frame skipped dot. The APU uses PAL
+frame-sequencer, noise and DMC tables, and audio sampling and host pacing use
+the PAL clock. DMA begins at an opcode fetch on the 2A07; OAM refresh starts
+on line 265. Red and green emphasis bits swap meaning on the 2C07.
+Sources: [NESdev clock chart](https://www.nesdev.org/wiki/Cycle_reference_chart),
+[CPU variants](https://www.nesdev.org/wiki/CPU_variants),
+[PPU registers](https://www.nesdev.org/wiki/PPU_registers), and
+[Mesen2 NES implementation](https://github.com/SourMesen/Mesen2/tree/master/Core/NES).
+
+PAL states use version 4 and preserve the /5 divider phase. Loading a state
+from another region is refused before changing the machine. NTSC writes
+remain version 2 (version 3 with a Zapper), and same-layout NTSC versions
+1 through 3 remain readable. In-memory isolated-call snapshots also preserve
+the region phase.
+
+Validation: the clock, rendered frame length, APU sequence, opcode-only DMA,
+audio duration, and corrupt/cross-region state contracts have a CTest target,
+`cyc_region_test`. The ten blargg PAL APU ROMs, which were tested on a PAL NES,
+all report PASSED. European Dr. Mario native/interpreter execution matches
+for 1,800 frames at all five PAL alignments and state continuation is exact.
+Its RAM matches independent Mesen frame-for-frame after startup, and sampled
+PPU color indices match exactly after the game initializes its palette.
+Startup comparison records one transient stack flags byte at frame 8; initial
+palette contents differ before initialization. These comparisons cover the
+tested route, rather than every 2C07 register quirk or every PAL game.
+The seven migrated NTSC game routes retained their complete prior 1,800-frame
+trace, memory, CPU and hardware hashes.
+
+## Password saves and content tools
+
+`PASSWORD_SAVE "faxanadu.srm" PASSWORD_SAVE_LABEL "Mantra"` on
+`nesrecomp_add_cycle_game` supplies the launcher's existing password editor.
+The file lives beside the executable, even when `--config` points elsewhere.
+Games implement their own encoder, text-file persistence and restore path in
+`HOST_EXTRAS`. `cyc_host_saves_enabled()` exposes `--no-save` before the launcher
+and game callbacks run; a game must honor it for sidecar loading and writing.
+The password editor is also omitted with `--no-save`.
+
+Trusted text tools can edit the in-memory PRG with `cyc_mod_prg_data_rw`.
+This disables generated dispatch until another image loads, because its
+folded constants would otherwise retain the original bytes. Execution still
+uses the cycle CPU interpreter; disk ROM files are unchanged. Save states
+retain their PRG hash identity and refuse a different patch set.
+
+`cyc_mod_set_ppu_write_hook` observes completed CPU `$2006` addresses and CPU
+`$2007` writes for CHR transfer tracking. Isolated calls suppress these hooks.
+`cyc_mod_chr_poke` updates mapped CHR RAM and invalidates rendering caches;
+it refuses CHR ROM, out-of-range addresses and isolated calls. The shared
+`override_chr.c` tool supports this path when built with `CYC_CONTENT_TOOLS`.
+`cyc_content_test` checks memory, isolation and hook contracts. Faxanadu runtime
+checks cover native/interpreter/reference parity, complete machine restoration
+after mantra capture, accepted password restore, persistence/history, no-save,
+text replacement, tile round trips, visible tile overrides and PNG compilation.

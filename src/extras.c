@@ -1,5 +1,5 @@
 /*
- * extras.c — Game-specific hooks for Super Mario Bros. 3 (NESRecomp)
+ * extras.c — Game-specific hooks for Mushroom Recompiled (NESRecomp)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,11 +15,11 @@ void func_F795(void); /* IRQ vector:   0xF795 */
 void func_NMI(void);
 
 const char *game_get_name(void) {
-    return "Super Mario Bros. 3 Recomp";
+    return "Mushroom Recompiled";
 }
 
 /* Expected CRC32 of ROM data without 16-byte iNES header:
- * Super Mario Bros. 3 (USA) (Rev 1): 0x2E6301ED */
+ * ROM compatível (USA Rev 1): 0x2E6301ED */
 uint32_t game_get_expected_crc32(void) {
     return 0x2E6301ED;
 }

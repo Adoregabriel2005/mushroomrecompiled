@@ -2,7 +2,7 @@
 #define COBJMACROS
 #include "preferences.h"
 #include "choice.h"
-#include "history.h"
+
 #include "theme.h"
 #include <commctrl.h>
 #include <commdlg.h>
@@ -201,7 +201,7 @@ static HWND fields[40], page_nav[7], live_label;
 static int capture_wait_release, previous_pad;
 static HBRUSH panel_brush;
 static WNDPROC unused_proc;
-static const wchar_t *pages[]={L"Teclado",L"Controle",L"Vídeo",L"Áudio",L"O jogo",L"Projeto",L"Créditos"};
+static const wchar_t *pages[]={L"Teclado",L"Controle",L"Vídeo",L"Áudio",L"ROM",L"Projeto",L"Créditos"};
 static const wchar_t *key_names[]={L"Cima",L"Baixo",L"Esquerda",L"Direita",L"B · correr / cauda",L"A · pular / voar",L"Select · itens",L"Start · pausa NES",L"Turbo B",L"Turbo A",L"Menu do PC"};
 static const wchar_t *pad_names[]={L"B · correr / cauda",L"A · pular / voar",L"Select · itens",L"Start · pausa NES",L"Cima",L"Baixo",L"Esquerda",L"Direita",L"Turbo B",L"Turbo A",L"Menu do PC"};
 static HWND add_control(const wchar_t *type,const wchar_t *text,int id,int x,int y,int w,int h,DWORD flags) {
@@ -273,9 +273,9 @@ static void build_page(void) {
   fields[4]=option(344,400,445,600,names,n+1,selected);
   label(L"Áudio original mono do NES, reproduzido nos dois canais. Aumente a reserva se houver cortes.",45,555,1000);
  } else {
-  const wchar_t *text=current_tab==4 ? L"SUPER MARIO BROS. 3\n\nFamicom · 1988 / NES · 1990\nNintendo R&D4\n\nMario e Luigi atravessam oito mundos para recuperar as varinhas dos reis e enfrentar Bowser e os Koopalings.\n\nSuper Leaf, Tanooki Suit, Frog Suit e Hammer Suit ampliam as formas de explorar as fases. No mapa, Select abre os itens; Start inicia ou pausa a partida.\n\nArtes originais da época: Nintendo. Acervo consultado: Super Mario Wiki, galeria de Super Mario Bros. 3." : current_tab==5 ? L"O PROJETO\n\nPort para Windows usando recompilação estática do código 6502 e o runtime cycle-accurate do NESRecomp.\n\nA seleção de ROM exige Super Mario Bros. 3 (USA) (Rev 1). A identificação é verificada antes de habilitar Jogar.\n\nAs configurações são salvas localmente. Salvar e carregar preservam o estado completo da máquina.\n\nReferência de experiência e organização: Mônica no Castelo do Dragão Recomp, de Adoregabriel2005.\n\nProjeto de fã, independente e não oficial. Validação automatizada não comprova todas as fases e dispositivos." : L"CRÉDITOS\n\nJogo, personagens, ilustrações e música: Nintendo.\nDireção: Takashi Tezuka. Produção: Shigeru Miyamoto. Música: Koji Kondo.\n\nBase técnica: NESRecomp / Matthew Stanley e colaboradores.\nControles e banco de mapeamentos: SDL2 e SDL_GameControllerDB (zlib).\nInterface de referência: Adoregabriel2005 / Mônica Recomp.\n\nBeta testers: ALEISTECH e RETROCESSO.\n\nAs ilustrações originais pertencem à Nintendo. As fontes e os arquivos utilizados estão documentados em docs/ARTES.md.\n\nEste projeto não é afiliado, patrocinado ou aprovado pela Nintendo.";
+  const wchar_t *text=current_tab==4 ? L"SUA ROM\n\nO arquivo do jogo é fornecido por quem vai jogar.\n\nSelecione uma ROM .nes compatível. O aplicativo verifica a revisão antes de iniciar e lembra o caminho escolhido.\n\nNas próximas aberturas, a ROM validada inicia diretamente. Esc abre o menu para salvar, carregar, configurar ou sair.\n\nA ROM não acompanha o projeto nem o pacote." : current_tab==5 ? L"MUSHROOM RECOMPILED\n\nAplicativo para Windows com recompilação estática de código 6502 e runtime cycle-accurate NESRecomp.\n\nConfigurações locais, controles remapeáveis, save states e vídeo amplo experimental.\n\nO arquivo de ROM compatível é fornecido pelo usuário.\n\nProjeto independente e não oficial. Consulte a documentação para limites e testes." : L"CRÉDITOS\n\nBase técnica: NESRecomp / Matthew Stanley e colaboradores.\nControles: SDL2 e SDL_GameControllerDB (zlib).\n\nBeta testers: ALEISTECH e RETROCESSO.\n\nIdentidade Underplay: imagem fornecida pelo responsável pelo projeto, utilizada sem modificar o arquivo.\n\nLicenças de terceiros preservadas em LICENSES e LICENSE_SCOPE.md.\n\nO conteúdo da ROM pertence aos seus respectivos titulares.";
   add_control(L"STATIC",text,0,45,125,current_tab==4?610:990,485,SS_LEFT);
-  add_control(L"BUTTON",current_tab==4?L"Ver acervo de artes e fontes":L"Abrir documentação local",950,45,605,500,32,BS_PUSHBUTTON);
+  add_control(L"BUTTON",current_tab==4?L"Visitar Underplay":L"Abrir documentação local",950,45,605,500,32,BS_PUSHBUTTON);
  }
  InvalidateRect(dialog,NULL,TRUE);
 }
@@ -295,7 +295,7 @@ static LRESULT CALLBACK settings_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
   if(id==300){collect_page();input_select(pending.device);input_update();return 0;}
   if(id>=100&&id<111){capture_key=id-100;SetWindowTextW(key_buttons[capture_key],L"Pressione uma tecla…");SetFocus(hwnd);return 0;}
   if(id>=400&&id<411){capture_pad=id-400;capture_wait_release=1;SetWindowTextW(pad_combos[capture_pad],L"Solte e aperte o botão…");return 0;}
-  if(id==950){ShellExecuteW(hwnd,L"open",current_tab==4?L"https://www.mariowiki.com/Gallery:Super_Mario_Bros._3":L"docs",NULL,NULL,SW_SHOWNORMAL);return 0;}
+  if(id==950){ShellExecuteW(hwnd,L"open",current_tab==4?L"https://underplay.com.br":L"docs",NULL,NULL,SW_SHOWNORMAL);return 0;}
  }
  if(msg==WM_KEYDOWN){if(capture_key>=0){int i=capture_key;if(wp!=VK_ESCAPE)pending.keys[i]=(int)wp;capture_key=-1;key_text(i);return 0;}if(wp==VK_ESCAPE){DestroyWindow(hwnd);return 0;}}
  if(msg==WM_TIMER){input_update();if(current_tab==1){int b=input_first_pressed();if(capture_pad>=0){if(b<0)capture_wait_release=0;else if(!capture_wait_release){pending.buttons[capture_pad]=b;wchar_t t[64];swprintf(t,64,L"Botão físico %d",b);SetWindowTextW(pad_combos[capture_pad],t);capture_pad=-1;}}wchar_t live[256];swprintf(live,256,L"%ls   ·   %ls %d",input_name(),b<0?L"Nenhum botão pressionado":L"Botão",b);SetWindowTextW(live_label,live);}

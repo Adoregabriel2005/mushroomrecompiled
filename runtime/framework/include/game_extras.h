@@ -6,7 +6,7 @@
  * appropriate points in the main loop.
  *
  * For games with no special behavior, provide empty implementations.
- * See games/super-mario-bros/extras.c for the stub template.
+ * See games/example/extras.c for the stub template.
  */
 #pragma once
 #include <stdint.h>

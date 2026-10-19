@@ -2,14 +2,16 @@
 
 **The ROM is not included with the project or the ZIP.** Select your compatible copy from the menu. The full game has not yet been validated.
 
-## Widescreen with enemies — v1.4
+## Widescreen and scene fixes — v1.5
 
 The downloadable version expands the scenery of horizontal stages to a 16:9 canvas without stretching tiles or sprites. The original HUD remains centered, with black bars on the sides. Select **Video > Aspect Ratio > 16:9**; new configurations already use this mode.
 
-The compositor uses the actual stage map. v1.4 extends object activation, horizontal culling, and rendering to the 16:9 area; vertical rooms and unsupported scenes remain in native framing. Read the [limits and tests](docs/WIDESCREEN.md). v1.2 remains available for comparison.
-Update: extends enemy activation and persistence to the 16:9 area and draws their sprites outside the old clipping region. Retains edge and menu fixes. Remembers the ROM and launches directly; Esc opens the menu during gameplay.
+The compositor uses the actual stage map. The widescreen mode extends object activation, horizontal culling, and rendering to the 16:9 area; vertical rooms and unsupported scenes remain in native framing. Read the [limits and tests](docs/WIDESCREEN.md). Historical packages remain available with updated download names.
+The current build keeps reward/bonus scenes centered with clean black margins and repairs object seams at the original viewport edges. It extends enemy activation and persistence to the 16:9 area and draws their sprites outside the old clipping region. Retains edge and menu fixes. Remembers the ROM and launches directly; Esc opens the menu during gameplay.
 
 ## Download and test
+
+Download the [portable Windows package](https://github.com/Adoregabriel2005/mushroomrecompiled/releases/tag/v1.5.0-exp), extract the complete ZIP, and run **MushroomRecompiled.exe**.
 
 1. Choose **Select ROM**.
 2. Point to the game ROM as a `.nes` file.
@@ -21,7 +23,7 @@ Requires Windows x64 and a video/audio device recognized by the system. No minim
 
 ## Interface
 
-The menu uses the original era logo and illustrations, with **RECOMPILED** alongside the logo. In-window settings: keyboard, controller, video, audio, The Game, Project, and Credits. Apply saves changes; Discard preserves the previous ones.
+The launcher uses the project identity and the original Underplay image supplied by the project owner. In-window settings: keyboard, controller, video, audio, ROM, Project, and Credits. Apply saves changes; Discard preserves the previous ones.
 
 - Controls: automatic or per-device selection, remapping, dead zone, button test, D-pad and analog. USB/Bluetooth/receivers via SDL2 and SDL_GameControllerDB, based on Windows recognition and pairing.
 - Video: aspect ratio, integer scale/fit/crop, filter, scanlines, brightness, resolution, and borderless fullscreen. 16:9 expands the scenery and object activation range in supported horizontal stages while keeping the original HUD.
@@ -57,7 +59,7 @@ Requires Windows, CMake, LLVM-MinGW/Clang, and mingw32-make in PATH. The first s
 .\build-local.ps1 -RomPath "C:\path\GAME NAME.nes"
 ```
 
-The script compiles the NESRecomp generator, produces the C blocks using your ROM and the seeds in docs/smb3-cycle-seeds.txt, and compiles the application. Generated files are not versioned. Output: build/SuperMarioBros3Recomp-v1.4.0.
+The script compiles the NESRecomp generator, produces the C blocks using your ROM and the seeds in docs/smb3-cycle-seeds.txt, and compiles the application. Generated files are not versioned. Output: build/MushroomRecompiled-v1.5.0.exe.
 
 ```powershell
 .\build-local.ps1 -RomPath "Game name.NES" -Verify
@@ -69,10 +71,12 @@ Auxiliary inspection: `node tools/rom.mjs <ROM.nes> [extraction directory]`; par
 
 ## Credits and licenses
 
-![TEAM](png.png)
+
 
 Beta testers: **ALEISTECH** and **RETROCESSO**. Thanks for the testing and bug reports.
 
-Fan-made, independent, and unofficial project. [Art sources](docs/ARTES.md).
+Independent, unofficial project. [Branding](docs/BRANDING.md).
 
 The integration code is licensed under MIT. NESRecomp is licensed under **PolyForm Noncommercial 1.0.0**; the MIT license of the interface does not alter the runtime's terms. See [LICENSE_SCOPE](LICENSE_SCOPE.md) and LICENSES. The ROM and generated assets are not published; the release executable contains code and materials derived from the game.
+
+[![Powered by Underplay](png.png)](https://underplay.com.br)

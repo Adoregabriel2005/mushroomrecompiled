@@ -1,4 +1,4 @@
-# Widescreen experimental — v1.4.0
+# Widescreen experimental — v1.5.0
 
 Vídeo > Proporção > 16:9 amplia a fase em um canvas 426 × 240, sem esticar sprites ou tiles. A câmera ampla respeita as bordas do mapa. As linhas 192–239 mantêm o HUD original de 256 pixels, centralizado entre duas faixas pretas de 85 pixels.
 
@@ -28,11 +28,19 @@ A ativação antecipada e o descarte mais distante mudam a sequência da partida
 
 ```powershell
 cd build
-.\smb3-wide-verify.exe "..\Super Mario Bros. 3 (USA) (Rev 1).nes"
+.\smb3-wide-verify.exe "..\game.nes"
 ```
 
 O roteiro entra em 1-1 e rola a câmera. Confere o HUD, miolo nativo e barras pixel a pixel; injeta lixo nas bordas para conferir o reparo; verifica inimigos ativos fora da área antiga e retidos além do antigo limite de descarte; recusa índices de spawn duplicados. Uma Piranha no primeiro cano deve estar ativa e ter sprites na margem ampla, enquanto a mesma sequência em modo nativo ainda não a ativa.
 
 Também compara 1.800 estados recompilados/interpretados com inimigos ampliados, verifica continuação determinística após save/load e confirma que a geração isolada de sprites não altera a máquina real. Esses testes cobrem o roteiro, sem comprovar todas as fases.
 
-Pesquisa técnica: [Southbird — Super Mario Bros. 3 Full Disassembly](https://github.com/captainsouthbird/smb3), especialmente PRG000 e PRG005; [SM3Mix](http://www.sonicepoch.com/sm3mix/). O disassembly foi consultado para pesquisa; dados e gráficos vêm da cópia local do usuário. Sobre artefatos originais: [NESdev Mirroring](https://www.nesdev.org/wiki/Mirroring) e [Attribute tables](https://www.nesdev.org/wiki/PPU_attribute_tables).
+Pesquisa técnica: [Southbird — Disassembly de referência](https://github.com/captainsouthbird/smb3), especialmente PRG000 e PRG005; [SM3Mix](http://www.sonicepoch.com/sm3mix/). O disassembly foi consultado para pesquisa; dados e gráficos vêm da cópia local do usuário. Sobre artefatos originais: [NESdev Mirroring](https://www.nesdev.org/wiki/Mirroring) e [Attribute tables](https://www.nesdev.org/wiki/PPU_attribute_tables).
+
+## v1.5 — transições e bordas de objetos
+
+A expansão é desativada durante prêmio, cartões, raster especial e saída da fase. O centro usa exatamente o quadro nativo e todas as margens externas são pretas, sem reaproveitar o mapa anterior. O renderer cobre os oito slots de objetos existentes sem aumentar a capacidade de ativação dos cinco principais. As peças visíveis da OAM permitem alinhar a camada isolada ao quadro real, e sua cobertura também inclui as faixas de 16 pixels reconstruídas nas antigas bordas.
+
+O teste scenes_verify usa troca de destino e posicionamento apenas no processo de teste para percorrer duas fases altas, comparar o fundo reconstruído ao fundo real da PPU e simular os indicadores de prêmio, bônus, raster e saída. Essas intervenções não integram o aplicativo.
+
+O enquadramento usa o scroll realmente aplicado pela PPU, reconstruído no espaço do mapa. A câmera de gameplay em RAM pode estar alguns pixels à frente do quadro exibido; usá-la diretamente criava emendas entre as margens reconstruídas e o centro nativo, especialmente nas fases altas com deslocamento horizontal.

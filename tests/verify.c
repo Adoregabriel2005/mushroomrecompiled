@@ -16,7 +16,7 @@ static uint8_t input(unsigned f) {
     return 0;
 }
 int main(int argc,char **argv) {
-    const char *rom=argc>1?argv[1]:"Super Mario Bros. 3 (USA) (Rev 1).nes";
+    const char *rom=argc>1?argv[1]:"game.nes";
     if (!glue_load_rom(rom)) { fprintf(stderr,"ROM load failed\n"); return 1; }
     cyc_run_miss=calloc(cyc_run_miss_slots(),sizeof(uint32_t));
     if (!cyc_run_miss) return 2;

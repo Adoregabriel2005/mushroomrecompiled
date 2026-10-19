@@ -34,7 +34,7 @@ Validar manualmente controles e áudio no Windows do usuário e ampliar a cobert
 
 ## Interface v1.2
 
-Launcher abre antes da partida, com ROM validada, controles, configurações, jogo e save states. Telas internas reescritas com sete abas, aplicar/descartar/restaurar, seletores próprios e navegação por teclado/gamepad. Artes clássicas verificadas e fontes em ARTES.md.
+Launcher abre antes da partida, com ROM validada, controles, configurações, jogo e save states. Telas internas reescritas com sete abas, aplicar/descartar/restaurar, seletores próprios e navegação por teclado/gamepad. Os pacotes históricos preservam a interface daquela versão; a identidade atual está em BRANDING.md.
 
 Volume, brilho, scanlines, resolução, tela cheia, dispositivo de áudio e frequência agora são aplicados. Reserva de áudio usa blocos de 10 ms para 20/40/60 ms de prefill. Select não abre mais o menu do PC. Corrigido fechamento duplo do joystick ao desconectar um GameController SDL. Preferência de dispositivo usa caminho estável, com GUID como fallback.
 
@@ -53,3 +53,9 @@ No modo 16:9, registros normais de objetos são ativados com base na câmera amp
 O teste atual compara 1.800 estados nativos/interpretados com a mesma política ampla, verifica HUD/barras/miolo, reparo das bordas, inimigos adiantados e retidos, índices de spawn únicos e save/load. Um controle sem widescreen comprova a diferença de ativação da primeira Piranha. Cobertura de todas as fases ainda pendente.
 
 Beta testers: ALEISTECH e RETROCESSO, creditados no README e na página Créditos do aplicativo.
+
+## v1.5 — cenas, plataformas e identidade
+
+O compositor amplo agora exige o modo de fase normal e raster padrão, sem transição, cartão final ou saída para o mapa. Prêmios e bônus voltam ao quadro nativo centralizado com margens pretas limpas. Os objetos que cruzam as duas faixas reconstruídas de 16 pixels também são desenhados nessas faixas. Partes geradas na cópia isolada são alinhadas à OAM realmente usada no quadro, evitando emendas de um quadro entre partes da mesma plataforma.
+
+A apresentação usa Mushroom Recompiled e a imagem Underplay fornecida, sem editar o arquivo. As artes promocionais e capturas anteriores foram removidas dos arquivos atuais. Os pacotes antigos permanecem históricos, com nomes atualizados.

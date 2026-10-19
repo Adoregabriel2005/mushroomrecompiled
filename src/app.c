@@ -234,7 +234,7 @@ static void try_load_rom(const wchar_t *path) {
         audio_reset();
         save_settings();
     } else {
-        show_message(L"ROM incompatível. Selecione Super Mario Bros. 3 (USA) (Rev 1), arquivo .nes.");
+        show_message(L"ROM incompatível. Selecione ROM compatível (USA Rev 1), arquivo .nes.");
     }
     update_menu_visibility();
     InvalidateRect(main_window, NULL, FALSE);
@@ -268,7 +268,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         const wchar_t *btn_labels[MENU_COUNT] = {
             L"Jogar / Retomar", L"Reiniciar aventura", L"Controles",
-            L"Configurações", L"Selecionar ROM", L"Sobre o jogo",
+            L"Configurações", L"Selecionar ROM", L"Sobre o projeto",
             L"Salvar · slot 1", L"Carregar · slot 1", L"Tela cheia", L"Sair"
         };
 
@@ -527,7 +527,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd_line, int show_cm
     wc.lpfnWndProc = window_proc;
     wc.hInstance = inst;
     wc.lpszClassName = L"Smb3RecompWindow";
-    wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(101));
+    wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     if (!wc.hIcon) wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     wc.hbrBackground = CreateSolidBrush(RGB(18, 22, 34));
@@ -539,7 +539,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd_line, int show_cm
     int sy = (GetSystemMetrics(SM_CYSCREEN) - win_h) / 2;
 
     main_window = CreateWindowExW(0, L"Smb3RecompWindow",
-                                 L"Super Mario Bros. 3 Recompiled · v1.4.0",
+                                 L"Mushroom Recompiled · v1.5.0",
                                  WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,
                                  sx, sy, win_w, win_h, NULL, NULL, inst, NULL);
 

@@ -5,13 +5,17 @@
 #include "wide_enemies.h"
 #include "cyc_core.h"
 #include "cyc_mod.h"
+#include "cyc_render.h"
+#include "widescreen.h"
 #include "cpu6502.h"
 #include <string.h>
 static bool enabled;
-static Smb3EnemyLayer layers[5];
+static Smb3EnemyLayer layers[SMB3_OBJECT_SLOTS];
 bool smb3_enemies_scene(const uint8_t *r){
  int set=r[0x70a],screens=r[0x372]+1;
- return set>=1&&set<=14&&set!=7&&!r[0x3ef]&&screens>1&&screens<=15&&r[0x100]!=0x80&&r[0x561]&&!r[0x55f]&&!r[0x3de];
+ return set>=1&&set<=14&&set!=7&&!r[0x3ef]&&screens>1&&screens<=15&&
+  r[0x100]==0xc0&&r[0x101]==0&&r[0x561]&&!r[0x55f]&&!r[0x3de]&&!r[0x559]&&!r[0x14]&&
+  !cyc_mod_peek(0x7974);
 }
 int smb3_enemies_camera(const uint8_t *r){
  int camera=r[0x12]*256+r[0xfd]-85,max=(r[0x372]+1)*256-426;
@@ -65,8 +69,9 @@ void smb3_enemies_capture(void){
  memset(layers,0,sizeof layers);
  const uint8_t *r=cyc_cpu_ram();
  if(!enabled||!smb3_enemies_scene(r))return;
- int native=r[0x12]*256+r[0xfd],wide=smb3_enemies_camera(r);
- for(int slot=0;slot<5;slot++){
+ int native,frame_y;smb3_wide_frame_camera(r,&native,&frame_y);
+ int wide=smb3_enemies_camera(r);
+ for(int slot=0;slot<SMB3_OBJECT_SLOTS;slot++){
   int x=r[0x76+slot]*256+r[0x91+slot],state=r[0x661+slot];
   if(state<2||x+64<wide||x>=wide+426||(x>=native&&x+64<native+256))continue;
   int camera=x>64?x-64:0;
@@ -86,6 +91,25 @@ void smb3_enemies_capture(void){
    layers[slot].camera=camera;layers[slot].valid=true;
   }
   cyc_mod_isolate_end();
+  /* Some routines draw before applying velocity. Align the scratch drawing
+   * to the DMA OAM actually used this frame whenever a visible piece exists.
+   * This avoids a one-frame split at the old viewport boundary. */
+  if(layers[slot].valid){
+   const uint8_t *original=cyc_render_oam();int best=0;
+   for(int sample=0;sample<64;sample++){
+    const uint8_t *a=original+sample*4,*b=layers[slot].oam+sample*4;
+    if(a[0]>=191||b[0]>=191||a[1]!=b[1]||a[2]!=b[2])continue;
+    int dx=native+a[3]-camera-b[3],dy=(int)a[0]-b[0];
+    if(dx < -8||dx>8||dy < -8||dy>8)continue;
+    int matches=0;
+    for(int i=0;i<64;i++){
+     const uint8_t *p=original+i*4,*q=layers[slot].oam+i*4;
+     if(p[0]<191&&q[0]<191&&p[1]==q[1]&&p[2]==q[2]&&
+        native+p[3]-camera-q[3]==dx&&(int)p[0]-q[0]==dy)matches++;
+    }
+    if(matches>best){best=matches;layers[slot].offset_x=dx;layers[slot].offset_y=dy;}
+   }
+  }
   r=cyc_cpu_ram();
  }
 }

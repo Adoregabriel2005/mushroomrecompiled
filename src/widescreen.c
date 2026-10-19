@@ -14,6 +14,15 @@ static uint8_t opaque[SMB3_WIDE_WIDTH*192];
 static uint8_t sprite_claimed[SMB3_WIDE_WIDTH*192];
 static bool tables_ok,captured,active;
 static int origin;
+void smb3_wide_frame_camera(const uint8_t *state,int *x,int *y){
+ int game_x=state[0x12]*256+state[0xfd],game_y=state[0x13]*240+state[0xfc];
+ /* Gameplay RAM may already describe the next frame. Reconstruct the world
+  * position of the scroll actually latched by the PPU for this picture. */
+ int dx=((cyc_render_line_scroll_x(8)-(game_x&255)+128)&255)-128;
+ int ppu_y=(cyc_render_line_scroll_y(8)-8+480)%480;
+ int dy=(ppu_y-game_y%480+720)%480-240;
+ *x=game_x+dx;*y=game_y+dy;
+}
 
 bool smb3_wide_load(const uint8_t *rom,size_t n) {
  tables_ok=false;
@@ -58,6 +67,7 @@ static unsigned terrain_pixel(int wx,int wy,int set) {
 /* Repair the two native edge metatiles from the full level map, rather than
  * the PPU's partially updated nametable/attribute columns. Restore their
  * sprites from captured OAM; do not change gameplay or the PPU itself. */
+uint32_t smb3_wide_terrain_argb(int x,int y){return colors[terrain_pixel(x,y,ram[0x70a])];}
 static bool repaired_column(int x,int x0) {
  return x<x0+16 || x>=x0+240;
 }
@@ -89,12 +99,10 @@ const uint32_t *smb3_wide_present(const uint32_t *native) {
  int set=ram[0x70a],screens=ram[0x372]+1;
  /* Menus, map, bonus games, vertical rooms and raster effects stay stock.
   * Horizontal multi-screen levels have a fully expanded block map in SRAM. */
- bool playable=tables_ok&&captured&&set>=1&&set<=14&&set!=7&&
-  !ram[0x3ef]&&screens>1&&screens<=15&&ram[0x100]!=0x80&&
+ bool playable=tables_ok&&captured&&smb3_enemies_scene(ram)&&
   (cyc_render_line_mask(8)&0x08);
  if(playable){
-  int camera_x=ram[0x12]*256+ram[0xfd];
-  int camera_y=ram[0x13]*240+ram[0xfc];
+  int camera_x,camera_y;smb3_wide_frame_camera(ram,&camera_x,&camera_y);
   int level_width=screens*256;
   int wide_camera=camera_x-85;if(wide_camera<0)wide_camera=0;
   if(wide_camera>level_width-426)wide_camera=level_width-426;
@@ -111,15 +119,15 @@ const uint32_t *smb3_wide_present(const uint32_t *native) {
    for(int y=0;y<192;y++)memcpy(canvas+y*426+origin+16,native+y*256+16,224*sizeof(uint32_t));
    sprite_edges(origin);
    const Smb3EnemyLayer *layers=smb3_enemies_layers();
-   for(int spr=0;spr<64;spr++)for(int object=0;object<5;object++){
+   for(int spr=0;spr<64;spr++)for(int object=0;object<SMB3_OBJECT_SLOTS;object++){
     if(!layers[object].valid)continue;
     const uint8_t *s=layers[object].oam+spr*4;
-    int y=s[0]+1,x=layers[object].camera-wide_camera+s[3];
+    int y=s[0]+1+layers[object].offset_y,x=layers[object].camera-wide_camera+s[3]+layers[object].offset_x;
     if(y>=192)continue;
     unsigned tile=s[1],attr=s[2],base=(tile&1)*4096+(tile&0xfe)*16;
     for(int dy=0;dy<16;dy++)for(int dx=0;dx<8;dx++){
      int px=x+dx,py=y+dy;
-     if(px<0||px>=426||py>=192||(px>=origin&&px<origin+256)||!(cyc_render_line_mask(py)&0x10))continue;
+     if(px<0||px>=426||py<0||py>=192||!repaired_column(px,origin)||!(cyc_render_line_mask(py)&0x10))continue;
      unsigned row=(attr&0x80)?15-dy:dy,col=(attr&0x40)?dx:7-dx;
      unsigned address=base+(row/8)*16+(row&7);
      unsigned v=((chr[address]>>col)&1)|(((chr[address+8]>>col)&1)<<1);

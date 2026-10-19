@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <wchar.h>
 
-/* Custom inline value selector for Super Mario Bros. 3 Recomp.
+/* Custom inline value selector for Mushroom Recompiled.
  * Replaces OS dropdowns with an inline stepper with arrows and keyboard/mousewheel support. */
 typedef struct {
     wchar_t **values;

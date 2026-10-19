@@ -36,10 +36,12 @@ cycle-misses.txt
 /tools/nesrecomp-src/runner/external/
 # Only used, attributed artwork belongs in the public source package
 /assets/*
-!/assets/official-logo.png
-!/assets/official-key-art.png
-!/assets/official-cover.png
+
+
+
 !/assets/gamecontrollerdb.txt
-!/assets/app.ico
+
 wide-output-*.png
 wide-reference-*.png
+
+scene-*.png

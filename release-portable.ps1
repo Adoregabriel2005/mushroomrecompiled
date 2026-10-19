@@ -1,24 +1,25 @@
-param([string]$Version='1.4.0')
+param([string]$Version='1.5.0')
 $ErrorActionPreference='Stop'
 Push-Location $PSScriptRoot
 try {
  if($Version -notmatch '^\d+\.\d+(\.\d+)?$'){throw 'Versão inválida'}
- $name="SMB3-Recomp-v$Version"
+ $name="MushroomRecompiled-v$Version"
  $stageRoot=Join-Path 'build' ('package-'+[Guid]::NewGuid().ToString('N'))
  $stage=Join-Path $stageRoot $name
  New-Item -ItemType Directory -Force "$stage/assets","$stage/docs","$stage/LICENSES",releases | Out-Null
- Copy-Item "build/SuperMarioBros3Recomp-v$Version.exe" "$stage/SuperMarioBros3Recomp.exe"
+ Copy-Item "build/MushroomRecompiled-v$Version.exe" "$stage/MushroomRecompiled.exe"
  Copy-Item build/SDL2.dll "$stage/SDL2.dll"
  Copy-Item LICENSE,LICENSE_SCOPE.md "$stage/"
- Copy-Item assets/official-logo.png,assets/official-key-art.png,assets/official-cover.png,assets/gamecontrollerdb.txt "$stage/assets/"
+ Copy-Item assets/gamecontrollerdb.txt "$stage/assets/"
+ Copy-Item png.png "$stage/png.png"
  Copy-Item LICENSES/SDL2.txt,LICENSES/SDL_GameControllerDB.txt,LICENSES/emu2413.txt "$stage/LICENSES/"
  Copy-Item tools/nesrecomp-src/LICENSE "$stage/LICENSES/NESRecomp.txt"
- Copy-Item docs/INTERFACE.md,docs/ARTES.md,docs/TESTAR.md,docs/STATUS.md,docs/WIDESCREEN.md "$stage/docs/"
+ Copy-Item docs/INTERFACE.md,docs/BRANDING.md,docs/TESTAR.md,docs/STATUS.md,docs/WIDESCREEN.md "$stage/docs/"
  @"
-Super Mario Bros. 3 Recompiled v$Version — experimental
+Mushroom Recompiled v$Version — experimental
 
-Extraia o ZIP inteiro e abra SuperMarioBros3Recomp.exe.
-Selecione sua ROM Super Mario Bros. 3 (USA) (Rev 1), arquivo .nes.
+Extraia o ZIP inteiro e abra MushroomRecompiled.exe.
+Selecione sua ROM compatível (USA Rev 1), arquivo .nes.
 A ROM não acompanha o pacote.
 Após selecionar uma ROM válida, o jogo inicia diretamente, inclusive nas próximas aberturas.
 Sem uma ROM lembrada válida, o menu inicial aparece.

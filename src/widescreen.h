@@ -11,3 +11,5 @@ void smb3_wide_capture(void);
 const uint32_t *smb3_wide_present(const uint32_t *native);
 bool smb3_wide_active(void);
 int smb3_wide_origin(void);
+uint32_t smb3_wide_terrain_argb(int world_x,int world_y);
+void smb3_wide_frame_camera(const uint8_t *state,int *x,int *y);

@@ -1,4 +1,4 @@
-param([string]$RomPath='Super Mario Bros. 3 (USA) (Rev 1).nes',[string]$BuildDir='build',[switch]$Verify)
+param([string]$RomPath='game.nes',[string]$BuildDir='build',[switch]$Verify)
 $ErrorActionPreference='Stop'
 Push-Location $PSScriptRoot
 try {
@@ -22,5 +22,5 @@ try {
         $verifierPath=(Resolve-Path "$BuildDir/smb3-verify.exe").Path
         Run-Native $verifierPath "`"$rom`"" "$BuildDir/verify"
     }
-    Write-Host "Build: $BuildDir/SuperMarioBros3Recomp-v1.4.0.exe"
+    Write-Host "Build: $BuildDir/MushroomRecompiled-v1.5.0.exe"
 } finally { Pop-Location }

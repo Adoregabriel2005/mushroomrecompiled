@@ -1,6 +1,6 @@
 # Interface e controles — v1.2
 
-O programa abre no launcher. Use Selecionar ROM para indicar Super Mario Bros. 3 (USA) (Rev 1); o payload é validado antes de habilitar Jogar. Uma ROM carregada não inicia a partida automaticamente.
+O programa abre no launcher. Use Selecionar ROM para indicar ROM compatível (USA Rev 1); o payload é validado antes de habilitar Jogar. Uma ROM validada inicia diretamente e é lembrada para as próximas aberturas.
 
 - Teclado: setas, Z = B, X = A, Shift = Select, Enter = Start, A/S = turbo, Esc = menu do PC. Todos são remapeáveis.
 - Controle: seleção automática ou por dispositivo; botões físicos remapeáveis; D-pad e analógico; zona morta; teste de botão e hotplug. A configuração Menu é independente de Select. Guide/Home abre o menu por padrão; controles sem esse botão podem remapear a ação.
@@ -9,7 +9,7 @@ O programa abre no launcher. Use Selecionar ROM para indicar Super Mario Bros. 3
 - Áudio: volume, mute, frequência 44,1/48/96 kHz, dispositivo e reserva de 20/40/60 ms. Saída NES mono nos dois canais.
 - Aplicar e voltar salva as alterações; Descartar mantém as anteriores. Restaurar esta página afeta apenas o grupo atual e exige Aplicar para persistir.
 - 1–5 selecionam o slot de save state. Carregar retoma a partida; Esc abre o menu; F11 alterna tela cheia.
-- O jogo, Projeto e Créditos fornecem contexto e fontes das artes.
+- ROM, Projeto e Créditos descrevem o aplicativo, a ROM do usuário e a identidade Underplay.
 
 Validação: smb3-ui-verify cria a interface sem abrir janelas visíveis, renderiza sete páginas, verifica Aplicar/Descartar e testa entrada, soltura e remoção de um controle virtual SDL. Capturas em build/ui-*.png. O teste do runtime continua sendo smb3-verify.
 

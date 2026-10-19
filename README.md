@@ -12,7 +12,7 @@ Atualização: amplia a ativação e a permanência dos inimigos para a área 16
 ## Baixar e testar
 
 1. Escolha **Selecionar ROM**.
-2. Indique **Super Mario Bros. 3 (USA) (Rev 1)**, arquivo `.nes`.
+2. Indique a Rom do Jogo, Em arquivo `.nes`.
 3. Após a validação, o jogo inicia. Nas próximas aberturas, a ROM lembrada é carregada diretamente.
 
 **Esc** pausa e abre o menu para salvar, carregar, continuar, configurar ou sair. Sem ROM cadastrada, ou se o arquivo salvo estiver ausente/incompatível, o launcher aparece. A inicialização direta não carrega um save state automaticamente.

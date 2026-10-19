@@ -1,4 +1,4 @@
-# SMB3 Recompiled
+# Mushroom Recompiled
 
 **A ROM não acompanha o projeto nem o ZIP.** Selecione sua cópia compatível no menu. O jogo inteiro ainda não foi validado.
 

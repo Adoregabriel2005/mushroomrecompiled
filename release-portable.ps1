@@ -20,6 +20,9 @@ Super Mario Bros. 3 Recompiled v$Version — experimental
 Extraia o ZIP inteiro e abra SuperMarioBros3Recomp.exe.
 Selecione sua ROM Super Mario Bros. 3 (USA) (Rev 1), arquivo .nes.
 A ROM não acompanha o pacote.
+Após selecionar uma ROM válida, o jogo inicia diretamente, inclusive nas próximas aberturas.
+Sem uma ROM lembrada válida, o menu inicial aparece.
+Esc pausa e abre o menu para salvar, carregar, continuar, configurar ou sair.
 
 Widescreen: Configurações > Vídeo > Proporção > 16:9.
 O cenário horizontal é ampliado; o HUD original fica no centro com barras pretas.

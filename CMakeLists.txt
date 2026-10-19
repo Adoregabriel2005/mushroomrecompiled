@@ -10,7 +10,7 @@ add_library(smb3-core STATIC ${NESRECOMP_CYC_SOURCES} ${CYCLE_BANKS} runtime/glu
 target_include_directories(smb3-core PUBLIC ${NESRECOMP_CYC_INCLUDE_DIRS} runtime generated src)
 target_link_libraries(smb3-core PUBLIC ${NESRECOMP_CYC_LIBRARIES})
 add_executable(Smb3Recomp WIN32 src/app.c src/theme.c src/preferences.c src/choice.c src/input.c src/app.rc)
-set_target_properties(Smb3Recomp PROPERTIES OUTPUT_NAME "SuperMarioBros3Recomp-v1.3")
+set_target_properties(Smb3Recomp PROPERTIES OUTPUT_NAME "SuperMarioBros3Recomp-v1.3.1")
 target_include_directories(Smb3Recomp PRIVATE "${SDL2_DIR}/include")
 target_compile_definitions(Smb3Recomp PRIVATE UNICODE _UNICODE WINVER=0x0A00 _WIN32_WINNT=0x0A00)
 target_link_directories(Smb3Recomp PRIVATE "${SDL2_DIR}/lib/x64")

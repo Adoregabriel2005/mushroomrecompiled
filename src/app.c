@@ -227,16 +227,23 @@ static void try_load_rom(const wchar_t *path) {
     if (!path || !path[0]) return;
     if (glue_load_rom_wide(path)) {
         wcsncpy(rom_path, path, 32767);
+        rom_path[32767] = 0;
         rom_ready = 1;
-        running = 0;
+        running = 1;
         paused = 0;
-        show_message(L"ROM USA Rev 1 validada. Escolha Jogar para iniciar.");
+        audio_reset();
         save_settings();
     } else {
         show_message(L"ROM incompatível. Selecione Super Mario Bros. 3 (USA) (Rev 1), arquivo .nes.");
     }
     update_menu_visibility();
     InvalidateRect(main_window, NULL, FALSE);
+}
+
+static void restore_saved_rom(void) {
+    wchar_t saved_rom[32768];
+    GetPrivateProfileStringW(L"app", L"rom", L"", saved_rom, 32768, ini_path);
+    if (saved_rom[0]) try_load_rom(saved_rom);
 }
 
 static void prompt_rom_file(void) {
@@ -391,8 +398,9 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if(wp==VK_RETURN){SendMessageW(hwnd,WM_COMMAND,menu_ids[menu_selection],0);return 0;}
         }
         if (wp == VK_ESCAPE || wp == (WPARAM)cfg.keys[10]) {
-            if (rom_ready) {
+            if (rom_ready && !(lp & (1L << 30))) {
                 paused ^= 1;
+                audio_reset();
                 update_menu_visibility();
                 InvalidateRect(hwnd, NULL, FALSE);
             }
@@ -520,30 +528,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd_line, int show_cm
     int sy = (GetSystemMetrics(SM_CYSCREEN) - win_h) / 2;
 
     main_window = CreateWindowExW(0, L"Smb3RecompWindow",
-                                 L"Super Mario Bros. 3 · v1.3",
+                                 L"Super Mario Bros. 3 · v1.3.1",
                                  WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                  sx, sy, win_w, win_h, NULL, NULL, inst, NULL);
 
     audio_open();
 
-    /* Try locating default ROM:
-     * 1) config.ini path
-     * 2) "Super Mario Bros. 3 (USA) (Rev 1).nes" in current dir
-     * 3) Command line argument */
-    if (cmd_line && cmd_line[0]) {
-        try_load_rom(cmd_line);
-    } else {
-        wchar_t default_rom[32768];
-        GetPrivateProfileStringW(L"app", L"rom", L"", default_rom, 32768, ini_path);
-        if (default_rom[0] && GetFileAttributesW(default_rom) != INVALID_FILE_ATTRIBUTES) {
-            try_load_rom(default_rom);
-        } else {
-            swprintf(default_rom, 32768, L"%ls\\Super Mario Bros. 3 (USA) (Rev 1).nes", root_dir);
-            if (GetFileAttributesW(default_rom) != INVALID_FILE_ATTRIBUTES) {
-                try_load_rom(default_rom);
-            }
-        }
-    }
+    int argument_count = 0;
+    LPWSTR *arguments = CommandLineToArgvW(GetCommandLineW(), &argument_count);
+    if (arguments && argument_count > 1) try_load_rom(arguments[1]);
+    else restore_saved_rom();
+    if (arguments) LocalFree(arguments);
 
     update_menu_visibility();
     if(cfg.fullscreen)toggle_fullscreen();

@@ -12,3 +12,7 @@ O programa abre no launcher. Use Selecionar ROM para indicar Super Mario Bros. 3
 - O jogo, Projeto e Créditos fornecem contexto e fontes das artes.
 
 Validação: smb3-ui-verify cria a interface sem abrir janelas visíveis, renderiza sete páginas, verifica Aplicar/Descartar e testa entrada, soltura e remoção de um controle virtual SDL. Capturas em build/ui-*.png. O teste do runtime continua sendo smb3-verify.
+
+## Widescreen v1.3
+
+Em Vídeo > Proporção, 16:9 agora amplia o cenário horizontal, mantendo o HUD centralizado e barras pretas apenas nas laterais dele. O ajuste da janela usa a proporção do canvas e preserva o tamanho relativo dos pixels, sem esticar a imagem. Não é o antigo 16:9 esticado. Esse modo é experimental: a ativação de inimigos permanece original, e salas verticais ou sem espaço lateral disponível ficam no enquadramento nativo. Consulte WIDESCREEN.md.

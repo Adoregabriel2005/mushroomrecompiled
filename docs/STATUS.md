@@ -39,3 +39,9 @@ Launcher abre antes da partida, com ROM validada, controles, configurações, jo
 Volume, brilho, scanlines, resolução, tela cheia, dispositivo de áudio e frequência agora são aplicados. Reserva de áudio usa blocos de 10 ms para 20/40/60 ms de prefill. Select não abre mais o menu do PC. Corrigido fechamento duplo do joystick ao desconectar um GameController SDL. Preferência de dispositivo usa caminho estável, com GUID como fallback.
 
 smb3-ui-verify passou: renderização das sete páginas, aplicar/descartar, entrada e soltura de botão virtual, hotplug. O teste de 3.000 quadros do runtime continua passando. Não houve validação física de todos os controles USB/Bluetooth.
+
+## v1.3 — prévia widescreen
+
+Canvas 426 × 240 com expansão real de cenário em fases horizontais e HUD original centralizado, entre barras pretas. Compositor lê mapa em SRAM e gráficos observados antes do IRQ do HUD. Não modifica CPU, física ou lógica de inimigos.
+
+Teste widescreen: 1.800 hashes de máquina idênticos entre modo ligado/desligado; 630 quadros de fase ampliada; câmera até 456 pixels; HUD e barras verificados. Limites e referências em WIDESCREEN.md. A ativação de objetos permanece original; salas verticais e cenas não suportadas ficam em formato nativo.

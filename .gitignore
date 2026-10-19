@@ -41,3 +41,5 @@ cycle-misses.txt
 !/assets/official-cover.png
 !/assets/gamecontrollerdb.txt
 !/assets/app.ico
+wide-output-*.png
+wide-reference-*.png

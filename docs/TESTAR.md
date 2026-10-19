@@ -18,3 +18,5 @@ Não anexe ROM, saves ou arquivos de configuração pessoais. Não existe envio 
 ## Limitações
 
 Build experimental. O jogo completo, todos os modos de vídeo e todos os modelos físicos de controle não foram certificados. Há fallback interpretado para uma instrução na fronteira de banco no roteiro conhecido. Testes de tradução compartilham o modelo de hardware, portanto não constituem uma referência independente de console físico.
+
+Para o widescreen v1.3, compare 4:3 e 16:9 na fase 1-1: confirme cenário adicional, pixels sem alongamento e o mesmo HUD entre barras pretas. Salas verticais e telas de mapa/título continuam em formato nativo. Consulte WIDESCREEN.md.

@@ -82,7 +82,7 @@ void preferences_defaults(Preferences *p) {
     for (int i = 0; i < 11; i++) p->buttons[i] = -1;
     p->deadzone = 25;
     p->resolution = 2;       /* 768x720 default (3x) */
-    p->aspect = 0;           /* 4:3 default */
+    p->aspect = 2;           /* wide phase, original HUD */
     p->scale = 0;            /* Fit */
     p->filter = 0;           /* Pixel Art / Crisp */
     p->scanlines = 0;        /* Off */
@@ -162,7 +162,7 @@ RECT video_destination(int w, int h, int aspect, int scale, RECT *source) {
     *source = (RECT){0, 0, 256, 240};
     if (w <= 0 || h <= 0) return dst;
 
-    /* Aspect ratio: 0: 4:3, 1: 8:7 (1:1 PAR), 2: 16:9 */
+    /* Native aspect modes. The extended 16:9 canvas is fitted by app.c. */
     int an = (aspect == 1) ? 16 : (aspect == 2) ? 16 : 4;
     int ad = (aspect == 1) ? 15 : (aspect == 2) ? 9  : 3;
 
@@ -246,7 +246,7 @@ static void build_page(void) {
   live_label=label(input_name(),35,566,1010);
   label(L"Aperte um botão para testar. Home/Guide abre o menu; Select continua disponível no NES.",35,605,1020);
  } else if(current_tab==2) {
-  const wchar_t *aspect[]={L"4:3 · televisão",L"Pixels quadrados · 16:15",L"16:9 · esticado"};
+  const wchar_t *aspect[]={L"4:3 · televisão",L"Pixels quadrados · 16:15",L"16:9 · fase ampliada / HUD original"};
   const wchar_t *scale[]={L"Ajustar à janela",L"Escala inteira",L"Recortar e preencher"};
   const wchar_t *filter[]={L"Nítido · nearest",L"Suave · bilinear"};
   const wchar_t *scan[]={L"Desligadas",L"Suaves",L"Marcadas"};
@@ -258,7 +258,8 @@ static void build_page(void) {
   fields[0]=option(320,400,133,600,aspect,3,pending.aspect); fields[1]=option(321,400,195,600,scale,3,pending.scale);
   fields[2]=option(322,400,257,600,filter,2,pending.filter);fields[3]=option(323,400,319,600,scan,3,pending.scanlines);
   fields[4]=option(324,400,381,600,sizes,5,pending.resolution);fields[5]=option(325,400,443,600,mode,2,pending.fullscreen);fields[6]=option(326,400,505,600,bright,5,(pending.brightness-50)/25);
-  label(L"16:9 altera a apresentação. O jogo mantém o campo de visão original.",45,585,1000);
+  label(L"16:9 amplia o cenário nas fases horizontais. HUD centralizado, com barras pretas.",45,585,1000);
+  label(L"Experimental: inimigos usam a ativação original; salas verticais mantêm a largura original.",45,615,1000);
  } else if(current_tab==3) {
   const wchar_t *vol[]={L"0%",L"10%",L"20%",L"30%",L"40%",L"50%",L"60%",L"70%",L"80%",L"90%",L"100%"};
   const wchar_t *rates[]={L"44.100 Hz",L"48.000 Hz",L"96.000 Hz"}; const wchar_t *muted[]={L"Som ligado",L"Silenciar"};
@@ -289,7 +290,7 @@ static LRESULT CALLBACK settings_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
   if(id>=200&&id<207){collect_page();current_tab=id-200;build_page();return 0;}
   if(id==900){collect_page();*target_prefs=pending;DestroyWindow(hwnd);SendMessageW(owner_window,PREFS_APPLIED,0,0);return 0;}
   if(id==901){DestroyWindow(hwnd);return 0;}
-  if(id==902){Preferences defaults;preferences_defaults(&defaults);if(current_tab==0)memcpy(pending.keys,defaults.keys,sizeof pending.keys);else if(current_tab==1){memcpy(pending.buttons,defaults.buttons,sizeof pending.buttons);pending.deadzone=25;pending.device[0]=0;}else if(current_tab==2){pending.aspect=0;pending.scale=0;pending.filter=0;pending.scanlines=0;pending.brightness=100;pending.resolution=2;pending.fullscreen=0;}else if(current_tab==3){pending.volume=100;pending.muted=0;pending.sample_rate=48000;pending.latency=1;pending.audio_device[0]=0;}build_page();return 0;}
+  if(id==902){Preferences defaults;preferences_defaults(&defaults);if(current_tab==0)memcpy(pending.keys,defaults.keys,sizeof pending.keys);else if(current_tab==1){memcpy(pending.buttons,defaults.buttons,sizeof pending.buttons);pending.deadzone=25;pending.device[0]=0;}else if(current_tab==2){pending.aspect=2;pending.scale=0;pending.filter=0;pending.scanlines=0;pending.brightness=100;pending.resolution=2;pending.fullscreen=0;}else if(current_tab==3){pending.volume=100;pending.muted=0;pending.sample_rate=48000;pending.latency=1;pending.audio_device[0]=0;}build_page();return 0;}
   if(id==311){collect_page();input_select(pending.device);input_update();build_page();return 0;}
   if(id==300){collect_page();input_select(pending.device);input_update();return 0;}
   if(id>=100&&id<111){capture_key=id-100;SetWindowTextW(key_buttons[capture_key],L"Pressione uma tecla…");SetFocus(hwnd);return 0;}
@@ -315,7 +316,3 @@ void preferences_open(HWND parent,Preferences *p,int tab,const wchar_t *assets){
 }
 int preferences_route(MSG *msg){if(!dialog)return 0;if(msg->hwnd==dialog||IsChild(dialog,msg->hwnd)){if(msg->message==WM_KEYDOWN&&(capture_key>=0||msg->wParam==VK_ESCAPE)){SendMessageW(dialog,WM_KEYDOWN,msg->wParam,msg->lParam);return 1;}if(IsDialogMessageW(dialog,msg))return 1;TranslateMessage(msg);DispatchMessageW(msg);return 1;}return 0;}
 void preferences_resize(void){if(dialog){RECT r;GetClientRect(owner_window,&r);MoveWindow(dialog,0,0,r.right,r.bottom,TRUE);}}
-
-
-
-

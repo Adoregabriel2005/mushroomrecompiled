@@ -14,6 +14,7 @@
 #include "theme.h"
 #include "preferences.h"
 #include "choice.h"
+#include "widescreen.h"
 
 #define MENU_COUNT 10
 
@@ -45,6 +46,8 @@ static WINDOWPLACEMENT prev_placement = {sizeof(WINDOWPLACEMENT)};
 
 /* Framebuffer & Audio */
 static uint32_t active_framebuffer[256 * 240];
+static uint32_t presented_framebuffer[SMB3_WIDE_WIDTH * 240];
+static int presented_width=256;
 static HWAVEOUT audio_device = NULL;
 static HANDLE audio_event = NULL;
 static WAVEHDR audio_headers[8];
@@ -364,6 +367,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     }
     case PREFS_APPLIED: {
+        glue_set_widescreen(cfg.aspect==2);
         input_select(cfg.device);input_configure(cfg.buttons);input_set_deadzone(cfg.deadzone);
         if(cfg.fullscreen!=is_fullscreen)toggle_fullscreen();
         if(!is_fullscreen){int widths[]={960,1024,1280,1600,1920},heights[]={720,768,720,900,1080};RECT size={0,0,widths[cfg.resolution],heights[cfg.resolution]};AdjustWindowRect(&size,GetWindowLongW(hwnd,GWL_STYLE),FALSE);SetWindowPos(hwnd,NULL,0,0,size.right-size.left,size.bottom-size.top,SWP_NOMOVE|SWP_NOZORDER);}
@@ -429,6 +433,13 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             /* Render Active Game Framebuffer */
             RECT src_rect;
             RECT dst = video_destination(w, h, cfg.aspect, cfg.scale, &src_rect);
+            if(cfg.aspect==2&&presented_width==SMB3_WIDE_WIDTH){
+                int dw=w,dh=MulDiv(w,240,presented_width);
+                if(dh>h){dh=h;dw=MulDiv(h,presented_width,240);}
+                if(cfg.scale==1){int k=w/presented_width;if(h/240<k)k=h/240;if(k>0){dw=presented_width*k;dh=240*k;}}
+                dst=(RECT){(w-dw)/2,(h-dh)/2,(w+dw)/2,(h+dh)/2};
+                src_rect=(RECT){0,0,presented_width,240};
+            }
 
             /* Fill letterbox / pillar bars */
             HBRUSH black = CreateSolidBrush(RGB(10, 12, 18));
@@ -453,7 +464,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             /* Blit NES Frame */
             BITMAPINFO info = {0};
             info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-            info.bmiHeader.biWidth = 256;
+            info.bmiHeader.biWidth = presented_width;
             info.bmiHeader.biHeight = -240;
             info.bmiHeader.biPlanes = 1;
             info.bmiHeader.biBitCount = 32;
@@ -461,7 +472,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetStretchBltMode(hdc, cfg.filter ? HALFTONE : COLORONCOLOR);
             StretchDIBits(hdc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
                           src_rect.left, src_rect.top, src_rect.right - src_rect.left, src_rect.bottom - src_rect.top,
-                          active_framebuffer, &info, DIB_RGB_COLORS, SRCCOPY);
+                          presented_framebuffer, &info, DIB_RGB_COLORS, SRCCOPY);
         }
 
         draw_notification(hdc, w, h);
@@ -487,6 +498,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd_line, int show_cm
     swprintf(asset_dir, 32768, L"%ls\\assets", root_dir);
 
     preferences_load(&cfg, ini_path);
+    glue_set_widescreen(cfg.aspect==2);
     input_init();
     input_select(cfg.device);input_configure(cfg.buttons);input_set_deadzone(cfg.deadzone);
     theme_init(asset_dir);
@@ -508,7 +520,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd_line, int show_cm
     int sy = (GetSystemMetrics(SM_CYSCREEN) - win_h) / 2;
 
     main_window = CreateWindowExW(0, L"Smb3RecompWindow",
-                                 L"Super Mario Bros. 3 · v1.2",
+                                 L"Super Mario Bros. 3 · v1.3",
                                  WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                  sx, sy, win_w, win_h, NULL, NULL, inst, NULL);
 
@@ -625,11 +637,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd_line, int show_cm
             const uint32_t *fb = glue_get_framebuffer();
             if (fb) {
                 memcpy(active_framebuffer, fb, sizeof(active_framebuffer));
-                for(int y=0;y<240;y++)for(int x=0;x<256;x++){
-                    uint32_t c=active_framebuffer[y*256+x];int gain=cfg.brightness;
+                int image_height;
+                const uint32_t *present=glue_get_present_framebuffer(&presented_width,&image_height);
+                memcpy(presented_framebuffer,present,presented_width*240*sizeof(uint32_t));
+                for(int y=0;y<240;y++)for(int x=0;x<presented_width;x++){
+                    uint32_t c=presented_framebuffer[y*presented_width+x];int gain=cfg.brightness;
                     if(cfg.scanlines&&(y&1))gain=gain*(cfg.scanlines==1?80:55)/100;
                     int r=((c>>16)&255)*gain/100,g=((c>>8)&255)*gain/100,b=(c&255)*gain/100;
-                    active_framebuffer[y*256+x]=0xff000000u|((r>255?255:r)<<16)|((g>255?255:g)<<8)|(b>255?255:b);
+                    presented_framebuffer[y*presented_width+x]=0xff000000u|((r>255?255:r)<<16)|((g>255?255:g)<<8)|(b>255?255:b);
                 }
             }
 

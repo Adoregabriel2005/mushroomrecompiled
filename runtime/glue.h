@@ -36,6 +36,8 @@ uint8_t  glue_get_pad1(void);
 
 /* Audio & Video output */
 const uint32_t *glue_get_framebuffer(void); /* 256x240 ARGB8888 */
+void glue_set_widescreen(bool enabled);
+const uint32_t *glue_get_present_framebuffer(int *width,int *height);
 size_t   glue_get_audio_samples(int16_t *stereo_buffer, size_t max_samples, int stereo);
 uint32_t glue_audio_sample_rate(void);
 void     glue_set_audio_sample_rate(uint32_t rate);

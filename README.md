@@ -4,6 +4,13 @@ Port experimental de **Super Mario Bros. 3 (NES)** para Windows x64, com recompi
 
 **A ROM não acompanha o projeto nem o ZIP.** Selecione sua cópia compatível no menu. O jogo inteiro ainda não foi validado.
 
+## Prévia widescreen v1.3
+
+A [prévia experimental v1.3](https://github.com/Adoregabriel2005/super-mario-bros-3-recomp/releases/tag/v1.3.0-exp) amplia o cenário das fases horizontais para um canvas 16:9, sem esticar tiles ou sprites. O HUD original permanece centralizado, com barras pretas nas laterais. Selecione **Vídeo > Proporção > 16:9**; configurações novas já usam esse modo.
+
+![Fase ampliada com HUD original](docs/images/widescreen.png)
+
+O compositor usa o mapa real da fase. A ativação de inimigos continua seguindo as regras originais; salas verticais e cenas não suportadas ficam no enquadramento nativo. Leia os [limites e testes](docs/WIDESCREEN.md). A v1.2 permanece disponível para comparação.
 ## Baixar e testar
 
 Baixe o [release Windows portátil](https://github.com/Adoregabriel2005/super-mario-bros-3-recomp/releases/latest), extraia o ZIP inteiro e abra **SuperMarioBros3Recomp.exe**. Mantenha SDL2.dll e assets ao lado do executável.
@@ -56,7 +63,7 @@ Requer Windows, CMake, LLVM-MinGW/Clang e mingw32-make no PATH. A primeira prepa
 .\build-local.ps1 -RomPath "C:\caminho\Super Mario Bros. 3 (USA) (Rev 1).nes"
 ```
 
-O script compila o gerador NESRecomp, gera os blocos C usando sua ROM e os seeds em docs/smb3-cycle-seeds.txt e compila o aplicativo. Os arquivos gerados não são versionados. Saída: build/SuperMarioBros3Recomp-v1.2.exe.
+O script compila o gerador NESRecomp, gera os blocos C usando sua ROM e os seeds em docs/smb3-cycle-seeds.txt e compila o aplicativo. Os arquivos gerados não são versionados. Saída: build/SuperMarioBros3Recomp-v1.3.exe.
 
 ```powershell
 .\build-local.ps1 -RomPath "C:\caminho\Super Mario Bros. 3 (USA) (Rev 1).nes" -Verify

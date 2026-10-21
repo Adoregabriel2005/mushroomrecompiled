@@ -229,6 +229,16 @@ static void config_save(const Config *cfg) {
         fprintf(stderr, "config: cannot write %s: %s\n", g_config_path, SDL_GetError());
         return;
     }
+    char key_a[32], key_b[32], key_select[32], key_start[32];
+    char key_up[32], key_down[32], key_left[32], key_right[32];
+    snprintf(key_a, sizeof(key_a), "%s", key_name(cfg->key_a));
+    snprintf(key_b, sizeof(key_b), "%s", key_name(cfg->key_b));
+    snprintf(key_select, sizeof(key_select), "%s", key_name(cfg->key_select));
+    snprintf(key_start, sizeof(key_start), "%s", key_name(cfg->key_start));
+    snprintf(key_up, sizeof(key_up), "%s", key_name(cfg->key_up));
+    snprintf(key_down, sizeof(key_down), "%s", key_name(cfg->key_down));
+    snprintf(key_left, sizeof(key_left), "%s", key_name(cfg->key_left));
+    snprintf(key_right, sizeof(key_right), "%s", key_name(cfg->key_right));
     char text[8192];
     int n = snprintf(text, sizeof(text),
                      "rom=%s\n"
@@ -257,9 +267,7 @@ static void config_save(const Config *cfg) {
                      cfg->renderer ? "vulkan" : "sdl",
                      cfg->aspect == 1 ? "integer" : cfg->aspect == 2 ? "stretch" : "fit",
                      cfg->scanlines, cfg->brightness, cfg->volume, cfg->audio_rate, cfg->slot,
-                     key_name(cfg->key_a), key_name(cfg->key_b), key_name(cfg->key_select),
-                     key_name(cfg->key_start), key_name(cfg->key_up), key_name(cfg->key_down),
-                     key_name(cfg->key_left), key_name(cfg->key_right));
+                     key_a, key_b, key_select, key_start, key_up, key_down, key_left, key_right);
     if (n > 0) SDL_RWwrite(rw, text, 1, (size_t)n);
     SDL_RWclose(rw);
 }

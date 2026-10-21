@@ -1,8 +1,10 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <io.h>
 #else
 #include <stdint.h>
+#include <unistd.h>
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,17 +55,19 @@ static bool load_file(FILE *f) {
     glue_reset();
     return true;
 }
-#ifdef _WIN32
-static FILE *open_wide(const wchar_t *path, const char *mode) {
-    return _wfopen(path, mode[0] == 'r' ? L"rb" : L"wb");
-}
-#else
-/* wchar_t is UCS-4 on Linux. Encode to UTF-8 rather than relying on the
- * process locale, so paths from GTK/SDL file dialogs work unchanged. */
+
+/* Paths cross the API as both wide and UTF-8 strings: the Win32 launcher uses
+ * wchar_t, while the portable SDL frontend and the tests use UTF-8. */
 static bool wide_to_utf8(const wchar_t *in, char *out, size_t cap) {
     size_t o = 0;
     for (; in && *in; in++) {
         uint32_t c = (uint32_t)*in;
+#ifdef _WIN32
+        if (c >= 0xd800 && c <= 0xdbff && in[1] >= 0xdc00 && in[1] <= 0xdfff) {
+            c = 0x10000u + ((c - 0xd800u) << 10) + ((uint32_t)in[1] - 0xdc00u);
+            in++;
+        }
+#endif
         if (c < 0x80) {
             if (o + 1 >= cap) return false;
             out[o++] = (char)c;
@@ -90,14 +94,54 @@ static bool wide_to_utf8(const wchar_t *in, char *out, size_t cap) {
     out[o] = 0;
     return true;
 }
+
+#ifdef _WIN32
+static bool utf8_to_wide(const char *in, wchar_t *out, size_t cap) {
+    return in && MultiByteToWideChar(CP_UTF8, 0, in, -1, out, (int)cap) > 0;
+}
+static FILE *open_wide(const wchar_t *path, const char *mode) {
+    return _wfopen(path, mode[0] == 'r' ? L"rb" : L"wb");
+}
+static FILE *open_utf8(const char *path, const char *mode) {
+    wchar_t wpath[4096];
+    return utf8_to_wide(path, wpath, 4096) ? _wfopen(wpath, mode[0] == 'r' ? L"rb" : L"wb") : NULL;
+}
+static bool replace_utf8(const char *from, const char *to) {
+    wchar_t wf[4096], wt[4096];
+    return utf8_to_wide(from, wf, 4096) && utf8_to_wide(to, wt, 4096) &&
+           MoveFileExW(wf, wt, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+}
+static void remove_utf8(const char *path) {
+    wchar_t wpath[4096];
+    if (utf8_to_wide(path, wpath, 4096)) _wremove(wpath);
+}
+#else
 static FILE *open_wide(const wchar_t *path, const char *mode) {
     char buf[4096];
     if (!path || !wide_to_utf8(path, buf, sizeof buf)) return NULL;
     return fopen(buf, mode);
 }
+static FILE *open_utf8(const char *path, const char *mode) {
+    return path ? fopen(path, mode) : NULL;
+}
+static bool replace_utf8(const char *from, const char *to) {
+    return rename(from, to) == 0;
+}
+static void remove_utf8(const char *path) {
+    remove(path);
+}
 #endif
-bool glue_load_rom(const char *p) { return p && load_file(fopen(p,"rb")); }
+
+bool glue_load_rom(const char *p) { return p && load_file(open_utf8(p,"rb")); }
 bool glue_load_rom_wide(const wchar_t *p) { return p && load_file(open_wide(p,"rb")); }
+bool glue_load_rom_utf8(const char *p) {
+#ifdef _WIN32
+    wchar_t wpath[4096];
+    return p && utf8_to_wide(p, wpath, 4096) && load_file(open_wide(wpath, "rb"));
+#else
+    return glue_load_rom(p);
+#endif
+}
 bool glue_is_rom_loaded(void) { return loaded; }
 uint32_t glue_get_rom_crc32(void) { return rom_crc; }
 void glue_init(void) { glue_reset(); }
@@ -137,18 +181,34 @@ void glue_set_audio_sample_rate(uint32_t rate) {
 uint32_t glue_audio_sample_rate(void) { return (uint32_t)sample_rate; }
 double glue_frame_rate(void) { return 1.0/cyc_frame_seconds(); }
 uint64_t glue_frame_count(void) { return frames; }
-bool glue_save_state(const wchar_t *path) {
+
+/* Write to a sibling temporary file and rename it over the target, so an
+ * interrupted save cannot leave a half-written state behind. */
+static bool save_state_utf8(const char *path) {
     if (!loaded || !path) return false;
     uint8_t *data=NULL; size_t len=0; char error[256];
     if (!cyc_state_save(&data,&len,error,sizeof error)) return false;
-    FILE *f=open_wide(path,"wb");
+    char tmp[4096];
+    if (snprintf(tmp,sizeof tmp,"%s.tmp",path) >= (int)sizeof tmp) { free(data); return false; }
+    FILE *f=open_utf8(tmp,"wb");
     bool ok=f && fwrite(data,1,len,f)==len;
-    if (f && fclose(f)) ok=false;
-    free(data); return ok;
+    if (f) {
+        if (fflush(f)) ok=false;
+#ifdef _WIN32
+        if (ok && _commit(_fileno(f))) ok=false;
+#else
+        if (ok && fsync(fileno(f))) ok=false;
+#endif
+        if (fclose(f)) ok=false;
+    }
+    free(data);
+    if (ok) ok=replace_utf8(tmp,path);
+    if (!ok) remove_utf8(tmp);
+    return ok;
 }
-bool glue_load_state(const wchar_t *path) {
+static bool load_state_utf8(const char *path) {
     if (!loaded || !path) return false;
-    FILE *f=open_wide(path,"rb"); if (!f) return false;
+    FILE *f=open_utf8(path,"rb"); if (!f) return false;
     if (fseek(f,0,SEEK_END)) { fclose(f); return false; }
     long n=ftell(f);
     if (n<=0 || n>64*1024*1024 || fseek(f,0,SEEK_SET)) { fclose(f); return false; }
@@ -159,4 +219,14 @@ bool glue_load_state(const wchar_t *path) {
     if (ok) ok=cyc_state_load(data,(size_t)n,error,sizeof error);
     if (ok) {smb3_wide_reset();smb3_enemies_reset();}
     free(data); return ok;
+}
+bool glue_save_state_utf8(const char *path) { return save_state_utf8(path); }
+bool glue_load_state_utf8(const char *path) { return load_state_utf8(path); }
+bool glue_save_state(const wchar_t *path) {
+    char utf8[4096];
+    return path && wide_to_utf8(path, utf8, sizeof utf8) && save_state_utf8(utf8);
+}
+bool glue_load_state(const wchar_t *path) {
+    char utf8[4096];
+    return path && wide_to_utf8(path, utf8, sizeof utf8) && load_state_utf8(utf8);
 }

@@ -41,7 +41,7 @@ The launcher uses the project identity and the original Underplay image supplied
 | Fullscreen | F11 | Via menu |
 | Save state slot | 1 to 5 | Via menu |
 
-Specific physical controllers still need retesting. Automated testing uses a virtual SDL joystick; this does not prove compatibility with every model.
+Specific physical controllers still need retesting. Automated testing uses a virtual SDL joystick; this does not prove compatibility with every model. The portable SDL2/Vulkan frontend uses the defaults documented in [PORTABLE.md](docs/PORTABLE.md), including configurable keyboard bindings.
 
 ## Technical status
 
@@ -53,13 +53,44 @@ The following also passed: continuation after save/load, audio at all three samp
 
 ## Building
 
+### Linux: portable SDL2/Vulkan frontend
+
+The native build uses the same engine and generated C blocks. Install CMake,
+Ninja, pkg-config, SDL2, and (optionally) the Vulkan headers, `glslc`, and
+Python 3 for the Vulkan presenter:
+
+```sh
+sudo apt install build-essential cmake ninja-build pkg-config \
+                 libsdl2-dev libvulkan-dev glslc python3
+```
+
+Generate the C blocks once, then build:
+
+```sh
+cmake -S tools/nesrecomp-src/recompiler -B build/recompiler-native \
+      -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build/recompiler-native -j 8
+./build/recompiler-native/NESRecomp "Game.nes" \
+    --game game.toml --cycle-seed-file docs/smb3-cycle-seeds.txt
+
+cmake -S . -B build/native -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build/native -j 8
+./build/native/mushroom-sdl --rom "Game.nes"
+```
+
+If Vulkan or `glslc` is missing, the executable still builds and uses the SDL2
+renderer. See [PORTABLE.md](docs/PORTABLE.md) for options, save-state locations,
+controls, and the current scope.
+
+### Windows
+
 Requires Windows, CMake, LLVM-MinGW/Clang, and mingw32-make in PATH. The first setup downloads the official SDL2 2.30.0 package and verifies its SHA-256.
 
 ```powershell
 .\build-local.ps1 -RomPath "C:\path\GAME NAME.nes"
 ```
 
-The script compiles the NESRecomp generator, produces the C blocks using your ROM and the seeds in docs/smb3-cycle-seeds.txt, and compiles the application. Both the goodNES and No-Intro/Rev 1 dumps are accepted: they share the same PRG/CHR payload and differ only in the iNES/NES 2.0 header, so the script validates the payload hashes. Generated files are not versioned. Output: build/MushroomRecompiled-v1.5.0.exe.
+The script compiles the NESRecomp generator, produces the C blocks using your ROM and the seeds in docs/smb3-cycle-seeds.txt, and compiles the application. Both the goodNES and No-Intro/Rev 1 dumps are accepted: they share the same PRG/CHR payload and differ only in the iNES/NES 2.0 header, so the script validates the payload hashes. Generated files are not versioned. Output: build/MushroomRecompiled-v1.5.0.exe. When SDL2 is available, CMake also builds `build/mushroom-sdl.exe`, the portable frontend described in [PORTABLE.md](docs/PORTABLE.md).
 
 ```powershell
 .\build-local.ps1 -RomPath "Game name.NES" -Verify

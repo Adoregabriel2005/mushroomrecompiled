@@ -27,6 +27,7 @@ cycle-misses.txt
 /tools/*
 !/tools/run-hidden.ps1
 !/tools/rom.mjs
+!/tools/spv_to_header.py
 !/tools/nesrecomp-src/
 /tools/nesrecomp-src/*
 !/tools/nesrecomp-src/common/

@@ -1,8 +1,7 @@
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 #include "glue.h"
 #include "cyc_core.h"
 #include "cyc_run.h"
@@ -16,6 +15,23 @@ static uint64_t frames;
 static uint8_t pad1;
 static int sample_rate = 48000;
 static uint32_t rom_crc;
+/* Keep the original Windows wide-path ABI; support it with the locale's
+ * multibyte encoding on POSIX, where fopen accepts UTF-8 paths. */
+static FILE *glue_wfopen(const wchar_t *path, const wchar_t *mode) {
+#ifdef _WIN32
+    return _wfopen(path, mode);
+#else
+    if (!path || !mode) return NULL;
+    size_t bytes = wcstombs(NULL, path, 0);
+    if (bytes == (size_t)-1) return NULL;
+    char *utf8 = malloc(bytes + 1);
+    if (!utf8) return NULL;
+    wcstombs(utf8, path, bytes + 1);
+    FILE *f = fopen(utf8, mode[0] == L'w' ? "wb" : "rb");
+    free(utf8);
+    return f;
+#endif
+}
 static uint32_t crc32(const uint8_t *p, size_t n) {
     uint32_t c = 0xffffffff;
     while (n--) { c ^= *p++; for (int i=0;i<8;i++) c=(c>>1)^(0xedb88320u & (0u-(c&1))); }
@@ -50,7 +66,7 @@ static bool load_file(FILE *f) {
     return true;
 }
 bool glue_load_rom(const char *p) { return p && load_file(fopen(p,"rb")); }
-bool glue_load_rom_wide(const wchar_t *p) { return p && load_file(_wfopen(p,L"rb")); }
+bool glue_load_rom_wide(const wchar_t *p) { return p && load_file(glue_wfopen(p,L"rb")); }
 bool glue_is_rom_loaded(void) { return loaded; }
 uint32_t glue_get_rom_crc32(void) { return rom_crc; }
 void glue_init(void) { glue_reset(); }
@@ -94,14 +110,14 @@ bool glue_save_state(const wchar_t *path) {
     if (!loaded || !path) return false;
     uint8_t *data=NULL; size_t len=0; char error[256];
     if (!cyc_state_save(&data,&len,error,sizeof error)) return false;
-    FILE *f=_wfopen(path,L"wb");
+    FILE *f=glue_wfopen(path,L"wb");
     bool ok=f && fwrite(data,1,len,f)==len;
     if (f && fclose(f)) ok=false;
     free(data); return ok;
 }
 bool glue_load_state(const wchar_t *path) {
     if (!loaded || !path) return false;
-    FILE *f=_wfopen(path,L"rb"); if (!f) return false;
+    FILE *f=glue_wfopen(path,L"rb"); if (!f) return false;
     if (fseek(f,0,SEEK_END)) { fclose(f); return false; }
     long n=ftell(f);
     if (n<=0 || n>64*1024*1024 || fseek(f,0,SEEK_SET)) { fclose(f); return false; }

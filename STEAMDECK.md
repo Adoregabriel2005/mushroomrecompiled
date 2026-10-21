@@ -6,8 +6,8 @@ provide the ROM or any Nintendo copyrighted content.
 
 ## Current status
 
-The Linux frontend is newly introduced. It is **not yet verified on Steam Deck
-and has not been validated with the full game**. The Windows interface remains
+The Linux frontend has been started and played on Steam Deck, but has **not
+been validated through the full game**. The Windows interface remains
 unchanged. This initial Linux target deliberately implements a compact
 game-first UI instead of porting the entire Win32 settings/launcher UI.
 
@@ -68,5 +68,25 @@ Save state location: SDL's user-specific preference directory
 Back up state files before updating the recompilation runtime.
 
 Known gaps: no in-game graphic settings menu, no integrated file picker,
-no audio/video latency profiling on Deck, only one quick-save slot in the
-Linux interface, and no Steam Deck hardware validation yet.
+no comprehensive audio/video latency profiling on Deck, only one quick-save
+slot in the Linux interface, and no full-game validation yet.
+
+## Frame pacing and diagnostics
+
+Starting with the October 21 frame-pacing fix, the simulation uses its own
+NTSC cadence (~60.1 ticks/s), separately from the rendering cadence. A SteamOS
+30/40 FPS display limit therefore no longer runs the NES logic at 30/40 FPS.
+If rendering stalls, the loop catches up at most eight simulation ticks; a
+longer suspension is bounded rather than followed by a prolonged fast-forward.
+
+The Steam Deck launcher enables `SMB3_PERF_LOG=1` by default, logging a
+performance line every five seconds to
+`~/.local/state/smb3-recompiled/perf.log`. The log is rotated at 1 MiB
+on the next launch. `simulated` should be near 60 ticks/s while playing;
+`presented` can be lower under SteamOS frame caps. Frequent nonzero
+`capped` counters mean the host failed to keep up. Disable logs by
+launching with `SMB3_PERF_LOG=0` if desired.
+
+For developers, `SMB3_TEST_RENDER_DELAY_MS=33` simulates slow presentation
+without modifying SteamOS settings. The game should still advance at ~60
+simulation ticks per second under this artificial limit.

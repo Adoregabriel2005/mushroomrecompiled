@@ -23,6 +23,10 @@ static bool widescreen = true;
 static bool fullscreen = true;
 static int texture_width;
 
+static double monotonic_seconds(void) {
+    return (double)SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency();
+}
+
 static bool exists(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return false;
@@ -221,6 +225,11 @@ int main(int argc, char **argv) {
         SDL_Quit();
         return 1;
     }
+    SDL_RendererInfo renderer_info;
+    if (!SDL_GetRendererInfo(renderer, &renderer_info)) {
+        fprintf(stderr, "SDL renderer: %s, flags=0x%x\n",
+                renderer_info.name, renderer_info.flags);
+    }
     SDL_AudioSpec desired = {0};
     desired.freq = 48000;
     desired.format = AUDIO_S16SYS;
@@ -250,7 +259,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ROM introuvable ou incompatible. Fournis --rom ou game.nes.\n");
         set_title("ROM manquante : glisser-déposer game.nes dans la fenêtre");
     }
-    double next_frame = (double)SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency();
+    /* A 30/40 FPS SteamOS frame limit must NOT slow down the simulation.
+     * Run the NES at its own cadence; only the presentation is frame-limited. */
+    const bool perf_log = SDL_getenv("SMB3_PERF_LOG") != NULL;
+    const char *delay_env = SDL_getenv("SMB3_TEST_RENDER_DELAY_MS");
+    int render_delay_ms = delay_env ? atoi(delay_env) : 0;
+    if (render_delay_ms < 0 || render_delay_ms > 100) render_delay_ms = 0;
+    double next_frame = monotonic_seconds();
+    double report_at = next_frame + 5.0;
+    double report_start = next_frame;
+    uint64_t simulated = 0, presented = 0, catchup = 0, capped = 0;
     bool running = true;
     bool pause_combo = false, save_combo = false, load_combo = false;
     while (running) {
@@ -294,28 +312,59 @@ int main(int argc, char **argv) {
             if (lc && !load_combo) save_or_load(false);
             pause_combo = pc; save_combo = sc; load_combo = lc;
         }
-        double now = (double)SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency();
+        double now = monotonic_seconds();
+        double seconds = glue_is_rom_loaded() ? 1.0 / glue_frame_rate() : 1.0 / 60.0;
         if (now >= next_frame) {
             if (glue_is_rom_loaded() && !paused) {
                 uint8_t pad = get_pad();
                 if (pause_combo) pad &= (uint8_t)~(NES_PAD_SELECT | NES_PAD_START);
-                glue_set_pad1(pad);
-                glue_step_frame();
-                play_audio();
+                int steps = 0;
+                /* At 30 FPS, typically simulate two NES ticks before each
+                 * present. Limit catch-up after suspension or heavy stalls. */
+                while (next_frame <= now && steps < 8) {
+                    glue_set_pad1(pad);
+                    glue_step_frame();
+                    play_audio();
+                    ++steps;
+                    ++simulated;
+                    next_frame += seconds;
+                }
+                if (steps > 1) catchup += (unsigned)(steps - 1);
+                if (next_frame <= now) {
+                    /* Prevent seconds of fast-forward after a long pause or
+                     * if the host cannot sustain full simulation speed. */
+                    ++capped;
+                    next_frame = now + seconds;
+                }
                 draw_frame();
             } else if (glue_is_rom_loaded() && paused) {
                 draw_frame();
+                next_frame = now + seconds;
             } else {
                 SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
                 SDL_RenderClear(renderer);
                 SDL_RenderPresent(renderer);
+                next_frame = now + seconds;
             }
-            double seconds = glue_is_rom_loaded() ? 1.0 / glue_frame_rate() : 1.0 / 60.0;
-            next_frame += seconds;
-            if (now - next_frame > seconds * 3.0) next_frame = now + seconds;
+            ++presented;
+            /* Artificial blocking to verify a 30 FPS Gamescope limit without
+             * changing SteamOS settings or touching the user's current game. */
+            if (render_delay_ms) SDL_Delay((Uint32)render_delay_ms);
         } else {
             Uint32 sleep_ms = (Uint32)((next_frame - now) * 1000.0);
             SDL_Delay(sleep_ms > 1 ? sleep_ms - 1 : 1);
+        }
+        if (perf_log && (now = monotonic_seconds()) >= report_at) {
+            double duration = now - report_start;
+            fprintf(stderr, "[smb3-perf] simulated=%.1f/s presented=%.1f/s "
+                    "catchup=%llu capped=%llu audio_queue_ms=%.0f\n",
+                    simulated / duration, presented / duration,
+                    (unsigned long long)catchup, (unsigned long long)capped,
+                    audio_device ? (double)SDL_GetQueuedAudioSize(audio_device)
+                        / (48000.0 * 2 * sizeof(int16_t)) * 1000.0 : 0.0);
+            simulated = presented = catchup = capped = 0;
+            report_start = now;
+            report_at = now + 5.0;
         }
     }
     if (controller) SDL_GameControllerClose(controller);

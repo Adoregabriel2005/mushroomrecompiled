@@ -147,12 +147,15 @@ static bool draw_frame(void) {
         texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
                                     SDL_TEXTUREACCESS_STREAMING, w, h);
         texture_width = w;
-        SDL_RenderSetLogicalSize(renderer, w, h); /* Keep aspect ratio on 16:10 Deck. */
+        /* The NES's 256x240 pixels have a non-square display aspect.
+         * Fit stock mode to 4:3, instead of displaying it as 16:15. */
+        SDL_RenderSetLogicalSize(renderer, w == 256 ? 320 : w, h);
     }
     if (!texture || SDL_UpdateTexture(texture, NULL, pixels, w * (int)sizeof(uint32_t))) return false;
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
-    SDL_RenderCopy(renderer, texture, NULL, NULL);
+    SDL_Rect dst = {0, 0, w == 256 ? 320 : w, h};
+    SDL_RenderCopy(renderer, texture, NULL, &dst);
     SDL_RenderPresent(renderer);
     return true;
 }
@@ -299,6 +302,8 @@ int main(int argc, char **argv) {
                 glue_set_pad1(pad);
                 glue_step_frame();
                 play_audio();
+                draw_frame();
+            } else if (glue_is_rom_loaded() && paused) {
                 draw_frame();
             } else {
                 SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);

@@ -22,7 +22,7 @@ if [[ -z "$rom" || ! -f "$rom" ]]; then
 fi
 rom="$(realpath "$rom")"
 hash="$(sha256sum "$rom" | cut -d ' ' -f 1)"
-expected="1ddc4b429490e298c05fa70389034107c0cb50f671c7c1baaa3f228224afc2e9"
+expected="4377a7f5e6eb50bdd2ac6f249bf1a7085500aca8eb41f38545c3a2731c51a579"
 if [[ "$hash" != "$expected" ]]; then
     echo "Incompatible ROM revision (SHA-256 $hash); expected SMB3 USA PRG1." >&2
     exit 2

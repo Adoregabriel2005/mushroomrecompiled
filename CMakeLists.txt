@@ -22,8 +22,6 @@ target_link_libraries(Smb3Recomp PRIVATE smb3-core SDL2 user32 gdi32 comdlg32 sh
 if(MINGW OR CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_link_options(Smb3Recomp PRIVATE -municode)
 endif()
-add_executable(smb3-verify tests/verify.c)
-target_link_libraries(smb3-verify PRIVATE smb3-core)
 add_custom_command(TARGET Smb3Recomp POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:Smb3Recomp>/assets"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/assets/gamecontrollerdb.txt" "$<TARGET_FILE_DIR:Smb3Recomp>/assets"
@@ -49,6 +47,8 @@ else()
         COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:Smb3Recomp>/assets"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/assets/gamecontrollerdb.txt" "$<TARGET_FILE_DIR:Smb3Recomp>/assets")
 endif()
+add_executable(smb3-verify tests/verify.c)
+target_link_libraries(smb3-verify PRIVATE smb3-core)
 add_executable(smb3-wide-verify tests/widescreen_verify.c)
 target_link_libraries(smb3-wide-verify PRIVATE smb3-core)
 add_executable(smb3-scenes-verify tests/scenes_verify.c)

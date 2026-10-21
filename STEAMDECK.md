@@ -12,7 +12,7 @@ unchanged. This initial Linux target deliberately implements a compact
 game-first UI instead of porting the entire Win32 settings/launcher UI.
 
 The expected ROM is the **USA PRG1** iNES dump with SHA-256:
-`1ddc4b429490e298c05fa70389034107c0cb50f671c7c1baaa3f228224afc2e9`.
+`4377a7f5e6eb50bdd2ac6f249bf1a7085500aca8eb41f38545c3a2731c51a579`.
 No ROM bytes are committed or shipped.
 
 ## Build on Debian (developer)

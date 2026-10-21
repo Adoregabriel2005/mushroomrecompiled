@@ -7,6 +7,8 @@
  * See hw_internal.h for the timing model.
  */
 #include "hw_internal.h"
+#include "audio_engine.h"
+#include "snd_owner.h"
 
 #include "cyc_core.h"
 #include "cyc_mod.h"
@@ -318,10 +320,22 @@ uint8_t hw_bus_read(uint16_t addr)
 void hw_bus_write(uint16_t addr, uint8_t value)
 {
     if (cyc_trace_enabled) cyc_trace_access(addr, value, true);
+    /* smb3pc sandbox: a re-run drawer has no PPU/APU/DMA side effects.
+     * The voice sets behind cyc_audio_write are not part of the machine
+     * snapshot, so an isolated APU write would leak into the live mix.
+     * Mapper and RAM writes still apply; the snapshot rolls them back. */
+    if (hw_isolated && addr >= 0x2000 && addr <= 0x4017) {
+        hw.data_bus = value;
+        hw.internal_bus = value;
+        return;
+    }
     if (hw_cart.mapper==5 && addr<0x4020) hw_cart_cpu_write(addr,value);
     if (addr < 0x2000) hw_code_store(&hw.ram[addr & 0x7FF], addr & 0x7FF, value);
     else if (addr < 0x4000) ppu_write(addr, value);
-    else if (addr <= 0x4017) apu_write(addr, value);
+    else if (addr <= 0x4017) {
+        apu_write(addr, value);
+        cyc_audio_write(addr, value, hw.cycles);
+    }
     else if (addr >= 0x4020) hw_cart_cpu_write(addr, value);
     /* $4018-$401F: the 2A03's test registers, not connected on a console. */
     hw.data_bus = value;
@@ -441,6 +455,12 @@ const uint8_t *cyc_cart_ram(size_t *len)
 const uint8_t *cyc_ppu_ciram(size_t *len) { *len = hw_cart.info.four_screen ? 4096 : 2048; return ppu.ciram; }
 const uint8_t *cyc_ppu_palette(void) { return ppu.palette; }
 const uint8_t *cyc_ppu_oam(void) { return ppu.oam; }
+const uint8_t *cyc_chr_rom(size_t *len)
+{
+    if (len) *len = hw_cart.chr_len;
+    return hw_cart.chr;
+}
+
 const uint8_t *cyc_chr_ram(size_t *len)
 {
     *len = hw_cart.chr_ram_len;
@@ -481,6 +501,7 @@ void cyc_power_on(uint8_t ppu_alignment)
     hw_cart_power_on();
     ppu_power_on();
     apu_power_on();
+    snd_owner_reset();
     hw_frame_done = false;
     hw_dma_stalls = 0;
 
@@ -626,11 +647,14 @@ const uint32_t *cyc_frame_argb(void)
 
 bool cyc_audio_enable(int sample_rate)
 {
-    apu_audio_enable(sample_rate > 0, sample_rate);
+    /* The NESRecomp APU remains the CPU-visible timing model. Its own audio
+     * output is not mixed: the two Blargg APUs below produce the sound. */
+    apu_audio_enable(false, 0);
+    cyc_audio_set_sample_rate(sample_rate);
     return sample_rate > 0;
 }
 
-size_t cyc_audio_read(int16_t *out, size_t max) { return apu_audio_read(out, max); }
+size_t cyc_audio_read(int16_t *out, size_t max) { return cyc_audio_read_samples(out, max); }
 
 void cyc_set_console(CycConsole console) { apu_set_console((int)console); }
 

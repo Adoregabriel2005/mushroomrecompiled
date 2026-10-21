@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include "glue.h"
 #include "cyc_core.h"
 #include "cyc_run.h"
@@ -65,6 +66,91 @@ int main(int argc,char **argv) {
     for (int i=0;i<30;i++) glue_step_frame();
     if (expected!=cyc_mem_state_hash()) { fprintf(stderr,"Save-state divergence\n"); return 8; }
     puts("Save/load: deterministic continuation OK");
+    /* Corrupted images are rejected and leave the machine untouched. The
+     * format has no payload checksum, so this covers what it validates:
+     * magic/version/identity header, chunk structure and truncation. */
+    {
+        uint64_t live_before = cyc_mem_state_hash();
+        FILE *sf = fopen("verify-state.bin", "rb");
+        if (!sf) return 13;
+        if (fseek(sf, 0, SEEK_END)) { fclose(sf); return 13; }
+        long n = ftell(sf);
+        if (n <= 0 || fseek(sf, 0, SEEK_SET)) { fclose(sf); return 13; }
+        uint8_t *image = malloc((size_t)n);
+        if (!image) { fclose(sf); return 13; }
+        bool ok = fread(image, 1, (size_t)n, sf) == (size_t)n;
+        fclose(sf);
+        if (!ok) { free(image); return 13; }
+        /* Case 1: bad magic. Case 2: truncation. */
+        for (int cas = 0; cas < 2; cas++) {
+            uint8_t *bad = malloc((size_t)n);
+            size_t bad_len = (size_t)n;
+            if (!bad) { free(image); return 13; }
+            memcpy(bad, image, (size_t)n);
+            if (cas == 0) bad[0] ^= 0x5A;
+            else bad_len -= 64;
+            FILE *bf = fopen("verify-state-bad.bin", "wb");
+            if (!bf || fwrite(bad, 1, bad_len, bf) != bad_len) {
+                if (bf) fclose(bf);
+                free(bad);
+                free(image);
+                return 13;
+            }
+            fclose(bf);
+            free(bad);
+            if (glue_load_state_utf8("verify-state-bad.bin")) {
+                fprintf(stderr, "Corrupted save state (case %d) was accepted\n", cas);
+                remove("verify-state-bad.bin");
+                free(image);
+                return 13;
+            }
+            if (cyc_mem_state_hash() != live_before) {
+                fprintf(stderr, "Rejected save state (case %d) changed the machine\n", cas);
+                remove("verify-state-bad.bin");
+                free(image);
+                return 13;
+            }
+        }
+        free(image);
+        remove("verify-state-bad.bin");
+        puts("Save/load: corrupted images rejected, machine unchanged");
+    }
+    /* Battery SRAM: file round trip, then rejection of a wrong-size file. */
+    {
+        size_t sram_len = glue_sram_size();
+        if (!sram_len || sram_len > 0x2000) return 14;
+        if (!glue_sram_save("verify-sram.bin")) return 14;
+        uint8_t before[0x2000], pattern[0x2000], after[0x2000];
+        if (!glue_sram_export(before, sram_len)) return 14;
+        for (size_t i = 0; i < sram_len; i++) pattern[i] = (uint8_t)(i * 7 + 3);
+        if (!glue_sram_import(pattern, sram_len)) return 14;
+        if (glue_sram_load("verify-sram.bin") != 1) return 14;
+        if (!glue_sram_export(after, sram_len) || memcmp(before, after, sram_len)) {
+            fprintf(stderr, "SRAM round trip mismatch\n");
+            return 14;
+        }
+        remove("verify-sram.bin");
+        uint64_t live_before = cyc_mem_state_hash();
+        FILE *bf = fopen("verify-sram-bad.bin", "wb");
+        if (!bf) return 14;
+        uint8_t junk[100];
+        memset(junk, 0x42, sizeof junk);
+        bool ok = fwrite(junk, 1, sizeof junk, bf) == sizeof junk;
+        fclose(bf);
+        if (!ok) { remove("verify-sram-bad.bin"); return 14; }
+        if (glue_sram_load("verify-sram-bad.bin") != -1) {
+            fprintf(stderr, "Wrong-size SRAM file was accepted\n");
+            remove("verify-sram-bad.bin");
+            return 14;
+        }
+        if (cyc_mem_state_hash() != live_before) {
+            fprintf(stderr, "Rejected SRAM file changed the machine\n");
+            remove("verify-sram-bad.bin");
+            return 14;
+        }
+        remove("verify-sram-bad.bin");
+        puts("SRAM: file round trip and invalid rejection OK");
+    }
     glue_reset();
     cyc_run_native=false;
     for (unsigned f=0;f<3000;f++) {

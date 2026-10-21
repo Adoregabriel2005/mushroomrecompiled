@@ -8,15 +8,22 @@
 #include "cyc_png.h"
 #include "cpu6502.h"
 #include "widescreen.h"
+#include "hud.h"
 #include "wide_enemies.h"
 static int warped,stage=4;
 static uint16_t objects;
 static int verify_native_scene(uint16_t address,uint8_t value){
  uint8_t old=cyc_mod_peek(address);cyc_mod_poke(address,value);smb3_wide_capture();
  const uint32_t *native=glue_get_framebuffer(),*out=smb3_wide_present(native);int valid=!smb3_wide_active();
+ int bar_first,bar_anchor;smb3_hud_bounds(&bar_first,&bar_anchor);
+ const uint32_t *hud=smb3_hud_present(native);
  for(int y=0;y<240;y++){
-  if(memcmp(out+y*426+85,native+y*256,256*sizeof(uint32_t)))valid=0;
-  for(int x=0;x<85;x++)if(out[y*426+x]!=0xff000000u||out[y*426+341+x]!=0xff000000u)valid=0;
+  /* The status bar is its own layer: only the rows it rebuilt differ from the
+   * machine's picture, and the picture pastes that layer, not the raw frame. */
+  int staged=bar_first>=0&&y>=bar_first&&y<=bar_anchor;
+  if(!staged&&memcmp(hud+y*256,native+y*256,256*sizeof(uint32_t)))valid=0;
+  if(memcmp(out+y*426+97,hud+y*256+12,232*sizeof(uint32_t)))valid=0;
+  for(int x=0;x<97;x++)if(out[y*426+x]!=0xff000000u||out[y*426+329+x]!=0xff000000u)valid=0;
  }
  cyc_mod_poke(address,old);smb3_wide_capture();return valid;
 }
@@ -74,11 +81,14 @@ int main(int argc,char **argv){
     snprintf(path,sizeof path,"scene-%d-%d-map.png",stage,f);cyc_write_png(path,map,256,240);
     const Smb3EnemyLayer *layers=smb3_enemies_layers();const uint8_t *oam=cyc_render_oam();
     for(int object=0;object<SMB3_OBJECT_SLOTS;object++)if(layers[object].valid){
-     for(int s=0;s<64;s++){
-      const uint8_t *p=oam+s*4,*q=layers[object].oam+s*4;
-      if(p[0]>=191||q[0]>=191||p[1]!=q[1]||p[2]!=q[2])continue;
-      int dx=camera_x+p[3]-layers[object].camera-q[3],dy=(int)p[0]-q[0];
-      if(dx==layers[object].offset_x&&dy==layers[object].offset_y)aligned++;
+     for(int k=0;k<layers[object].count;k++){
+      const Smb3EnemyPiece *pc=&layers[object].pieces[k];
+      int px=layers[object].obj_x+layers[object].off_x+pc->dx-camera_x,py=layers[object].obj_y+layers[object].off_y+pc->dy-camera_y+1;
+      for(int s=0;s<64;s++){
+       const uint8_t *p=oam+s*4;
+       if(p[0]>=191||p[1]!=pc->tile||p[2]!=pc->attr)continue;
+       if((int)p[3]==px&&(int)p[0]+1==py){aligned++;break;}
+      }
      }
     }
    }

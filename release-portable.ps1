@@ -7,7 +7,7 @@ try {
  $stageRoot=Join-Path 'build' ('package-'+[Guid]::NewGuid().ToString('N'))
  $stage=Join-Path $stageRoot $name
  New-Item -ItemType Directory -Force "$stage/assets","$stage/docs","$stage/LICENSES",releases | Out-Null
- Copy-Item "build/MushroomRecompiled-v$Version.exe" "$stage/MushroomRecompiled.exe"
+ Copy-Item "build/MushroomRecompiled.exe" "$stage/MushroomRecompiled.exe"
  Copy-Item build/SDL2.dll "$stage/SDL2.dll"
  Copy-Item LICENSE,LICENSE_SCOPE.md "$stage/"
  Copy-Item assets/gamecontrollerdb.txt "$stage/assets/"
@@ -19,10 +19,10 @@ try {
 Mushroom Recompiled v$Version — experimental
 
 Extraia o ZIP inteiro e abra MushroomRecompiled.exe.
-Selecione sua ROM compatível (USA Rev 1), arquivo .nes.
+Na primeira abertura, escolha sua ROM compatível (USA Rev 1), arquivo .nes,
+na lista ou arraste o arquivo para a janela.
 A ROM não acompanha o pacote.
-Após selecionar uma ROM válida, o jogo inicia diretamente, inclusive nas próximas aberturas.
-Sem uma ROM lembrada válida, o menu inicial aparece.
+Após escolher uma ROM válida, o jogo inicia diretamente, inclusive nas próximas aberturas.
 Esc pausa e abre o menu para salvar, carregar, continuar, configurar ou sair.
 
 Widescreen: Configurações > Vídeo > Proporção > 16:9.

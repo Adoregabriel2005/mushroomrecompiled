@@ -18,7 +18,11 @@
 #include "audio_sdl.h"
 #include "cyc_overlay.h"
 #include "cyc_png.h"
+#ifndef _WIN32
+#include <dirent.h>
+#endif
 #include "glue.h"
+#include "overlay.h"
 #include "video.h"
 #include "widescreen.h"
 
@@ -36,6 +40,8 @@ typedef struct {
     int volume;
     int audio_rate;
     int slot;
+    char replay[4096];
+    char record[4096];
     SDL_Scancode key_a;
     SDL_Scancode key_b;
     SDL_Scancode key_select;
@@ -50,12 +56,22 @@ static Config g_cfg;
 static char g_base_dir[4096];
 static char g_config_path[4096];
 static char g_save_dir[4096];
+static char g_sram_path[4096];
+static bool g_sram_ok = true;
+static int g_sram_frames = 0;
+static uint8_t *g_session;
+static size_t g_session_len, g_session_cap;
+static uint8_t *g_replay;
+static size_t g_replay_len, g_replay_pos;
+static FILE *g_record_fp;
 static SDL_Window *g_window;
 static Video *g_video;
 static AudioOut *g_audio;
 static SDL_GameController *g_pad;
 static uint32_t *g_present;
 static size_t g_present_capacity;
+static const uint8_t *g_chr;
+static size_t g_chr_len;
 static bool g_running;
 static bool g_menu;
 static int g_menu_index;
@@ -84,7 +100,7 @@ static void config_defaults(Config *cfg) {
     cfg->aspect = 0;
     cfg->scanlines = 0;
     cfg->brightness = 100;
-    cfg->volume = 80;
+    cfg->volume = 100; /* smb3pc has no volume control: always full level */
     cfg->audio_rate = 48000;
     cfg->slot = 1;
     cfg->vsync = true;
@@ -136,6 +152,259 @@ static bool file_exists(const char *path) {
     if (!rw) return false;
     SDL_RWclose(rw);
     return true;
+}
+
+/* ROM picker: candidates are *.nes files beside the app and in the working
+ * directory, so a first launch with no remembered ROM just works. */
+static void open_controller(int index);
+static void config_save(const Config *cfg);
+static bool init_video(int fw, int fh);
+#define PICK_MAX 64
+#define PICK_ROWS 12
+
+static bool pick_is_nes(const char *name) {
+    size_t n = strlen(name);
+    return n > 4 && !SDL_strcasecmp(name + n - 4, ".nes");
+}
+
+static void pick_add(char files[][4096], int *count, const char *dir, const char *name) {
+    char path[4096];
+    join_path(path, sizeof(path), dir, name);
+    for (int i = 0; i < *count; i++)
+        if (!SDL_strcasecmp(files[i], path)) return;
+    if (*count >= PICK_MAX) return;
+    snprintf(files[*count], 4096, "%s", path);
+    (*count)++;
+}
+
+static int pick_cmp(const void *a, const void *b) {
+    return SDL_strcasecmp((const char *)a, (const char *)b);
+}
+
+static void pick_scan_one(char files[][4096], int *count, const char *dir) {
+    if (!dir || !dir[0] || *count >= PICK_MAX) return;
+#ifdef _WIN32
+    char pat[4096];
+    size_t dn = strlen(dir);
+    bool slash = dn > 0 && (dir[dn - 1] == '/' || dir[dn - 1] == '\\');
+    snprintf(pat, sizeof(pat), "%s%s*.nes", dir, slash ? "" : "/");
+    wchar_t wpat[4096];
+    if (MultiByteToWideChar(CP_UTF8, 0, pat, -1, wpat, 4096) <= 0) return;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (fd.cFileName[0] == L'.') continue;
+        char name[4096];
+        if (WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name, sizeof(name),
+                                NULL, NULL) > 0)
+            pick_add(files, count, dir, name);
+    } while (*count < PICK_MAX && FindNextFileW(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while (*count < PICK_MAX && (e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        if (pick_is_nes(e->d_name)) pick_add(files, count, dir, e->d_name);
+    }
+    closedir(d);
+#endif
+}
+
+/* Parent of dir (trailing separators tolerated); empty when there is none. */
+static void parent_dir(char *out, size_t cap, const char *dir) {
+    snprintf(out, cap, "%s", dir ? dir : "");
+    size_t n = strlen(out);
+    while (n > 0 && (out[n - 1] == '/' || out[n - 1] == '\\')) out[--n] = 0;
+    char *sep = strrchr(out, '/');
+    char *wsep = strrchr(out, '\\');
+    if (wsep && (!sep || wsep > sep)) sep = wsep;
+    if (sep) *sep = 0;
+    else out[0] = 0;
+}
+
+static int pick_scan(char files[][4096]) {
+    int count = 0;
+    /* The binary often sits nested (build/native/), two levels below the
+     * project roms/ folder, so also walk up from the app directory. */
+    char up1[4096], up2[4096];
+    parent_dir(up1, sizeof(up1), g_base_dir);
+    parent_dir(up2, sizeof(up2), up1);
+    const char *roots[4] = { g_base_dir, up1, up2, "." };
+    for (int r = 0; r < 4; r++) {
+        if (!roots[r] || !roots[r][0]) continue;
+        pick_scan_one(files, &count, roots[r]);
+        char sub[4096];
+        join_path(sub, sizeof(sub), roots[r], "roms");
+        pick_scan_one(files, &count, sub);
+    }
+    qsort(files, (size_t)count, sizeof(files[0]), pick_cmp);
+    return count;
+}
+
+static const char *pick_base(const char *path) {
+    const char *b = strrchr(path, '/');
+    const char *w = strrchr(path, '\\');
+    if (w && (!b || w > b)) b = w;
+    return b ? b + 1 : path;
+}
+
+static bool pick_ensure(int w, int h) {
+    size_t pixels = (size_t)w * (size_t)h;
+    if (pixels > g_present_capacity) {
+        uint32_t *grown = realloc(g_present, pixels * sizeof(*grown));
+        if (!grown) return false;
+        g_present = grown;
+        g_present_capacity = pixels;
+    }
+    return true;
+}
+
+static void pick_draw(char files[][4096], int n, int sel, const char *error) {
+    const int w = 256, h = 240;
+    if (!pick_ensure(w, h)) return;
+    for (int i = 0; i < w * h; i++) g_present[i] = 0xFF101014u;
+    cyc_overlay_text(g_present, w, h, (w - 10 * 8) / 2, 24, 2, 0xFFD25A, "SELECT ROM");
+    if (!n) {
+        cyc_overlay_text(g_present, w, h, 20, 80, 1, 0xE6E6E6, "NO .NES FILES FOUND");
+        cyc_overlay_text(g_present, w, h, 20, 92, 1, 0xE6E6E6, "PUT ONE BESIDE THE APP");
+        cyc_overlay_text(g_present, w, h, 20, 104, 1, 0xE6E6E6, "OR DRAG IT HERE");
+    } else {
+        int top = sel - PICK_ROWS / 2;
+        if (top < 0) top = 0;
+        if (top > n - PICK_ROWS) top = n - PICK_ROWS;
+        if (top < 0) top = 0;
+        for (int r = 0; r < PICK_ROWS && top + r < n; r++) {
+            char row[64];
+            snprintf(row, sizeof(row), "%s %-29.29s", top + r == sel ? ">" : " ",
+                     pick_base(files[top + r]));
+            cyc_overlay_text(g_present, w, h, 16, 64 + r * 12, 1,
+                             top + r == sel ? 0xFFD25A : 0xE6E6E6, row);
+        }
+    }
+    if (error && *error)
+        cyc_overlay_text(g_present, w, h, 16, 208, 1, 0xFF6B5E, error);
+    else
+        cyc_overlay_text(g_present, w, h, 16, 208, 1, 0x8A8A92,
+                         "UP/DOWN CHOOSE  ENTER LAUNCH");
+    g_frame_w = w;
+    g_frame_h = h;
+    VideoOptions o;
+    memset(&o, 0, sizeof(o));
+    video_present(g_video, g_present, w, h, &o);
+}
+
+/* A lone nearby ROM boots straight in, so dropping one .nes into roms/
+ * is enough for a flagless double-click launch. Zero or several ROMs
+ * still bring up the picker. */
+/* Remembered ROMs stay valid no matter which folder the app is started
+ * from: the picker scans with relative roots, so absolutize on store. */
+static void store_rom_path(const char *path) {
+#ifdef _WIN32
+    char abs[4096];
+    if (GetFullPathNameA(path, (DWORD)sizeof(abs), abs, NULL) && abs[0])
+        snprintf(g_cfg.rom, sizeof(g_cfg.rom), "%s", abs);
+    else
+        snprintf(g_cfg.rom, sizeof(g_cfg.rom), "%s", path);
+#else
+    char abs[4096];
+    if (realpath(path, abs))
+        snprintf(g_cfg.rom, sizeof(g_cfg.rom), "%s", abs);
+    else
+        snprintf(g_cfg.rom, sizeof(g_cfg.rom), "%s", path);
+#endif
+}
+
+static bool pick_autoload(void) {
+    static char files[PICK_MAX][4096];
+    if (pick_scan(files) != 1) return false;
+    if (!glue_load_rom_utf8(files[0])) return false;
+    store_rom_path(files[0]);
+    config_save(&g_cfg);
+    return true;
+}
+
+static bool run_picker(void) {
+    static char files[PICK_MAX][4096];
+    int n = pick_scan(files);
+    int sel = 0;
+    char error[96] = "";
+    for (;;) {
+        pick_draw(files, n, sel, error);
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            switch (ev.type) {
+                case SDL_QUIT:
+                    return false;
+                case SDL_CONTROLLERDEVICEADDED:
+                    open_controller(ev.cdevice.which);
+                    break;
+                case SDL_DROPFILE: {
+                    bool ok = ev.drop.file && glue_load_rom_utf8(ev.drop.file);
+                    if (ev.drop.file) {
+                        if (ok) store_rom_path(ev.drop.file);
+                        SDL_free(ev.drop.file);
+                    }
+                    if (ok) {
+                        config_save(&g_cfg);
+                        return true;
+                    }
+                    snprintf(error, sizeof(error), "ROM REJECTED");
+                    break;
+                }
+                case SDL_KEYDOWN: {
+                    SDL_Keycode k = ev.key.keysym.sym;
+                    bool rep = ev.key.repeat != 0;
+                    if (k == SDLK_ESCAPE && !rep) return false;
+                    if (n > 0 && (k == SDLK_UP || k == SDLK_w)) {
+                        sel = (sel + n - 1) % n;
+                        error[0] = 0;
+                    } else if (n > 0 && (k == SDLK_DOWN || k == SDLK_s)) {
+                        sel = (sel + 1) % n;
+                        error[0] = 0;
+                    } else if (!rep && n > 0 &&
+                               (k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_SPACE)) {
+                        if (glue_load_rom_utf8(files[sel])) {
+                            store_rom_path(files[sel]);
+                            config_save(&g_cfg);
+                            return true;
+                        }
+                        snprintf(error, sizeof(error), "ROM REJECTED");
+                    }
+                    break;
+                }
+                case SDL_CONTROLLERBUTTONDOWN: {
+                    Uint8 b = ev.cbutton.button;
+                    if (n > 0 && b == SDL_CONTROLLER_BUTTON_DPAD_UP) {
+                        sel = (sel + n - 1) % n;
+                        error[0] = 0;
+                    } else if (n > 0 && b == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
+                        sel = (sel + 1) % n;
+                        error[0] = 0;
+                    } else if (!n) {
+                        if (b == SDL_CONTROLLER_BUTTON_B) return false;
+                    } else if (b == SDL_CONTROLLER_BUTTON_A ||
+                               b == SDL_CONTROLLER_BUTTON_START) {
+                        if (glue_load_rom_utf8(files[sel])) {
+                            store_rom_path(files[sel]);
+                            config_save(&g_cfg);
+                            return true;
+                        }
+                        snprintf(error, sizeof(error), "ROM REJECTED");
+                    } else if (b == SDL_CONTROLLER_BUTTON_B) {
+                        return false;
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+        SDL_Delay(16);
+    }
 }
 
 static bool parse_bool(const char *value) {
@@ -277,6 +546,10 @@ static void state_path(char *out, size_t cap, int slot) {
 }
 
 static void save_slot(int slot) {
+    if (g_replay) {
+        notify("STATES OFF IN REPLAY");
+        return;
+    }
     char path[4096];
     state_path(path, sizeof(path), slot);
     if (glue_save_state_utf8(path)) notify("SAVED SLOT %d", slot);
@@ -284,6 +557,10 @@ static void save_slot(int slot) {
 }
 
 static void load_slot(int slot) {
+    if (g_replay) {
+        notify("STATES OFF IN REPLAY");
+        return;
+    }
     char path[4096];
     state_path(path, sizeof(path), slot);
     if (!file_exists(path)) {
@@ -294,10 +571,49 @@ static void load_slot(int slot) {
     else notify("LOAD SLOT %d FAILED", slot);
 }
 
+/* Session replay: one controller byte per emulated frame, raw like smb3pc.
+ * Paused menu frames never step the machine, so they are never recorded.
+ * Replays start at boot with the same widescreen mode and never touch the
+ * real save file; save states are refused while one plays. */
+static void session_push(uint8_t pad) {
+    if (g_session_len < g_session_cap) {
+        g_session[g_session_len++] = pad;
+        return;
+    }
+    size_t next = g_session_cap ? g_session_cap * 2 : 4096;
+    if (next > 8 * 1024 * 1024) return;
+    uint8_t *grown = realloc(g_session, next);
+    if (!grown) return;
+    g_session = grown;
+    g_session_cap = next;
+    g_session[g_session_len++] = pad;
+}
+
+static void save_replay_file(void) {
+    char path[4096];
+    int n = 1;
+    for (;; n++) {
+        snprintf(path, sizeof(path), "%sreplay-%d.rec", g_save_dir, n);
+        if (!file_exists(path)) break;
+    }
+    FILE *f = fopen(path, "wb");
+    bool ok = f && (g_session_len == 0 ||
+                    fwrite(g_session, 1, g_session_len, f) == g_session_len);
+    if (f) fclose(f);
+    if (ok) notify("REPLAY %d SAVED", n);
+    else {
+        remove(path);
+        notify("REPLAY SAVE FAILED");
+    }
+}
+
 static void resize_window_to_frame(void) {
     if (!g_window || g_cfg.fullscreen) return;
     int fw = 256, fh = 240;
     (void)glue_get_present_framebuffer(&fw, &fh);
+    /* smb3pc: the 4:3 window is 3x the visible 240x240 picture, so at scale
+     * 3 the window is 720x720 for the cropped 256-column frame. */
+    if (fw == 256) fw = 240;
     SDL_SetWindowSize(g_window, fw * g_cfg.scale, fh * g_cfg.scale);
 }
 
@@ -389,13 +705,19 @@ static void handle_key(SDL_Keycode key, bool repeat) {
     if (repeat) return;
     if (key == SDLK_F5) save_slot(g_slot);
     else if (key == SDLK_F7) load_slot(g_slot);
+    else if (key == SDLK_g) save_replay_file();
     else if (key == SDLK_F10) toggle_widescreen();
     else if (key == SDLK_F11) toggle_fullscreen();
     else if (key == SDLK_F8) toggle_mute();
     else if (key == SDLK_MINUS) adjust_volume(-5);
     else if (key == SDLK_EQUALS) adjust_volume(5);
     else if (key == SDLK_r) {
+        /* Console reset preserves RAM: carry the save slots across power-on. */
+        uint8_t sram[0x2000];
+        size_t sram_len = glue_sram_size();
+        bool keep = sram_len <= sizeof(sram) && glue_sram_export(sram, sram_len);
         glue_reset();
+        if (keep) glue_sram_import(sram, sram_len);
         audio_out_clear(g_audio);
         notify("RESET");
     } else if (key >= SDLK_1 && key <= SDLK_5) {
@@ -499,61 +821,10 @@ static uint8_t read_pad(void) {
     return pad;
 }
 
-static void fill_rect(uint32_t *dst, int width, int height, int x, int y,
-                      int w, int h, uint32_t color, unsigned alpha) {
-    if (x < 0) { w += x; x = 0; }
-    if (y < 0) { h += y; y = 0; }
-    if (x + w > width) w = width - x;
-    if (y + h > height) h = height - y;
-    if (w <= 0 || h <= 0) return;
-    for (int yy = y; yy < y + h; yy++) {
-        for (int xx = x; xx < x + w; xx++) {
-            uint32_t *p = &dst[(size_t)yy * width + xx];
-            if (alpha >= 255) {
-                *p = 0xff000000u | color;
-                continue;
-            }
-            uint32_t old = *p;
-            uint32_t out = 0;
-            for (int shift = 0; shift < 24; shift += 8) {
-                uint32_t dc = (old >> shift) & 255;
-                uint32_t sc = (color >> shift) & 255;
-                out |= ((sc * alpha + dc * (255 - alpha)) / 255) << shift;
-            }
-            *p = 0xff000000u | out;
-        }
-    }
-}
-
 static void draw_menu(uint32_t *dst, int width, int height) {
-    int panel_w = width < 220 ? width - 8 : 220;
-    int panel_h = 132;
-    int x = (width - panel_w) / 2;
-    int y = (height - panel_h) / 2;
-    fill_rect(dst, width, height, x, y, panel_w, panel_h, 0x181820, 238);
-    fill_rect(dst, width, height, x, y, panel_w, 1, 0xffd25a, 255);
-    fill_rect(dst, width, height, x, y + panel_h - 1, panel_w, 1, 0xffd25a, 255);
-    fill_rect(dst, width, height, x, y, 1, panel_h, 0xffd25a, 255);
-    fill_rect(dst, width, height, x + panel_w - 1, y, 1, panel_h, 0xffd25a, 255);
-
-    cyc_overlay_text(dst, width, height, x + 10, y + 8, 2, 0xffd25a, "PAUSED");
-    char label[48];
-    for (int i = 0; i < MENU_COUNT; i++) {
-        if (i == 3) snprintf(label, sizeof(label), "WIDESCREEN %s", g_cfg.widescreen ? "ON" : "OFF");
-        else if (i == 4) snprintf(label, sizeof(label), "FULLSCREEN %s", g_cfg.fullscreen ? "ON" : "OFF");
-        else snprintf(label, sizeof(label), "%s", MENU_ITEMS[i]);
-        int item_y = y + 26 + i * 14;
-        if (i == g_menu_index)
-            fill_rect(dst, width, height, x + 6, item_y - 2, panel_w - 12, 12, 0x3a2a10, 255);
-        cyc_overlay_text(dst, width, height, x + 12, item_y, 2,
-                         i == g_menu_index ? 0xffd25a : 0xe6e6e6, label);
-    }
-    snprintf(label, sizeof(label), "SLOT %d", g_slot);
-    cyc_overlay_text(dst, width, height, x + 10, y + panel_h - 22, 1, 0xe6e6e6, label);
-    cyc_overlay_text(dst, width, height, x + 10, y + panel_h - 12, 1, 0xaaaaaa,
-                     "1-5 SLOT  F5 SAVE  F7 LOAD");
-    cyc_overlay_text(dst, width, height, x + panel_w - 10 - (int)strlen(video_name(g_video)) * 4,
-                     y + panel_h - 12, 1, 0xaaaaaa, video_name(g_video));
+    int on[6] = {0, 0, 0, g_cfg.widescreen ? 1 : 0, g_cfg.fullscreen ? 1 : 0, 0};
+    OverlayTarget target = {dst, width, height};
+    overlay_menu(target, g_menu_index, on, g_slot, g_chr);
 }
 
 static bool present_frame(void) {
@@ -575,9 +846,7 @@ static bool present_frame(void) {
     g_frame_w = width;
     g_frame_h = height;
     VideoOptions options;
-    options.aspect = (VideoAspect)g_cfg.aspect;
-    options.brightness = g_cfg.brightness;
-    options.scanlines = g_cfg.scanlines;
+    options.scanlines = g_cfg.scanlines != 0;
     return video_present(g_video, g_present, width, height, &options);
 }
 
@@ -635,18 +904,21 @@ static void usage(const char *argv0) {
            "  --scale N               window scale 1-8 (default 3)\n"
            "  --fullscreen            start fullscreen\n"
            "  --widescreen            start with the 426x240 widescreen view\n"
-           "  --aspect fit|integer|stretch\n"
            "  --scanlines 0|1|2       CRT scanline strength\n"
-           "  --brightness 50-150     percent\n"
            "  --audio-rate 44100|48000|96000\n"
            "  --volume 0-100          --mute\n"
            "  --slot 1-5              active save slot\n"
+           "  --replay FILE           feed raw controller bytes (one per frame)\n"
+           "  --record FILE           write one controller byte per emulated frame\n"
            "  --frames N              run N frames then exit (smoke test)\n"
            "  --menu                  start paused in the in-game menu\n"
            "  --screenshot PATH       write a presented frame as PNG\n"
            "  --screenshot-frame N    frame to capture (default 1)\n"
            "  --no-vsync              disable vsync\n"
            "  --help                  this text\n"
+           "With no --rom and no remembered ROM, one nearby .nes\n"
+           "boots directly; otherwise a picker lists them,\n"
+           "and you can also drag one onto it.\n"
            "The ROM can also be stored as rom=... in %s.\n",
            argv0, g_config_path[0] ? g_config_path : "config.ini");
 }
@@ -690,6 +962,10 @@ static bool parse_args(Config *cfg, int *frame_limit, bool *help, int argc, char
             cfg->muted = true;
         } else if (!strcmp(arg, "--slot") && i + 1 < argc) {
             cfg->slot = atoi(argv[++i]);
+        } else if (!strcmp(arg, "--replay") && i + 1 < argc) {
+            snprintf(cfg->replay, sizeof(cfg->replay), "%s", argv[++i]);
+        } else if (!strcmp(arg, "--record") && i + 1 < argc) {
+            snprintf(cfg->record, sizeof(cfg->record), "%s", argv[++i]);
         } else if (!strcmp(arg, "--frames") && i + 1 < argc) {
             *frame_limit = atoi(argv[++i]);
         } else if (!strcmp(arg, "--menu")) {
@@ -762,6 +1038,7 @@ int main(int argc, char **argv) {
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
     SDL_GameControllerEventState(SDL_ENABLE);
     init_paths();
+    snprintf(g_sram_path, sizeof(g_sram_path), "%ssmb3.srm", g_save_dir);
     config_load(&g_cfg, g_config_path);
 
     int frame_limit = 0;
@@ -778,10 +1055,39 @@ int main(int argc, char **argv) {
     }
     g_slot = g_cfg.slot;
 
-    if (!g_cfg.rom[0]) {
-        fprintf(stderr, "No ROM selected. Use --rom GAME.NES or set rom=... in %s\n", g_config_path);
+    if (g_base_dir[0]) {
+        char mapping[4096];
+        join_path(mapping, sizeof(mapping), g_base_dir, "assets/gamecontrollerdb.txt");
+        if (file_exists(mapping)) SDL_GameControllerAddMappingsFromFile(mapping);
+    }
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        if (SDL_IsGameController(i)) {
+            open_controller(i);
+            break;
+        }
+    }
+
+    bool batch = frame_limit > 0 || g_screenshot[0];
+    bool rom_ok = g_cfg.rom[0] && glue_load_rom_utf8(g_cfg.rom);
+    if (!rom_ok && !batch)
+        rom_ok = pick_autoload();
+    if (!rom_ok && !batch) {
+        if (!init_video(256, 240)) {
+            SDL_Quit();
+            return 1;
+        }
+        if (!run_picker()) {
+            video_destroy(g_video);
+            if (g_window) SDL_DestroyWindow(g_window);
+            SDL_Quit();
+            return 0;
+        }
+        rom_ok = true;
+    }
+    if (!rom_ok) {
+        fprintf(stderr, "No ROM: run with no flags to choose one, or --rom GAME.NES\n");
         SDL_Quit();
-        return 2;
+        return g_cfg.rom[0] ? 1 : 2;
     }
 
     g_audio = audio_out_create(g_cfg.audio_rate, g_cfg.volume, g_cfg.muted);
@@ -798,25 +1104,76 @@ int main(int argc, char **argv) {
         return 1;
     }
     glue_set_widescreen(g_cfg.widescreen);
-
-    if (g_base_dir[0]) {
-        char mapping[4096];
-        join_path(mapping, sizeof(mapping), g_base_dir, "assets/gamecontrollerdb.txt");
-        if (file_exists(mapping)) SDL_GameControllerAddMappingsFromFile(mapping);
-    }
-    for (int i = 0; i < SDL_NumJoysticks(); i++) {
-        if (SDL_IsGameController(i)) {
-            open_controller(i);
-            break;
+    if (g_cfg.replay[0]) {
+        FILE *rf = fopen(g_cfg.replay, "rb");
+        if (!rf) {
+            fprintf(stderr, "cannot read replay %s\n", g_cfg.replay);
+            audio_out_destroy(g_audio);
+            SDL_Quit();
+            return 1;
         }
+        if (fseek(rf, 0, SEEK_END)) {
+            fclose(rf);
+            audio_out_destroy(g_audio);
+            SDL_Quit();
+            return 1;
+        }
+        long rn = ftell(rf);
+        if (rn <= 0 || fseek(rf, 0, SEEK_SET)) {
+            fclose(rf);
+            fprintf(stderr, "cannot read replay %s\n", g_cfg.replay);
+            audio_out_destroy(g_audio);
+            SDL_Quit();
+            return 1;
+        }
+        g_replay = malloc((size_t)rn);
+        if (!g_replay || fread(g_replay, 1, (size_t)rn, rf) != (size_t)rn) {
+            free(g_replay);
+            g_replay = NULL;
+            fclose(rf);
+            fprintf(stderr, "cannot read replay %s\n", g_cfg.replay);
+            audio_out_destroy(g_audio);
+            SDL_Quit();
+            return 1;
+        }
+        fclose(rf);
+        g_replay_len = (size_t)rn;
+        /* Replays never touch the real save file. */
+        g_sram_ok = false;
+    }
+    if (g_cfg.record[0]) {
+        g_record_fp = fopen(g_cfg.record, "wb");
+        if (!g_record_fp) {
+            fprintf(stderr, "cannot write %s\n", g_cfg.record);
+            audio_out_destroy(g_audio);
+            SDL_Quit();
+            return 1;
+        }
+    }
+    if (!g_replay) {
+        int sram_rc = glue_sram_load(g_sram_path);
+        if (sram_rc < 0) {
+            g_sram_ok = false;
+            fprintf(stderr, "save: %s is not a valid save file; it will not be overwritten\n",
+                    g_sram_path);
+        }
+    }
+    g_chr = glue_get_chr_rom(&g_chr_len);
+    if (!g_chr || g_chr_len < 0x6000) {
+        fprintf(stderr, "video: CHR ROM unavailable; menu skin disabled\n");
+        g_chr = NULL;
     }
 
     int fw = 256, fh = 240;
     (void)glue_get_present_framebuffer(&fw, &fh);
-    if (!init_video(fw, fh)) {
-        audio_out_destroy(g_audio);
-        SDL_Quit();
-        return 1;
+    if (!g_window) {
+        if (!init_video(fw, fh)) {
+            audio_out_destroy(g_audio);
+            SDL_Quit();
+            return 1;
+        }
+    } else {
+        resize_window_to_frame();
     }
 
     if (g_menu) open_menu();
@@ -833,10 +1190,41 @@ int main(int argc, char **argv) {
         while (SDL_PollEvent(&event)) handle_event(&event);
 
         if (!g_menu) {
-            glue_set_pad1(read_pad());
+            uint8_t live = read_pad();
+            uint8_t fed = live;
+            if (g_replay) {
+                if (g_replay_pos < g_replay_len) {
+                    fed = g_replay[g_replay_pos++];
+                } else {
+                    fprintf(stderr, "replay finished\n");
+                    notify("REPLAY FINISHED");
+                    g_running = false;
+                }
+            }
+            if (!g_running) {
+                /* Recording over: present the last frame instead of stepping. */
+            } else {
+            session_push(fed);
+            if (g_record_fp) fwrite(&fed, 1, 1, g_record_fp);
+            glue_set_pad1(fed);
             glue_step_frame();
-            size_t samples = glue_get_audio_samples(audio_buffer, 4096, 1);
-            if (samples) audio_out_push(g_audio, audio_buffer, samples);
+            if (!g_replay && g_sram_ok && ++g_sram_frames >= 60) {
+                g_sram_frames = 0;
+                if (!glue_sram_save(g_sram_path))
+                    fprintf(stderr, "save: cannot write %s\n", g_sram_path);
+            }
+            if (g_audio) {
+                const size_t target = audio_out_target(g_audio);
+                if (target) {
+                    double fill = ((double)target - (double)audio_out_queued(g_audio)) / (double)target;
+                    if (fill < -1.0) fill = -1.0;
+                    if (fill > 1.0) fill = 1.0;
+                    glue_set_audio_rate_scale(1.0 + 0.005 * fill);
+                }
+            }
+            size_t samples = glue_get_audio_samples(audio_buffer, 4096, 0);
+            if (samples && g_audio) audio_out_push(g_audio, audio_buffer, samples);
+            }
         }
         if (!present_frame()) {
             fprintf(stderr, "video: presentation failed\n");
@@ -859,12 +1247,10 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (!g_replay && g_sram_ok) glue_sram_save(g_sram_path);
     config_save(&g_cfg);
+    if (g_record_fp) fclose(g_record_fp);
+    free(g_session);
+    free(g_replay);
     audio_out_destroy(g_audio);
-    if (g_pad) SDL_GameControllerClose(g_pad);
-    video_destroy(g_video);
-    if (g_window) SDL_DestroyWindow(g_window);
-    free(g_present);
-    SDL_Quit();
-    return 0;
 }

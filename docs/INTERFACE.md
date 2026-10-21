@@ -1,18 +1,14 @@
-# Interface e controles — v1.2
+# Interface e controles
 
-O programa abre no launcher. Use Selecionar ROM para indicar ROM compatível (USA Rev 1, dump goodNES ou No-Intro); o payload é validado antes de habilitar Jogar. Uma ROM validada inicia diretamente e é lembrada para as próximas aberturas.
+O programa é um binário único: dois cliques iniciam o jogo direto. Sem `--rom` e sem ROM lembrada, um único `.nes` próximo (ao lado do app, no diretório atual ou em `roms/`) abre direto; com zero ou vários, abre um seletor dentro da janela (setas/Enter, gamepad, ou arrastar o arquivo para a janela). A ROM usada é validada e lembrada por caminho absoluto em `config.ini` para as próximas aberturas.
 
-- Teclado: setas, Z = B, X = A, Shift = Select, Enter = Start, A/S = turbo, Esc = menu do PC. Todos são remapeáveis.
-- Controle: seleção automática ou por dispositivo; botões físicos remapeáveis; D-pad e analógico; zona morta; teste de botão e hotplug. A configuração Menu é independente de Select. Guide/Home abre o menu por padrão; controles sem esse botão podem remapear a ação.
-- USB/Bluetooth/receptores: SDL2 com HIDAPI e SDL_GameControllerDB. O Windows precisa reconhecer/parear o dispositivo. Não foi testado fisicamente cada modelo; o teste automatizado usa joystick virtual.
-- Vídeo: proporção, escala inteira/ajuste/recorte, filtro, scanlines, brilho, resolução e tela cheia sem bordas. 16:9 amplia o cenário horizontal, com HUD original centralizado.
-- Áudio: volume, mute, frequência 44,1/48/96 kHz, dispositivo e reserva de 20/40/60 ms. Saída NES mono nos dois canais.
-- Aplicar e voltar salva as alterações; Descartar mantém as anteriores. Restaurar esta página afeta apenas o grupo atual e exige Aplicar para persistir.
-- 1–5 selecionam o slot de save state. Carregar retoma a partida; Esc abre o menu; F11 alterna tela cheia.
-- ROM, Projeto e Créditos descrevem o aplicativo, a ROM do usuário e a identidade Underplay.
+- Teclado: setas, X = A, Z = B, Shift = Select, Enter = Start. Tudo remapeável via `key_*` em `config.ini`.
+- Menu do PC (Esc ou botão Guide): RESUME, SAVE STATE, LOAD STATE, WIDESCREEN, FULLSCREEN, QUIT. Navega com setas/WASD ou D-pad; Enter/Espaço/A/Start ativa, B fecha.
+- Atalhos: F5 salva, F7 carrega, 1–5 trocam o slot de save state. F10 alterna widescreen, F11 tela cheia, F8 mudo, -/= volume. G grava a sessão em `saves/replay-N.rec`. R é o Reset do console (mantém a SRAM).
+- Controle: abertura automática com hotplug; D-pad e analógico esquerdo (zona morta ~12000); A/B/X/Y, Back = Select, Start = Start. Guide abre o menu.
+- Vídeo: `--renderer vulkan|sdl` (Vulkan com fallback para SDL2), `--scale 1-8`, aspecto fit/integer/stretch, `--scanlines`, `--brightness 50-150`, tela cheia. 16:9 amplia o cenário horizontal com HUD original centralizado; salas verticais e cenas voltam ao quadro nativo.
+- Áudio: volume, mudo, `--audio-rate 44100|48000|96000`. Saída NES mono nos dois canais.
+- Persistência: `config.ini` guarda ROM, vídeo, áudio e teclas. Progresso em `saves/smb3.srm` (janela $6000–$7FFF), save states em `saves/state-1..5.sst`.
+- Linha de comando: `--record/--replay` (1 byte de controle por quadro), `--frames N` e `--screenshot` para testes, `--menu` inicia pausado, `--slot 1-5`, `--no-vsync`, `--help` lista tudo.
 
-Validação: smb3-ui-verify cria a interface sem abrir janelas visíveis, renderiza sete páginas, verifica Aplicar/Descartar e testa entrada, soltura e remoção de um controle virtual SDL. Capturas em build/ui-*.png. O teste do runtime continua sendo smb3-verify.
-
-## Widescreen v1.3
-
-Em Vídeo > Proporção, 16:9 agora amplia o cenário horizontal, mantendo o HUD centralizado e barras pretas apenas nas laterais dele. O ajuste da janela usa a proporção do canvas e preserva o tamanho relativo dos pixels, sem esticar a imagem. Não é o antigo 16:9 esticado. Esse modo é experimental: a ativação e o descarte horizontal dos objetos acompanham a área ampliada, e salas verticais ou sem espaço lateral disponível ficam no enquadramento nativo. Consulte WIDESCREEN.md.
+Ver trocas de proporção e ativação de inimigos em 1-1 em WIDESCREEN.md. Limitações e garantias do build em PORTABLE.md.

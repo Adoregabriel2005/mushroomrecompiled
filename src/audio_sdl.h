@@ -9,17 +9,18 @@ extern "C" {
 
 typedef struct AudioOut AudioOut;
 
-/* Opens the default SDL2 audio device. Returns NULL when audio is unavailable;
- * the caller can continue without sound. `count` is the number of interleaved
- * int16 samples (two per stereo frame). */
+/* Opens the default SDL2 audio device with a queue (no callback), like
+ * smb3pc. The device is stereo; input is mono and is duplicated here. */
 AudioOut *audio_out_create(int sample_rate, int volume, bool muted);
 void audio_out_destroy(AudioOut *audio);
-void audio_out_push(AudioOut *audio, const int16_t *interleaved, size_t count);
+void audio_out_push(AudioOut *audio, const int16_t *mono, size_t count);
 void audio_out_set_volume(AudioOut *audio, int volume);
 void audio_out_set_muted(AudioOut *audio, bool muted);
 void audio_out_pause(AudioOut *audio, bool paused);
 void audio_out_clear(AudioOut *audio);
 int audio_out_sample_rate(const AudioOut *audio);
+size_t audio_out_queued(const AudioOut *audio);
+size_t audio_out_target(const AudioOut *audio);
 
 #ifdef __cplusplus
 }

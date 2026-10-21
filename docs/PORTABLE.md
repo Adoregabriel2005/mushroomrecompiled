@@ -67,6 +67,8 @@ Useful options:
 --volume 0-100
 --mute
 --slot 1-5
+--replay FILE           feed raw controller bytes (one per frame)
+--record FILE           write one controller byte per emulated frame
 --no-vsync
 --frames N              run N frames then exit (smoke test)
 --screenshot PATH       write a presented frame as PNG
@@ -85,6 +87,20 @@ and are renamed over the target, so a failed or interrupted save does not
 replace a good state with a partial file. The engine does not auto-load a state
 at startup, matching the existing launcher behaviour.
 
+The game's own progress slots live in work RAM, which the cartridge header
+marks non-battery. Like smb3pc, the frontend still persists that window in
+`saves/smb3.srm`: loaded after the ROM, flushed about once a second while it
+changes and on exit, written through a `.tmp` file and rename. A file of the
+wrong size is reported and never overwritten. Console Reset (R) preserves RAM
+across power-on, so progress survives a reset. Replays never touch the file.
+
+`G` saves the session so far as the first free `saves/replay-N.rec`: raw
+controller bytes, one per emulated frame, like smb3pc's desktop recordings.
+`--record FILE` streams the same bytes to a file; `--replay FILE` feeds them
+back instead of live input and quits when the recording ends. A replay must
+start with the same widescreen mode it was recorded with, and save states
+are refused while one plays.
+
 ## Controls
 
 | Action | Keyboard | SDL gamepad |
@@ -97,6 +113,7 @@ at startup, matching the existing launcher behaviour.
 | PC menu | Esc | Guide / Home |
 | Save state | F5 | Menu |
 | Load state | F7 | Menu |
+| Save session replay | G | — |
 | Select slot | 1-5 | Menu |
 | Widescreen | F10 | Menu |
 | Fullscreen | F11 | Menu |
@@ -124,12 +141,15 @@ survive restarts.
   pages or per-device button remapping UI. It loads `gamecontrollerdb.txt` and
   uses the standard mapping above; settings such as scale, renderer, aspect,
   volume, sample rate, and slot are persisted in `config.ini`.
-- Music and sound effects still share NESRecomp's single cycle-accurate APU
-  instance. smb3pc's two-voice-set split depends on translator-level ownership
-  tags around the game's sound routines; NESRecomp's generated code has no such
-  tags, so the split was not ported. Duplicating the CPU-visible APU state
-  would also change DMA/IRQ timing and save states, so it is intentionally
-  left as a follow-up rather than merged untested.
+- Music and sound effects run on two Blargg voice sets (music + sfx), routed
+  by owner tags the translator emits around the game's sound routines
+  (`[[sound_owner]]` in game.toml), with the sfx set reset at every level
+  load. The four music gates that muted music while an effect shared the
+  channel are removed (`[[sound_gate]]`), so music keeps playing; the
+  interpreter sees the same fall-through through a ROM-read override, and
+  `smb3-verify` checks native/interpreter agreement over 3,000 frames.
+  Duplicating the CPU-visible APU state this way leaves DMA/IRQ timing and
+  the save-state format unchanged.
 - Screenshot paths are passed to the engine's PNG writer; use an ASCII path on
   Windows until the writer has a wide-character entry point.
 

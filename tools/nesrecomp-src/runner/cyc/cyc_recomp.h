@@ -8,6 +8,9 @@
 #pragma once
 #include "cpu6502.h"
 #include "cyc_hooks.h"
+#include "audio_engine.h"
+#include "snd_owner.h"
+#include "wide_enemies.h" /* level-load signal for the widescreen object window */
 
 /* One compiled view of the cartridge: the instructions of one 4KB PRG bank as
  * mapped in one of the CPU's eight 4KB slots. A block folds the ROM bytes at

@@ -5,6 +5,7 @@
 #include "cyc_core.h"
 #include "cyc_png.h"
 #include "widescreen.h"
+#include "hud.h"
 #include "wide_enemies.h"
 #include "cyc_run.h"
 #include "cyc_mod.h"
@@ -34,7 +35,7 @@ int main(int argc,char **argv){
     for(int j=i+1;j<5;j++)if(r[0x661+j]&&r[0x659+i]<48&&r[0x659+i]==r[0x659+j])return 10;
    }
    const Smb3EnemyLayer *layers=smb3_enemies_layers();
-   for(int i=0;i<5;i++)if(layers[i].valid){for(int s=0;s<64;s++)if(layers[i].oam[s*4]<191){layer_frames++;goto layer_counted;}}
+   for(int i=0;i<5;i++)if(layers[i].valid&&layers[i].count){layer_frames++;goto layer_counted;}
    layer_counted:;
   }
   if(f==1140){
@@ -45,17 +46,50 @@ int main(int argc,char **argv){
    if(cyc_mem_state_hash()!=before){fprintf(stderr,"Sprite drawing changed live machine\n");return 11;}
    if(!glue_save_state(L"verify-wide-enemies.bin"))return 12;
   }
-  for(int y=192;y<240;y++){
-   if(memcmp(out+y*w+85,native+y*256,256*sizeof(uint32_t)))return 3;
-   for(int x=0;x<85;x++)if(out[y*w+x]!=0xff000000u||out[y*w+341+x]!=0xff000000u)return 4;
+  /* The status bar is its own layer (hud.c, after smb3pc's hud.cpp): the rows
+   * the split stages are drawn from the bar's settled row, and every other
+   * HUD row is the machine's own, pixel for pixel. A staged row must continue
+   * the bar - the same background its settled row shows - not the playfield
+   * that was still on the wire when the split began. */
+  int bar_first,bar_anchor;smb3_hud_bounds(&bar_first,&bar_anchor);
+  const uint32_t *hud=smb3_hud_present(native);
+  int bar_top=smb3_hud_top();if(bar_top>240)bar_top=240;
+  /* The split IRQ is the only thing that can start a bar (hud.cpp's hud_top):
+   * a frame without one gets no layer at all. */
+  if(bar_first>=0&&cyc_frame_split_line()>=240){fprintf(stderr,"Bar without a split IRQ at %d\n",f);return 18;}
+  /* Every row below the anchor is the bar's own captured state, so the layer
+   * rebuilding it has to reproduce the machine's pixels exactly - that is the
+   * port reproducing the PPU (palette, banking, scroll, sprites, greyscale). */
+  for(int y=bar_anchor+1;y>0&&y<240;y++)if(memcmp(hud+y*256,native+y*256,256*sizeof(uint32_t))){
+   fprintf(stderr,"Bar row %d is not the PPU's at %d\n",y,f);return 19;}
+  uint32_t bar_bg=0;int bar_best=-1;
+  for(int x=0;bar_anchor>=0&&x<256;x++){
+   uint32_t c=hud[bar_anchor*256+x];int n=0;
+   for(int k=0;k<256;k++)if(hud[bar_anchor*256+k]==c)n++;
+   if(n>bar_best){bar_best=n;bar_bg=c;}
   }
-  int first=active?16:0,count=active?224:256;
-  for(int y=0;y<192;y++)if(memcmp(out+y*w+origin+first,native+y*256+first,count*sizeof(uint32_t)))return 5;
+  int play_x=active?origin+12:97;
+  for(int y=0;y<240;y++){
+   if(y<bar_top){
+    /* The level still owns these rows (they are the playfield's own pixels),
+     * so the wide picture pastes them with the frame and fills their margins
+     * with level content. */
+    if(memcmp(out+y*w+play_x,native+y*256+12,232*sizeof(uint32_t)))return 5;
+    continue;
+   }
+   for(int x=0;x<232;x++)if(out[y*w+97+x]!=hud[y*256+12+x]){fprintf(stderr,"Bar row %d is not the bar layer's at %d\n",y,f);return 3;}
+   int staged=bar_first>=0&&y>=bar_first&&y<=bar_anchor;
+   if(staged&&memcmp(hud+y*256,native+y*256,256*sizeof(uint32_t))){
+    int n=0;for(int x=0;x<256;x++)if(hud[y*256+x]==bar_bg)n++;
+    if(n<192){fprintf(stderr,"Repaired bar row %d does not continue the bar at %d (%d/256)\n",y,f,n);return 17;}
+   }
+   for(int x=0;x<97;x++)if(out[y*w+x]!=0xff000000u||out[y*w+329+x]!=0xff000000u)return 4;
+  }
   if(active){
    static uint32_t clean[426*240],corrupted[256*240];
    memcpy(clean,out,sizeof clean);memcpy(corrupted,native,sizeof corrupted);
-   for(int y=0;y<192;y++)for(int x=0;x<16;x++){
-    corrupted[y*256+x]=0xffff00ffu;corrupted[y*256+240+x]=0xff00ff00u;
+   for(int y=0;y<192;y++)for(int x=0;x<12;x++){
+    corrupted[y*256+x]=0xffff00ffu;corrupted[y*256+244+x]=0xff00ff00u;
    }
    out=smb3_wide_present(corrupted);
    if(memcmp(clean,out,sizeof clean)){fprintf(stderr,"Native garbage leaked through repaired edges at %d\n",f);return 8;}

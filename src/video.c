@@ -1,5 +1,4 @@
 #include "video_internal.h"
-#include <stdlib.h>
 
 Video *video_create(SDL_Window *window, VideoBackend backend, bool vsync) {
     if (!window) return NULL;
@@ -10,7 +9,6 @@ Video *video_create(SDL_Window *window, VideoBackend backend, bool vsync) {
 void video_destroy(Video *video) {
     if (!video) return;
     if (video->ops && video->ops->destroy) video->ops->destroy(video);
-    free(video);
 }
 
 bool video_present(Video *video, const uint32_t *argb, int width, int height,

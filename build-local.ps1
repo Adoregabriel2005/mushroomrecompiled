@@ -43,15 +43,11 @@ try {
         & ./tools/run-hidden.ps1 -Executable $Exe -Arguments $NativeArguments -Log $Log
         if ($LASTEXITCODE -ne 0) { throw "Falha: veja $Log.log e $Log.err.log" }
     }
-    Run-Native $cmake "-S tools/nesrecomp-src/recompiler -B `"$BuildDir/recompiler`" -G `"MinGW Makefiles`" -DCMAKE_BUILD_TYPE=Release" "$BuildDir/recompiler-configure"
-    Run-Native $cmake "--build `"$BuildDir/recompiler`" -j 8" "$BuildDir/recompiler-build"
-    $compiler=(Resolve-Path "$BuildDir/recompiler/NESRecomp.exe").Path
-    Run-Native $compiler "`"$rom`" --game game.toml --cycle-seed-file docs/smb3-cycle-seeds.txt" "$BuildDir/generate"
-    Run-Native $cmake "-S . -B `"$BuildDir`" -G `"MinGW Makefiles`" -DCMAKE_BUILD_TYPE=Release" "$BuildDir/configure"
+    Run-Native $cmake "-S . -B `"$BuildDir`" -G `"MinGW Makefiles`" -DCMAKE_BUILD_TYPE=Release -DSMB3_ROM=`"$rom`"" "$BuildDir/configure"
     Run-Native $cmake "--build `"$BuildDir`" -j 8" "$BuildDir/compile"
     if ($Verify) {
         $verifierPath=(Resolve-Path "$BuildDir/smb3-verify.exe").Path
         Run-Native $verifierPath "`"$rom`"" "$BuildDir/verify"
     }
-    Write-Host "Build: $BuildDir/MushroomRecompiled-v1.5.0.exe"
+    Write-Host "Build: $BuildDir/MushroomRecompiled.exe"
 } finally { Pop-Location }

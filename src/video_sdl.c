@@ -33,6 +33,7 @@ static void sdl_destroy(Video *base) {
     SdlVideo *v = (SdlVideo *)base;
     if (v->texture) SDL_DestroyTexture(v->texture);
     if (v->renderer) SDL_DestroyRenderer(v->renderer);
+    free(v);
 }
 
 static bool sdl_present(Video *base, const uint32_t *argb, int width, int height,
@@ -49,29 +50,37 @@ static bool sdl_present(Video *base, const uint32_t *argb, int width, int height
     SDL_GetRendererOutputSize(v->renderer, &win_w, &win_h);
     if (win_w <= 0 || win_h <= 0) SDL_GetWindowSize(v->window, &win_w, &win_h);
 
-    VideoAspect aspect = options ? options->aspect : VIDEO_ASPECT_FIT;
-    int brightness = options ? options->brightness : 100;
-    int scanlines = options ? options->scanlines : 0;
-    if (brightness < 0) brightness = 0;
-    if (brightness > 200) brightness = 200;
-    Uint8 mod = (Uint8)((brightness * 255 + 50) / 100);
-    SDL_SetTextureColorMod(v->texture, mod, mod, mod);
-
     SDL_SetRenderDrawColor(v->renderer, 0, 0, 0, 255);
     SDL_RenderClear(v->renderer);
-    int x, y, dw, dh;
-    video_dest_rect(win_w, win_h, width, height, aspect, &x, &y, &dw, &dh);
-    SDL_Rect dst = {x, y, dw, dh};
-    if (SDL_RenderCopy(v->renderer, v->texture, NULL, &dst) != 0) {
+
+    /* smb3pc overscan: 8 pixels hidden on each side, so the 4:3 picture
+     * shown is 240 columns wide; the 426-column widescreen compose buffer
+     * is shown whole. Square pixels, centred. */
+    int src_x = 0, src_w = width;
+    if (width == 256) {
+        src_x = 8;
+        src_w = 240;
+    }
+    const double sx = (double)win_w / (double)src_w;
+    const double sy = (double)win_h / (double)height;
+    const double scale = sx < sy ? sx : sy;
+    int dw = (int)((double)src_w * scale + 0.5);
+    int dh = (int)((double)height * scale + 0.5);
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    SDL_Rect src = {src_x, 0, src_w, height};
+    SDL_Rect dst = {(win_w - dw) / 2, (win_h - dh) / 2, dw, dh};
+    if (SDL_RenderCopy(v->renderer, v->texture, &src, &dst) != 0) {
         fprintf(stderr, "video: SDL_RenderCopy failed: %s\n", SDL_GetError());
         return false;
     }
 
-    if (scanlines > 0 && dh > 2) {
-        int alpha = scanlines >= 2 ? 112 : 56;
-        SDL_SetRenderDrawColor(v->renderer, 0, 0, 0, (Uint8)alpha);
-        for (int row = y + 1; row < y + dh; row += 2) {
-            SDL_RenderDrawLine(v->renderer, x, row, x + dw - 1, row);
+    if (options && options->scanlines && dh > 2) {
+        SDL_SetRenderDrawBlendMode(v->renderer, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(v->renderer, 0, 0, 0, 72);
+        for (int row = 1; row < height; row += 2) {
+            int y = dst.y + row * dh / height;
+            SDL_RenderDrawLine(v->renderer, dst.x, y, dst.x + dst.w - 1, y);
         }
     }
     SDL_RenderPresent(v->renderer);
@@ -101,6 +110,5 @@ Video *video_sdl_create(SDL_Window *window, bool vsync) {
         free(v);
         return NULL;
     }
-    SDL_SetRenderDrawBlendMode(v->renderer, SDL_BLENDMODE_BLEND);
     return &v->base;
 }

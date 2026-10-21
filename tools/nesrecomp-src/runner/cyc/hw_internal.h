@@ -418,6 +418,12 @@ extern HwPpu ppu;
 extern uint16_t hw_frame_index[256 * 240];
 /* cyc_core.h cyc_frame_lines / cyc_frame_bg_opaque. */
 extern CycLine  hw_frame_lines[240];
+/* cyc_core.h cyc_frame_nametables: the four nametable quadrants as the PPU
+ * mapped them at the end of the last frame. */
+extern uint8_t  hw_frame_nt[0x1000];
+/* The row the frame's last scanline IRQ (the status-bar split) starts on, or
+ * 240 when this frame had none. Set by the mapper's IRQ, cleared at prerender. */
+extern int      hw_split_line;
 extern uint8_t  hw_frame_bg[256 * 240];
 extern uint32_t hw_frame_argb[256 * 240];
 

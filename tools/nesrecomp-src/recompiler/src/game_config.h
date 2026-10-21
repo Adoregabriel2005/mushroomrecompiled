@@ -26,6 +26,8 @@
 #define GAME_CFG_MAX_STACK_BAIL_FUNCS 16
 #define GAME_CFG_MAX_INDIRECT_CONTINUATIONS 16
 #define GAME_CFG_MAX_DEDUP_EXCLUDES 4096
+#define GAME_CFG_MAX_SOUND_OWNERS       32
+#define GAME_CFG_MAX_SOUND_GATES         8
 
 /*
  * Trampoline: a JSR whose operand address is a known bank-switch dispatch
@@ -109,6 +111,31 @@ typedef struct {
     int      bank;          /* -1 for fixed bank */
     bool     replace_group; /* false: one identity; true: its proven group */
 } ReplaceFunc;
+
+/*
+ * Sound ownership: a JSR into one of these routine entry points changes which
+ * Blargg APU receives subsequent register writes. 0 = music, 1 = sfx,
+ * 2 = both. The cycle backend emits owner save/restore around every JSR/RTS;
+ * calls not listed here inherit the caller's owner, so shared helpers write
+ * for whoever called them.
+ */
+typedef struct {
+    uint16_t addr;
+    uint8_t  owner;
+} SoundOwner;
+
+/*
+ * Sound gates: BNE instructions that skip music notes/envelopes while a
+ * sound effect uses the same channel. Removed (both paths fall through) so
+ * music keeps playing under effects. The recompiled path emits the branch
+ * with its target forced to the next instruction; live/interpreter paths see
+ * the same fall-through through a ROM-read override that forces the branch
+ * offset to zero, so both sides agree cycle for cycle.
+ */
+typedef struct {
+    uint16_t addr;
+    int      bank;          /* -1 matches the address in any bank */
+} SoundGate;
 
 /*
  * Inline indexed dispatch: JSR to a routine that pops the return address to
@@ -365,6 +392,17 @@ typedef struct {
 
     ExtraFunc        dedup_excludes[GAME_CFG_MAX_DEDUP_EXCLUDES];
     int              dedup_exclude_count;
+
+    SoundOwner       sound_owners[GAME_CFG_MAX_SOUND_OWNERS];
+    int              sound_owner_count;
+    SoundGate        sound_gates[GAME_CFG_MAX_SOUND_GATES];
+    int              sound_gate_count;
+    /* First instruction of the level-init body: reset the sfx voice set on a
+     * genuine level load, so a ringing channel does not carry across. */
+    uint16_t         sound_reset_addr;
+    int              sound_reset_bank;
+    /* [start, end) of the pause routine: its $4015 writes reach both sets. */
+    uint16_t         sound_pause_start, sound_pause_end;
 
     uint16_t         stack_bail_funcs[GAME_CFG_MAX_STACK_BAIL_FUNCS];
     int              stack_bail_func_count;

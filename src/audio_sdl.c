@@ -2,50 +2,15 @@
 #include <SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 struct AudioOut {
     SDL_AudioDeviceID device;
-    SDL_mutex *lock;
     int sample_rate;
     int volume;
     bool muted;
-    int16_t *ring;
-    size_t capacity; /* interleaved samples */
-    size_t read;
-    size_t write;
-    size_t count;
+    int16_t *stereo;
+    size_t stereo_capacity; /* int16 samples */
 };
-
-/* Start with a short cushion of silence. The game produces samples once per
- * emulated frame while SDL pulls them in fixed-size callback blocks; without a
- * cushion the first callback can run dry and the stream clicks at startup or
- * after a menu/reset clear. */
-static void audio_prefill(AudioOut *a) {
-    size_t target = (size_t)a->sample_rate / 20u * 2u; /* 50 ms, interleaved */
-    if (target > a->capacity) target = a->capacity;
-    memset(a->ring, 0, a->capacity * sizeof(*a->ring));
-    a->read = 0;
-    a->write = target % a->capacity;
-    a->count = target;
-}
-
-static void SDLCALL audio_callback(void *userdata, Uint8 *stream, int len) {
-    AudioOut *a = userdata;
-    int16_t *out = (int16_t *)stream;
-    size_t want = (size_t)len / sizeof(int16_t);
-    SDL_LockMutex(a->lock);
-    for (size_t i = 0; i < want; i++) {
-        if (a->count > 0) {
-            out[i] = a->ring[a->read];
-            a->read = (a->read + 1) % a->capacity;
-            a->count--;
-        } else {
-            out[i] = 0;
-        }
-    }
-    SDL_UnlockMutex(a->lock);
-}
 
 AudioOut *audio_out_create(int sample_rate, int volume, bool muted) {
     if (sample_rate < 8000 || sample_rate > 192000) return NULL;
@@ -54,34 +19,35 @@ AudioOut *audio_out_create(int sample_rate, int volume, bool muted) {
     a->sample_rate = sample_rate;
     a->volume = volume < 0 ? 0 : volume > 100 ? 100 : volume;
     a->muted = muted;
-    a->lock = SDL_CreateMutex();
-    a->capacity = (size_t)sample_rate; /* 0.5 seconds, stereo interleaved */
-    a->ring = calloc(a->capacity, sizeof(*a->ring));
-    if (!a->lock || !a->ring) {
-        audio_out_destroy(a);
-        return NULL;
-    }
 
-    SDL_AudioSpec want = {0}, have = {0};
+    SDL_AudioSpec want, have;
+    SDL_zero(want);
+    SDL_zero(have);
     want.freq = sample_rate;
     want.format = AUDIO_S16SYS;
     want.channels = 2;
     want.samples = 1024;
-    want.callback = audio_callback;
-    want.userdata = a;
+    want.callback = NULL;
     a->device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
     if (!a->device) {
         fprintf(stderr, "audio: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
-        audio_out_destroy(a);
+        free(a);
         return NULL;
     }
     if (have.format != AUDIO_S16SYS || have.channels != 2) {
         fprintf(stderr, "audio: device did not provide stereo S16 output\n");
-        audio_out_destroy(a);
+        SDL_CloseAudioDevice(a->device);
+        free(a);
         return NULL;
     }
     a->sample_rate = have.freq;
-    audio_prefill(a);
+    a->stereo_capacity = 4096u * 2u;
+    a->stereo = malloc(a->stereo_capacity * sizeof(*a->stereo));
+    if (!a->stereo) {
+        SDL_CloseAudioDevice(a->device);
+        free(a);
+        return NULL;
+    }
     SDL_PauseAudioDevice(a->device, 0);
     return a;
 }
@@ -92,42 +58,37 @@ void audio_out_destroy(AudioOut *a) {
         SDL_PauseAudioDevice(a->device, 1);
         SDL_CloseAudioDevice(a->device);
     }
-    if (a->lock) SDL_DestroyMutex(a->lock);
-    free(a->ring);
+    free(a->stereo);
     free(a);
 }
 
-void audio_out_push(AudioOut *a, const int16_t *interleaved, size_t count) {
-    if (!a || !interleaved || count == 0) return;
-    SDL_LockMutex(a->lock);
+void audio_out_push(AudioOut *a, const int16_t *mono, size_t count) {
+    if (!a || !mono || count == 0) return;
+    if (count * 2 > a->stereo_capacity) {
+        size_t cap = count * 2;
+        int16_t *grown = realloc(a->stereo, cap * sizeof(*grown));
+        if (!grown) return;
+        a->stereo = grown;
+        a->stereo_capacity = cap;
+    }
     int volume = a->muted ? 0 : a->volume;
     for (size_t i = 0; i < count; i++) {
-        int32_t sample = (int32_t)interleaved[i] * volume / 100;
-        if (a->count == a->capacity) {
-            a->read = (a->read + 1) % a->capacity;
-            a->count--;
-        }
-        a->ring[a->write] = (int16_t)sample;
-        a->write = (a->write + 1) % a->capacity;
-        a->count++;
+        int16_t s = (int16_t)((int32_t)mono[i] * volume / 100);
+        a->stereo[i * 2] = s;
+        a->stereo[i * 2 + 1] = s;
     }
-    SDL_UnlockMutex(a->lock);
+    SDL_QueueAudio(a->device, a->stereo, (Uint32)(count * 2 * sizeof(int16_t)));
 }
 
 void audio_out_set_volume(AudioOut *a, int volume) {
     if (!a) return;
     if (volume < 0) volume = 0;
     if (volume > 100) volume = 100;
-    SDL_LockMutex(a->lock);
     a->volume = volume;
-    SDL_UnlockMutex(a->lock);
 }
 
 void audio_out_set_muted(AudioOut *a, bool muted) {
-    if (!a) return;
-    SDL_LockMutex(a->lock);
-    a->muted = muted;
-    SDL_UnlockMutex(a->lock);
+    if (a) a->muted = muted;
 }
 
 void audio_out_pause(AudioOut *a, bool paused) {
@@ -135,12 +96,18 @@ void audio_out_pause(AudioOut *a, bool paused) {
 }
 
 void audio_out_clear(AudioOut *a) {
-    if (!a) return;
-    SDL_LockMutex(a->lock);
-    audio_prefill(a);
-    SDL_UnlockMutex(a->lock);
+    if (a && a->device) SDL_ClearQueuedAudio(a->device);
 }
 
 int audio_out_sample_rate(const AudioOut *a) {
     return a ? a->sample_rate : 0;
+}
+
+size_t audio_out_queued(const AudioOut *a) {
+    return a && a->device ? (size_t)SDL_GetQueuedAudioSize(a->device) : 0;
+}
+
+size_t audio_out_target(const AudioOut *a) {
+    /* 40 ms stereo S16, the same queue target as smb3pc. */
+    return a ? (size_t)(a->sample_rate / 25) * 2u * sizeof(int16_t) : 0;
 }

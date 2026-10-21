@@ -1113,10 +1113,18 @@ static void emit_read(Emit *e, const OpDef *d) {
     go_next(e);
 }
 
+static bool sound_config_active(void);
+static uint8_t sound_owner_for(uint16_t addr);
+static bool sound_gate_at(const Emit *e, const OpDef *d);
+static bool sound_pause_write(const Emit *e, const OpDef *d);
+
 static void emit_write(Emit *e, const OpDef *d) {
     WriteReach reach = write_reach(e, d->am);
     addressing(e, d->am, true, false);
+    const bool both = sound_pause_write(e, d);
+    if (both) ln(e, "snd_owner_begin_both(); /* pause routine reaches both sets */");
     ln(e, "cpu_write(ea, %s, CYC_POLL | CYC_DONE);", d->body);
+    if (both) ln(e, "snd_owner_end_both();");
     if (!bank_exit(e, reach)) { ram_store_check(e, d->am); go_next(e); }
 }
 
@@ -1175,7 +1183,12 @@ static void emit_branch(Emit *e, const OpDef *d) {
         return;
     }
     uint16_t next = (uint16_t)(e->P + 2);
-    uint16_t target = (uint16_t)(next + (int8_t)insn_byte(e, 1));
+    /* Sound gates fall through on both paths: the music is not muted while a
+     * sound effect shares its channel. Live paths see the same behavior
+     * through a ROM-read override that zeroes the branch offset. */
+    uint16_t target = sound_gate_at(e, d)
+        ? next /* gate removed: music ignores sound-effect state */
+        : (uint16_t)(next + (int8_t)insn_byte(e, 1));
     uint16_t same_page = (uint16_t)((next & 0xFF00) | (target & 0xFF));
     ln(e, "if (%s) { %s; %s }", not_taken(d), read_const(e, (uint16_t)(e->P + 1), POLL | DONE), jump_const(e, next));
     read_operand(e, 1, POLL);
@@ -1227,6 +1240,15 @@ static void emit_jsr(Emit *e) {
         ln(e, "cpu_write((uint16_t)(0x100 | (uint8_t)(cpu.s - 1)), 0x%02X, 0);", ret & 0xFF);
     }
     read_operand(e, 2, POLL | DONE);
+    /* The standalone interpreter has no game config, but an untracked
+     * JSR/RTS pair would desync the owner from then on, so it saves and
+     * inherits like a live call. */
+    if (sound_config_active() || INTERP(e)) {
+        if (LIVE(e))
+            ln(e, "snd_owner_push(cpu.s, 0xFF); /* interpreted call inherits the owner */");
+        else
+            ln(e, "snd_owner_push(cpu.s, %u); /* sound owner */", (unsigned)sound_owner_for(insn_operand16(e)));
+    }
     ln(e, "cpu.s = (uint8_t)(cpu.s - 2);");
     if (LIVE(e))
         ln(e, "cpu.pc = %s;", operand16(e));
@@ -1241,6 +1263,7 @@ static void emit_rts(Emit *e) {
     ln(e, "uint8_t hi = cpu_read((uint16_t)(0x100 | (uint8_t)(cpu.s + 2)), 0);");
     ln(e, "cpu_read((uint16_t)(lo | hi << 8), CYC_POLL | CYC_DONE);");
     ln(e, "cpu.s = (uint8_t)(cpu.s + 2);");
+    if (sound_config_active() || INTERP(e)) ln(e, "snd_owner_pop(cpu.s); /* sound owner */");
     ln(e, "cpu.pc = (uint16_t)((lo | hi << 8) + 1);");
     ln(e, "if (cyc_cpu_rts_observer) cyc_cpu_rts_observer();");
     ln(e, "return;");
@@ -1384,6 +1407,40 @@ static bool hook_site_here(const Emit *e) {
     return false;
 }
 
+static bool sound_config_active(void) {
+    return s_hook_cfg && (s_hook_cfg->sound_owner_count || s_hook_cfg->sound_gate_count ||
+                          s_hook_cfg->sound_reset_addr ||
+                          s_hook_cfg->sound_pause_start || s_hook_cfg->sound_pause_end);
+}
+
+static uint8_t sound_owner_for(uint16_t addr) {
+    if (!sound_config_active()) return 0xFF;
+    for (int i = 0; i < s_hook_cfg->sound_owner_count; ++i)
+        if (s_hook_cfg->sound_owners[i].addr == addr) return s_hook_cfg->sound_owners[i].owner;
+    return 0xFF;
+}
+
+static int s_sound_gate_hits;
+
+static bool sound_gate_at(const Emit *e, const OpDef *d) {
+    if (!s_hook_cfg || strcmp(d->name, "BNE")) return false;
+    for (int i = 0; i < s_hook_cfg->sound_gate_count; ++i)
+        if (s_hook_cfg->sound_gates[i].addr == e->P &&
+            (s_hook_cfg->sound_gates[i].bank < 0 ||
+             s_hook_cfg->sound_gates[i].bank == (int)e->at.bank)) {
+            s_sound_gate_hits++;
+            return true;
+        }
+    return false;
+}
+
+static bool sound_pause_write(const Emit *e, const OpDef *d) {
+    if (!sound_config_active() || d->am != AM_ABS) return false;
+    if (s_hook_cfg->sound_pause_start >= s_hook_cfg->sound_pause_end) return false;
+    return insn_operand16(e) == 0x4015 && e->P >= s_hook_cfg->sound_pause_start &&
+           e->P < s_hook_cfg->sound_pause_end;
+}
+
 static void emit_instruction(Emit *e) {
     const OpDef *d = &OPS[e->opcode];
     out(e, "L_%04X: /* %02X %s%s */\n", e->P, e->opcode, d->name, mode_suffix(d->am));
@@ -1392,6 +1449,14 @@ static void emit_instruction(Emit *e) {
         out(e, "    if (cyc_hook_stop(0x%04X)) { cpu.pc = 0x%04X; return; }   /* mod hook site */\n", e->P, e->P);
     out(e, "    if (cpu_fetch_rom(0x%04X, 0x%02X)) { cpu.pc = 0x%04X; cpu_interrupt(false); return; }\n", e->P,
         e->opcode, e->P);
+    /* Both hooks belong to the same site and must share the guard: without
+     * the braces the second call is emitted before EVERY instruction, which
+     * restarts the object window on every frame. */
+    if (!INTERP(e) && s_hook_cfg && s_hook_cfg->sound_reset_addr == e->P &&
+        (s_hook_cfg->sound_reset_bank < 0 || s_hook_cfg->sound_reset_bank == e->at.bank)) {
+        out(e, "    cyc_audio_reset_sfx(); /* genuine level load: clear the sfx voice set */\n");
+        out(e, "    smb3_wide_level_load(); /* genuine level load: the object window restarts */\n");
+    }
     out(e, "    {\n");
     if (e->live) ln(e, "const uint16_t pc = 0x%04X; uint8_t b1 = 0, b2 = 0; (void)pc; (void)b1; (void)b2;   /* operands vary */", e->P);
     emit_body(e);
@@ -1633,7 +1698,8 @@ bool cyc_codegen_emit_interpreter(const char *path) {
         " * recompiler/src/cyc_codegen.c with operands read at run time. Recompiled\n"
         " * code (<prefix>_cyc.c) is generated from the same templates. Regenerate with\n"
         " *   NESRecomp --emit-cycle-interpreter runner/cyc/cpu6502_interp.c */\n"
-        "#include \"cpu6502.h\"\n\n"
+        "#include \"cpu6502.h\"\n"
+        "#include \"snd_owner.h\"\n\n"
         "void cpu_interp_step(void) {\n"
         "    uint16_t pc = cpu.pc;\n"
         "    uint8_t opcode, b1 = 0, b2 = 0;\n"
@@ -2527,8 +2593,10 @@ bool cyc_codegen_emit(const NESRom *rom, const GameConfig *cfg, const char *outp
         uint16_t addr = cfg->extra_funcs[i].addr;
         if (addr < 0x8000) continue;
         uint32_t slot = (addr >> SLOT_SHIFT) & (SLOT_COUNT - 1);
-        if (p->power_on[slot] < 0) continue;
-        seeds[n++] = POS_PACK((uint32_t)p->power_on[slot], slot, addr & (SLOT_SIZE - 1));
+        int bank = cfg->extra_funcs[i].bank;
+        if (bank < 0) bank = p->power_on[slot];
+        if (bank < 0 || (uint32_t)bank >= p->banks) continue;
+        seeds[n++] = POS_PACK((uint32_t)bank, slot, addr & (SLOT_SIZE - 1));
     }
     int file_seeds = 0;
     if (cfg->cycle_seed_file[0]) {
@@ -2552,6 +2620,7 @@ bool cyc_codegen_emit(const NESRom *rom, const GameConfig *cfg, const char *outp
      * there (which such a site must declare: the address alone names a
      * different routine in each bank). */
     s_hook_cfg = cfg;
+    s_sound_gate_hits = 0;
     int hook_errors = 0;
     for (int i = 0; i < cfg->mod_function_hook_count; i++) {
         uint16_t addr = cfg->mod_function_hooks[i].addr;
@@ -2619,6 +2688,19 @@ bool cyc_codegen_emit(const NESRom *rom, const GameConfig *cfg, const char *outp
     int ram_files = ram_emit(p, ram, output_prefix);
     snprintf(path, sizeof(path), "generated/%s_cyc.c", output_prefix);
     emit_umbrella(p, path, output_prefix, fds, ram, cfg->console, cfg->display_name);
+
+    if (s_sound_gate_hits != cfg->sound_gate_count) {
+        fprintf(stderr, "[cyc] %d of %d [[sound_gate]] sites compiled; fix game.toml\n",
+                s_sound_gate_hits, cfg->sound_gate_count);
+        ram_free(ram);
+        free(p->is_insn);
+        free(p->seen);
+        free(p);
+        return false;
+    }
+    if (cfg->sound_gate_count)
+        printf("[NESRecomp] sound gates removed: %d BNE sites fall through\n",
+               s_sound_gate_hits);
 
     printf("[NESRecomp] cycle-accurate (%s, %u KB PRG in %u banks of 4KB): %u instructions compiled",
            board, p->prg_len / 1024, p->banks, count);

@@ -1,5 +1,9 @@
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <stdint.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,8 +53,51 @@ static bool load_file(FILE *f) {
     glue_reset();
     return true;
 }
+#ifdef _WIN32
+static FILE *open_wide(const wchar_t *path, const char *mode) {
+    return _wfopen(path, mode[0] == 'r' ? L"rb" : L"wb");
+}
+#else
+/* wchar_t is UCS-4 on Linux. Encode to UTF-8 rather than relying on the
+ * process locale, so paths from GTK/SDL file dialogs work unchanged. */
+static bool wide_to_utf8(const wchar_t *in, char *out, size_t cap) {
+    size_t o = 0;
+    for (; in && *in; in++) {
+        uint32_t c = (uint32_t)*in;
+        if (c < 0x80) {
+            if (o + 1 >= cap) return false;
+            out[o++] = (char)c;
+        } else if (c < 0x800) {
+            if (o + 2 >= cap) return false;
+            out[o++] = (char)(0xc0 | (c >> 6));
+            out[o++] = (char)(0x80 | (c & 0x3f));
+        } else if (c < 0x10000) {
+            if (o + 3 >= cap) return false;
+            out[o++] = (char)(0xe0 | (c >> 12));
+            out[o++] = (char)(0x80 | ((c >> 6) & 0x3f));
+            out[o++] = (char)(0x80 | (c & 0x3f));
+        } else if (c <= 0x10ffff) {
+            if (o + 4 >= cap) return false;
+            out[o++] = (char)(0xf0 | (c >> 18));
+            out[o++] = (char)(0x80 | ((c >> 12) & 0x3f));
+            out[o++] = (char)(0x80 | ((c >> 6) & 0x3f));
+            out[o++] = (char)(0x80 | (c & 0x3f));
+        } else {
+            return false;
+        }
+    }
+    if (o >= cap) return false;
+    out[o] = 0;
+    return true;
+}
+static FILE *open_wide(const wchar_t *path, const char *mode) {
+    char buf[4096];
+    if (!path || !wide_to_utf8(path, buf, sizeof buf)) return NULL;
+    return fopen(buf, mode);
+}
+#endif
 bool glue_load_rom(const char *p) { return p && load_file(fopen(p,"rb")); }
-bool glue_load_rom_wide(const wchar_t *p) { return p && load_file(_wfopen(p,L"rb")); }
+bool glue_load_rom_wide(const wchar_t *p) { return p && load_file(open_wide(p,"rb")); }
 bool glue_is_rom_loaded(void) { return loaded; }
 uint32_t glue_get_rom_crc32(void) { return rom_crc; }
 void glue_init(void) { glue_reset(); }
@@ -94,14 +141,14 @@ bool glue_save_state(const wchar_t *path) {
     if (!loaded || !path) return false;
     uint8_t *data=NULL; size_t len=0; char error[256];
     if (!cyc_state_save(&data,&len,error,sizeof error)) return false;
-    FILE *f=_wfopen(path,L"wb");
+    FILE *f=open_wide(path,"wb");
     bool ok=f && fwrite(data,1,len,f)==len;
     if (f && fclose(f)) ok=false;
     free(data); return ok;
 }
 bool glue_load_state(const wchar_t *path) {
     if (!loaded || !path) return false;
-    FILE *f=_wfopen(path,L"rb"); if (!f) return false;
+    FILE *f=open_wide(path,"rb"); if (!f) return false;
     if (fseek(f,0,SEEK_END)) { fclose(f); return false; }
     long n=ftell(f);
     if (n<=0 || n>64*1024*1024 || fseek(f,0,SEEK_SET)) { fclose(f); return false; }

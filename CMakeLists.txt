@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(MushroomRecompiled C RC)
+project(MushroomRecompiled C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED YES)
 set(RUNNER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/tools/nesrecomp-src/runner")
@@ -9,32 +9,38 @@ file(GLOB CYCLE_BANKS CONFIGURE_DEPENDS "generated/smb3_cyc*.c")
 add_library(smb3-core STATIC ${NESRECOMP_CYC_SOURCES} ${CYCLE_BANKS} runtime/glue.c src/widescreen.c src/wide_enemies.c)
 target_include_directories(smb3-core PUBLIC ${NESRECOMP_CYC_INCLUDE_DIRS} runtime generated src)
 target_link_libraries(smb3-core PUBLIC ${NESRECOMP_CYC_LIBRARIES})
-add_executable(Smb3Recomp WIN32 src/app.c src/theme.c src/preferences.c src/choice.c src/input.c src/app.rc)
-set_target_properties(Smb3Recomp PROPERTIES OUTPUT_NAME "MushroomRecompiled-v1.5.0")
-target_include_directories(Smb3Recomp PRIVATE "${SDL2_DIR}/include")
-target_compile_definitions(Smb3Recomp PRIVATE UNICODE _UNICODE WINVER=0x0A00 _WIN32_WINNT=0x0A00)
-target_link_directories(Smb3Recomp PRIVATE "${SDL2_DIR}/lib/x64")
-target_link_libraries(Smb3Recomp PRIVATE smb3-core SDL2 user32 gdi32 comdlg32 shell32 winmm ole32 windowscodecs uuid comctl32 uxtheme msimg32 dbghelp ws2_32)
-if(MINGW OR CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
-    target_link_options(Smb3Recomp PRIVATE -municode)
-endif()
+
+# The verifiers and the engine are portable; the launcher below is Win32.
 add_executable(smb3-verify tests/verify.c)
 target_link_libraries(smb3-verify PRIVATE smb3-core)
-add_custom_command(TARGET Smb3Recomp POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:Smb3Recomp>/assets"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/assets/gamecontrollerdb.txt" "$<TARGET_FILE_DIR:Smb3Recomp>/assets"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/png.png" "$<TARGET_FILE_DIR:Smb3Recomp>/png.png"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SDL2_DIR}/lib/x64/SDL2.dll" "$<TARGET_FILE_DIR:Smb3Recomp>")
-
-add_executable(smb3-ui-verify tests/ui_verify.c src/theme.c src/preferences.c src/choice.c src/input.c)
-target_include_directories(smb3-ui-verify PRIVATE "${SDL2_DIR}/include")
-target_compile_definitions(smb3-ui-verify PRIVATE UNICODE _UNICODE WINVER=0x0A00 _WIN32_WINNT=0x0A00)
-target_link_directories(smb3-ui-verify PRIVATE "${SDL2_DIR}/lib/x64")
-target_link_libraries(smb3-ui-verify PRIVATE smb3-core SDL2 user32 gdi32 comdlg32 shell32 winmm ole32 windowscodecs uuid comctl32 uxtheme msimg32)
-if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
- target_compile_options(smb3-ui-verify PRIVATE -UNDEBUG)
-endif()
 add_executable(smb3-wide-verify tests/widescreen_verify.c)
 target_link_libraries(smb3-wide-verify PRIVATE smb3-core)
 add_executable(smb3-scenes-verify tests/scenes_verify.c)
 target_link_libraries(smb3-scenes-verify PRIVATE smb3-core)
+
+if(WIN32)
+    enable_language(RC)
+    add_executable(Smb3Recomp WIN32 src/app.c src/theme.c src/preferences.c src/choice.c src/input.c src/app.rc)
+    set_target_properties(Smb3Recomp PROPERTIES OUTPUT_NAME "MushroomRecompiled-v1.5.0")
+    target_include_directories(Smb3Recomp PRIVATE "${SDL2_DIR}/include")
+    target_compile_definitions(Smb3Recomp PRIVATE UNICODE _UNICODE WINVER=0x0A00 _WIN32_WINNT=0x0A00)
+    target_link_directories(Smb3Recomp PRIVATE "${SDL2_DIR}/lib/x64")
+    target_link_libraries(Smb3Recomp PRIVATE smb3-core SDL2 user32 gdi32 comdlg32 shell32 winmm ole32 windowscodecs uuid comctl32 uxtheme msimg32 dbghelp ws2_32)
+    if(MINGW OR CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_link_options(Smb3Recomp PRIVATE -municode)
+    endif()
+    add_custom_command(TARGET Smb3Recomp POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:Smb3Recomp>/assets"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/assets/gamecontrollerdb.txt" "$<TARGET_FILE_DIR:Smb3Recomp>/assets"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/png.png" "$<TARGET_FILE_DIR:Smb3Recomp>/png.png"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SDL2_DIR}/lib/x64/SDL2.dll" "$<TARGET_FILE_DIR:Smb3Recomp>")
+
+    add_executable(smb3-ui-verify tests/ui_verify.c src/theme.c src/preferences.c src/choice.c src/input.c)
+    target_include_directories(smb3-ui-verify PRIVATE "${SDL2_DIR}/include")
+    target_compile_definitions(smb3-ui-verify PRIVATE UNICODE _UNICODE WINVER=0x0A00 _WIN32_WINNT=0x0A00)
+    target_link_directories(smb3-ui-verify PRIVATE "${SDL2_DIR}/lib/x64")
+    target_link_libraries(smb3-ui-verify PRIVATE smb3-core SDL2 user32 gdi32 comdlg32 shell32 winmm ole32 windowscodecs uuid comctl32 uxtheme msimg32)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(smb3-ui-verify PRIVATE -UNDEBUG)
+    endif()
+endif()

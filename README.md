@@ -53,6 +53,29 @@ The following also passed: continuation after save/load, audio at all three samp
 
 ## Building
 
+### Linux / Steam Deck (experimental)
+
+An SDL2-based native Linux frontend is available for Linux PCs and Steam Deck.
+It uses the same NESRecomp cycle-accurate core as the Windows version, with
+gamepad controls, fullscreen, 4:3 / widescreen presentation, quick save/load,
+and frame pacing independent of the display FPS limit. The original Windows UI
+is unchanged. This is an early port, not a fully validated release.
+
+On a Debian-based development machine, install CMake, Ninja and SDL2 headers,
+then run:
+
+```bash
+bash tools/build-linux.sh --check
+bash tools/build-linux.sh /path/to/your/compatible-smb3.nes
+```
+
+The build requires your own compatible **USA PRG1 ROM** to generate the
+recompiled C code; no game data is included in this repository. See
+[STEAMDECK.md](STEAMDECK.md) for SteamOS installation, controller mappings,
+limitations and performance troubleshooting.
+
+### Windows
+
 Requires Windows, CMake, LLVM-MinGW/Clang, and mingw32-make in PATH. The first setup downloads the official SDL2 2.30.0 package and verifies its SHA-256.
 
 ```powershell

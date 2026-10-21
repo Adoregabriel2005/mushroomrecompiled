@@ -1,0 +1,33 @@
+name: Linux source checks
+
+on:
+  push:
+    paths:
+      - 'CMakeLists.txt'
+      - 'runtime/**'
+      - 'src/**'
+      - 'tools/build-linux.sh'
+      - 'tools/nesrecomp-src/**'
+      - '.github/workflows/linux-check.yml'
+  pull_request:
+    paths:
+      - 'CMakeLists.txt'
+      - 'runtime/**'
+      - 'src/**'
+      - 'tools/build-linux.sh'
+      - 'tools/nesrecomp-src/**'
+      - '.github/workflows/linux-check.yml'
+
+jobs:
+  source-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SDL2 development headers
+        run: sudo apt-get update && sudo apt-get install -y libsdl2-dev ninja-build
+      - name: Compile-check native Linux frontend and core glue
+        run: bash tools/build-linux.sh --check
+      - name: Compile NESRecomp generator (no game data)
+        run: |
+          cmake -S tools/nesrecomp-src/recompiler -B build/linux-recompiler -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/linux-recompiler --parallel

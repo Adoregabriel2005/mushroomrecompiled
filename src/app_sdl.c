@@ -360,8 +360,10 @@ static void set_slot(int slot) {
 
 static void handle_key(SDL_Keycode key, bool repeat) {
     if (key == SDLK_ESCAPE) {
-        if (g_menu) close_menu();
-        else open_menu();
+        if (!repeat) {
+            if (g_menu) close_menu();
+            else open_menu();
+        }
         return;
     }
     if (g_menu) {
@@ -372,7 +374,7 @@ static void handle_key(SDL_Keycode key, bool repeat) {
         } else if (key == SDLK_RETURN || key == SDLK_KP_ENTER || key == SDLK_SPACE) {
             if (!repeat) activate_menu();
         } else if (key >= SDLK_1 && key <= SDLK_5) {
-            set_slot(key - SDLK_0);
+            if (!repeat) set_slot(key - SDLK_0);
         }
         return;
     }

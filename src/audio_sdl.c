@@ -17,6 +17,19 @@ struct AudioOut {
     size_t count;
 };
 
+/* Start with a short cushion of silence. The game produces samples once per
+ * emulated frame while SDL pulls them in fixed-size callback blocks; without a
+ * cushion the first callback can run dry and the stream clicks at startup or
+ * after a menu/reset clear. */
+static void audio_prefill(AudioOut *a) {
+    size_t target = (size_t)a->sample_rate / 20u * 2u; /* 50 ms, interleaved */
+    if (target > a->capacity) target = a->capacity;
+    memset(a->ring, 0, a->capacity * sizeof(*a->ring));
+    a->read = 0;
+    a->write = target % a->capacity;
+    a->count = target;
+}
+
 static void SDLCALL audio_callback(void *userdata, Uint8 *stream, int len) {
     AudioOut *a = userdata;
     int16_t *out = (int16_t *)stream;
@@ -42,7 +55,7 @@ AudioOut *audio_out_create(int sample_rate, int volume, bool muted) {
     a->volume = volume < 0 ? 0 : volume > 100 ? 100 : volume;
     a->muted = muted;
     a->lock = SDL_CreateMutex();
-    a->capacity = (size_t)sample_rate * 2u * 2u; /* two seconds, stereo */
+    a->capacity = (size_t)sample_rate; /* 0.5 seconds, stereo interleaved */
     a->ring = calloc(a->capacity, sizeof(*a->ring));
     if (!a->lock || !a->ring) {
         audio_out_destroy(a);
@@ -68,6 +81,7 @@ AudioOut *audio_out_create(int sample_rate, int volume, bool muted) {
         return NULL;
     }
     a->sample_rate = have.freq;
+    audio_prefill(a);
     SDL_PauseAudioDevice(a->device, 0);
     return a;
 }
@@ -123,7 +137,7 @@ void audio_out_pause(AudioOut *a, bool paused) {
 void audio_out_clear(AudioOut *a) {
     if (!a) return;
     SDL_LockMutex(a->lock);
-    a->read = a->write = a->count = 0;
+    audio_prefill(a);
     SDL_UnlockMutex(a->lock);
 }
 

@@ -76,7 +76,11 @@ enum { MENU_COUNT = (int)(sizeof(MENU_ITEMS) / sizeof(MENU_ITEMS[0])) };
 static void config_defaults(Config *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->scale = 3;
+#if defined(MUSHROOM_HAVE_VULKAN) && MUSHROOM_HAVE_VULKAN
     cfg->renderer = 1;
+#else
+    cfg->renderer = 0;
+#endif
     cfg->aspect = 0;
     cfg->scanlines = 0;
     cfg->brightness = 100;

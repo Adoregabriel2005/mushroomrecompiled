@@ -56,7 +56,7 @@ The Windows script does the same generation and build in one step:
 Useful options:
 
 ```text
---renderer vulkan|sdl   presentation backend (default Vulkan, SDL2 fallback)
+--renderer vulkan|sdl   presentation backend (Vulkan when built with it, SDL2 fallback)
 --scale N               window scale 1-8
 --fullscreen            start fullscreen
 --widescreen            start in 426x240 widescreen

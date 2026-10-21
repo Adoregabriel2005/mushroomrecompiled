@@ -1,6 +1,6 @@
 # Interface e controles — v1.2
 
-O programa abre no launcher. Use Selecionar ROM para indicar ROM compatível (USA Rev 1); o payload é validado antes de habilitar Jogar. Uma ROM validada inicia diretamente e é lembrada para as próximas aberturas.
+O programa abre no launcher. Use Selecionar ROM para indicar ROM compatível (USA Rev 1, dump goodNES ou No-Intro); o payload é validado antes de habilitar Jogar. Uma ROM validada inicia diretamente e é lembrada para as próximas aberturas.
 
 - Teclado: setas, Z = B, X = A, Shift = Select, Enter = Start, A/S = turbo, Esc = menu do PC. Todos são remapeáveis.
 - Controle: seleção automática ou por dispositivo; botões físicos remapeáveis; D-pad e analógico; zona morta; teste de botão e hotplug. A configuração Menu é independente de Select. Guide/Home abre o menu por padrão; controles sem esse botão podem remapear a ação.

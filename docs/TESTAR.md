@@ -2,7 +2,7 @@
 
 1. Baixe o ZIP da página Releases e extraia tudo para uma pasta gravável.
 2. Sem ROM cadastrada, abra MushroomRecompiled.exe. O launcher deve aparecer.
-3. Em Selecionar ROM, indique ROM compatível (USA Rev 1), formato .nes. Uma ROM incompatível deve mostrar aviso sem iniciar o jogo.
+3. Em Selecionar ROM, indique ROM compatível (USA Rev 1, dump goodNES ou No-Intro), formato .nes. Uma ROM incompatível deve mostrar aviso sem iniciar o jogo.
 4. A seleção válida inicia o jogo. Feche e reabra: deve iniciar diretamente usando a ROM lembrada. Se mover ou remover a ROM, deve voltar ao launcher. Confira abertura, início da partida, mapa e entrada em uma fase.
 5. Teste Z/X/Enter/Shift e o teclado remapeado. Para gamepad, conecte/pareie no Windows e confira o dispositivo e o teste de botão na página Controle.
 6. Confira áudio contínuo; se houver cortes, experimente a reserva Estável de 60 ms.

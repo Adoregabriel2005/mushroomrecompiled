@@ -59,7 +59,7 @@ Requires Windows, CMake, LLVM-MinGW/Clang, and mingw32-make in PATH. The first s
 .\build-local.ps1 -RomPath "C:\path\GAME NAME.nes"
 ```
 
-The script compiles the NESRecomp generator, produces the C blocks using your ROM and the seeds in docs/smb3-cycle-seeds.txt, and compiles the application. Generated files are not versioned. Output: build/MushroomRecompiled-v1.5.0.exe.
+The script compiles the NESRecomp generator, produces the C blocks using your ROM and the seeds in docs/smb3-cycle-seeds.txt, and compiles the application. Both the goodNES and No-Intro/Rev 1 dumps are accepted: they share the same PRG/CHR payload and differ only in the iNES/NES 2.0 header, so the script validates the payload hashes. Generated files are not versioned. Output: build/MushroomRecompiled-v1.5.0.exe.
 
 ```powershell
 .\build-local.ps1 -RomPath "Game name.NES" -Verify

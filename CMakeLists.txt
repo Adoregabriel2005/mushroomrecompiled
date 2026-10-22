@@ -37,7 +37,7 @@ target_include_directories(smb3-core PUBLIC ${NESRECOMP_CYC_INCLUDE_DIRS} runtim
 target_link_libraries(smb3-core PUBLIC ${NESRECOMP_CYC_LIBRARIES})
 if(WIN32)
 add_executable(Smb3Recomp WIN32 src/app.c src/theme.c src/preferences.c src/choice.c src/input.c src/app.rc)
-set_target_properties(Smb3Recomp PROPERTIES OUTPUT_NAME "MushroomRecompiled-v1.5.0")
+set_target_properties(Smb3Recomp PROPERTIES OUTPUT_NAME "MushroomRecompiled-v1.6.0")
 target_include_directories(Smb3Recomp PRIVATE "${SDL2_DIR}/include")
 target_compile_definitions(Smb3Recomp PRIVATE UNICODE _UNICODE WINVER=0x0A00 _WIN32_WINNT=0x0A00)
 target_link_directories(Smb3Recomp PRIVATE "${SDL2_DIR}/lib/x64")

@@ -11,6 +11,17 @@ experimental widescreen runtime as Windows. Unsupported scenes remain centered;
 the original HUD keeps black side margins. Whole-game correctness and
 compatibility across SteamOS versions are not guaranteed.
 
+## Binary download
+
+The [v1.6.0 release](https://github.com/Adoregabriel2005/mushroomrecompiled/releases/tag/v1.6.0)
+provides separate Windows x64 and Linux x86-64 packages. Extract the complete
+Linux `.tar.gz`, then run `bash run-steamdeck.sh --rom '/path/game.nes'`.
+The launcher also recognizes the executable beside it in a binary package.
+System SDL2 runtime libraries are required (`libsdl2-2.0-0` on Debian/Ubuntu).
+The v1.6.0 Linux binary is built on Ubuntu 22.04 with glibc 2.35 and SDL2
+2.0.20, rather than the newer Ubuntu used during initial development.
+Physical Steam Deck compatibility still needs verification.
+
 ## Build locally
 
 On Debian/Ubuntu x86-64:

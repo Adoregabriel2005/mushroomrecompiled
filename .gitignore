@@ -16,6 +16,7 @@ config.ini
 verify-frame*.png
 ui-*.png
 cycle-misses.txt
+dispatch_misses.log
 # Binary toolchains/dependencies are fetched or attached to releases
 *.exe
 *.dll
@@ -27,6 +28,7 @@ cycle-misses.txt
 /tools/*
 !/tools/run-hidden.ps1
 !/tools/build-linux.sh
+!/tools/package-linux.sh
 !/tools/nesrecomp-src/
 /tools/nesrecomp-src/*
 !/tools/nesrecomp-src/common/

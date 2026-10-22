@@ -2,6 +2,10 @@
 
 **The ROM is not included with the project or the ZIP.** Select your compatible copy from the menu. The full game has not yet been validated.
 
+## Stable release — v1.6.0
+
+Includes the native Linux / Steam Deck frontend described below and the existing Windows frontend. Linux/SteamOS hardware compatibility remains experimental; see [validation](docs/LINUX_VALIDATION.md).
+
 ## Widescreen and scene fixes — v1.5
 
 The downloadable version expands the scenery of horizontal stages to a 16:9 canvas without stretching tiles or sprites. The original HUD remains centered, with black bars on the sides. Select **Video > Aspect Ratio > 16:9**; new configurations already use this mode.
@@ -11,7 +15,7 @@ The current build keeps reward/bonus scenes centered with clean black margins an
 
 ## Download and test
 
-Download the [portable Windows package](https://github.com/Adoregabriel2005/mushroomrecompiled/releases/tag/v1.5.0-exp), extract the complete ZIP, and run **MushroomRecompiled.exe**.
+Download the [Windows x64 and Linux x86-64 packages](https://github.com/Adoregabriel2005/mushroomrecompiled/releases/tag/v1.6.0), extract the complete package, and run **MushroomRecompiled.exe** on Windows. For Linux, run `bash run-steamdeck.sh --rom "/path/game.nes"`; see [STEAMDECK.md](STEAMDECK.md).
 
 1. Choose **Select ROM**.
 2. Point to the game ROM as a `.nes` file.
@@ -59,7 +63,7 @@ Requires Windows, CMake, LLVM-MinGW/Clang, and mingw32-make in PATH. The first s
 .\build-local.ps1 -RomPath "C:\path\GAME NAME.nes"
 ```
 
-The script compiles the NESRecomp generator, produces the C blocks using your ROM and the seeds in docs/smb3-cycle-seeds.txt, and compiles the application. Generated files are not versioned. Output: build/MushroomRecompiled-v1.5.0.exe.
+The script compiles the NESRecomp generator, produces the C blocks using your ROM and the seeds in docs/smb3-cycle-seeds.txt, and compiles the application. Generated files are not versioned. Output: build/MushroomRecompiled-v1.6.0.exe.
 
 ```powershell
 .\build-local.ps1 -RomPath "Game name.NES" -Verify

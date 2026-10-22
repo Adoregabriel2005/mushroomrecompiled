@@ -1,5 +1,28 @@
 # Linux frontend validation — 2026-10-22
 
+## Stable v1.6.0 package validation
+
+The downloadable Linux x86-64 binary was rebuilt in an isolated Ubuntu
+22.04 environment with CMake/Ninja, GCC 11, glibc 2.35 and SDL2 2.0.20.
+The full build and portable host tests passed. The 3,000-frame verifier,
+deterministic save/load, three audio rates, widescreen verifier and both
+scene cases passed again in that environment. A five-second SDL dummy-driver
+smoke test passed; the ELF's highest directly referenced GLIBC symbol is 2.34.
+The build uses the generic x86-64 compiler target, without `-march=native`.
+
+The extracted Linux release package was also launched twice under Ubuntu
+26.04 using its bundled launcher. Both runs maintained about 60 simulation
+ticks/s with zero dropped ticks; the optional performance log and previous-log
+rotation worked. All dynamic dependencies resolved in both environments.
+The archive contains the executable, launcher, mapping database, documentation
+and license notices, without a ROM, saves or generated game source.
+
+The v1.6.0 Windows binary was rebuilt, and its portable host and existing UI
+regression checks passed. Neither release package contains a remembered ROM or
+user configuration. Physical Steam Deck/SteamOS validation remains outstanding.
+
+## Initial development validation
+
 Measured locally in Ubuntu 26.04 x86-64 under WSL, GCC 15.2, CMake 4.2.3,
 SDL2 2.32.10, Unix Makefiles. This is not a physical Steam Deck or a Debian
 installation. Ninja is supported by the script when installed, but was not

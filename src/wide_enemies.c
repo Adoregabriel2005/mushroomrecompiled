@@ -3,6 +3,7 @@
  * Controllers/events keep their original triggers. Real objects use their
  * existing slots, state machines, world coordinates and collision routines. */
 #include "wide_enemies.h"
+#include "glue.h"
 #include "cyc_core.h"
 #include "cyc_mod.h"
 #include "cyc_render.h"
@@ -13,6 +14,9 @@
 #include <string.h>
 static bool enabled;
 static Smb3EnemyLayer layers[SMB3_OBJECT_SLOTS];
+/* Frame this capture describes (see smb3_enemies_capture). */
+static uint64_t captured_frame;
+static bool captured_frame_valid;
 /* Frames left in the post-load grace. The loader builds the level then
  * sweeps its first screen calling the spawner, which creates the opening
  * objects; the extended window stays off until that sweep is done, so far
@@ -98,9 +102,12 @@ static bool held_valid[SMB3_OBJECT_SLOTS];
 static uint8_t held_id[SMB3_OBJECT_SLOTS],held_rec[SMB3_OBJECT_SLOTS];
 bool smb3_enemies_scene(const uint8_t *r){
  int set=r[0x70a],screens=r[0x372]+1;
+ /* The hit end card ($7974) and Player_EndLevel ($559) are still the level:
+  * smb3pc widens through both and lets the window follow the run-off. Only
+  * Level_ExitToMap ($14), the junction reloads, vertical rooms and non-level
+  * scenes return to native framing. */
  return set>=1&&set<=14&&set!=7&&!r[0x3ef]&&screens>1&&screens<=15&&
-  r[0x100]==0xc0&&r[0x101]==0&&r[0x561]&&!r[0x55f]&&!r[0x3de]&&!r[0x559]&&!r[0x14]&&
-  !cyc_mod_peek(0x7974);
+  r[0x100]==0xc0&&r[0x101]==0&&r[0x561]&&!r[0x55f]&&!r[0x3de]&&!r[0x14];
 }
 int smb3_enemies_camera(const uint8_t *r){
  int camera=r[0x12]*256+r[0xfd]-85,max=(r[0x372]+1)*256-426;
@@ -111,10 +118,46 @@ int smb3_enemies_camera(const uint8_t *r){
 static bool object_bank(void){
  return cyc_mod_peek(0xca46)==0xbd&&cyc_mod_peek(0xca47)==0x61&&cyc_mod_peek(0xca48)==6;
 }
+/* The native 256-pixel frame is a presentation crop, not a collision
+ * boundary. Object_DetermineHorzVis sets every SprHVis bit for a margin
+ * object, and the block-hit paths use Object_AnySprOffscreen as a proxy for
+ * relevance, so they discard a wall hit before Object_BumpOffBlocks. The map
+ * itself is already addressed by world pages (ObjTile_DetXHi/YHi), so only
+ * these native gates need to know the expanded viewport. SprHVis is left
+ * untouched: the native OAM draw must keep hiding its wrapped copy. */
+static bool margin_block_hit(const uint8_t *r,int slot){
+ int x=r[0x76+slot]*256+r[0x91+slot];
+ int camera=r[0x12]*256+r[0xfd],wide=smb3_enemies_camera(r);
+ return (x<camera||x+16>camera+256)&&x+16>wide&&x<wide+426;
+}
+/* Return address of the JSR that entered Object_AnySprOffscreen. The routine
+ * is two LDAs and an RTS, so the pushed address is still on top when its
+ * first operand read runs. */
+static uint16_t any_return_address(void){
+ uint8_t lo,hi;
+ if(!cyc_mod_peek_ok((uint16_t)(0x100|(uint8_t)(cpu.s+1)),&lo)||
+    !cyc_mod_peek_ok((uint16_t)(0x100|(uint8_t)(cpu.s+2)),&hi))return 0;
+ return (uint16_t)((lo|(hi<<8))+1);
+}
 static uint8_t read_policy(uint16_t pc,uint16_t addr,uint8_t value){
- if(!enabled||(pc!=0xd40f&&pc!=0xd41a)||cyc_mod_isolated())return value;
+ if(!enabled||cyc_mod_isolated())return value;
+ if(pc!=0xd40f&&pc!=0xd41a&&pc!=0xcc9d&&pc!=0xdd54)return value;
  const uint8_t *r=cyc_cpu_ram();
  if(!smb3_enemies_scene(r)||!object_bank())return value;
+ int slot=cpu.x;
+ /* ObjState_Kicked's wall response first rejects the native frame's 6/228
+  * SpriteX edges, then Object_AnySprOffscreen. A shell in the margin is
+  * beyond both, even though Object_Move has already reported the wall. */
+ if(pc==0xcc9d&&slot<SMB3_OBJECT_SLOTS&&addr==0xac+slot&&margin_block_hit(r,slot))return 128;
+ /* Only the two block-hit callers are widened: the kicked shell's wall
+  * response ($CCAE, return $CCB1) and Object_HandleBumpUnderneath ($D16D,
+  * return $D170). Other Object_AnySprOffscreen users (poofs, splashes,
+  * deletion) must keep their native answer or their wrapped OAM would leak
+  * into the middle of the wide picture. */
+ if(pc==0xdd54&&slot<SMB3_OBJECT_SLOTS&&addr==0x651+slot&&margin_block_hit(r,slot)){
+  uint16_t ret=any_return_address();
+  if(ret==0xccb1||ret==0xd170)return 0;
+ }
  /* The delete table alternates right/left distances by Y parity (even rows
   * carry high byte $01, odd rows $FF). Like smb3pc's delete slack, move each
   * boundary 176 pixels past the matching edge of the expanded viewport, so
@@ -125,13 +168,18 @@ static uint8_t read_policy(uint16_t pc,uint16_t addr,uint8_t value){
  if(pc==0xd41a&&addr==0x12)return (uint8_t)(camera>>8);
  return value;
 }
-void smb3_enemies_enable(bool on){enabled=on;cyc_mod_set_ram_read_hook(on?read_policy:NULL);if(!on){memset(layers,0,sizeof layers);claimed_oam=0;memset(snap,0,sizeof snap);memset(seen,0,sizeof seen);seen_valid=false;}}
-void smb3_enemies_reset(void){memset(layers,0,sizeof layers);memset(held_pieces,0,sizeof held_pieces);memset(held_valid,0,sizeof held_valid);memset(prev_have,0,sizeof prev_have);claimed_oam=0;memset(snap,0,sizeof snap);memset(seen,0,sizeof seen);seen_valid=false;load_grace=0;scene_prev=false;}
+void smb3_enemies_enable(bool on){enabled=on;cyc_mod_set_ram_read_hook(on?read_policy:NULL);captured_frame_valid=false;if(!on){memset(layers,0,sizeof layers);claimed_oam=0;memset(snap,0,sizeof snap);memset(seen,0,sizeof seen);seen_valid=false;}}
+void smb3_enemies_reset(void){memset(layers,0,sizeof layers);memset(held_pieces,0,sizeof held_pieces);memset(held_valid,0,sizeof held_valid);memset(prev_have,0,sizeof prev_have);claimed_oam=0;memset(snap,0,sizeof snap);memset(seen,0,sizeof seen);seen_valid=false;load_grace=0;scene_prev=false;captured_frame_valid=false;}
 const Smb3EnemyLayer *smb3_enemies_layers(void){return layers;}
 void smb3_enemies_tick(void){
  const uint8_t *r=cyc_cpu_ram();
  bool scene=smb3_enemies_scene(r);
  if(!enabled||!scene){scene_prev=false;return;}
+ /* The end card and run-off keep the wide picture (smb3_enemies_scene), but
+  * the game no longer advances its own scrolling spawner there. Scanning the
+  * records here would create late Goombas in the margins, where they can
+  * overlap enemies already on screen; keep only what the level spawned. */
+ if(r[0x559]||cyc_mod_peek(0x7974))return;
  /* A level load is only signalled from generated code at the sound-reset
   * site; the interpreter never runs that hook, so the object window would
   * start in a different state per execution engine. Entering a gameplay
@@ -194,7 +242,16 @@ void smb3_enemies_tick(void){
   cyc_mod_poke((uint16_t)(0x661 + slot),1);
  }
 }
+/* One capture per frame. The compositor can be asked for the same picture
+ * more than once (a resize or a fullscreen switch presents again), and a
+ * second capture would advance the rewind window a second time: the layers
+ * would then be drawn one update ahead of the picture they belong to, so
+ * margin sprites would sit a pixel off - the piranha's stem and pipe mask
+ * visibly jump between two presentations of one frame. */
 void smb3_enemies_capture(void){
+ uint64_t frame=glue_frame_count();
+ if(captured_frame_valid&&captured_frame==frame)return;
+ captured_frame=frame;captured_frame_valid=true;
  memset(layers,0,sizeof layers);
  claimed_oam=0;
  const uint8_t *r=cyc_cpu_ram();

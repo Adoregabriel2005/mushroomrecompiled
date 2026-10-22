@@ -117,12 +117,12 @@ const uint32_t *smb3_wide_present(const uint32_t *native) {
   * Horizontal multi-screen levels have a fully expanded block map in SRAM. */
  bool playable=tables_ok&&captured&&smb3_enemies_scene(ram)&&
   (cyc_render_line_mask(8)&0x08);
- /* The status bar as its own layer (hud.c, after smb3pc's hud.cpp): the rows
-  * the split stages are drawn from the bar's settled row, so no stripe of
-  * playfield backdrop or card colour shows above the bar. The level's rows
-  * above it keep the pixels the game drew, and the wide picture treats them as
-  * playfield - the ground runs on beside the bar, up to the bar's own first
-  * row (smb3pc's bar_top). */
+ /* The status bar as its own layer (hud.c, after smb3pc's hud.cpp): the frame
+  * is the layer's picture, the rows from the split down rebuilt from the
+  * frame's own captures, so no stripe of playfield backdrop or card colour
+  * shows above the bar. The level's rows between the split and the bar's first
+  * row keep their own capture and are treated as playfield - the ground runs
+  * on beside the bar, up to the bar's own first row (smb3pc's bar_top). */
  static uint32_t bar[SMB3_WIDE_HEIGHT*256];
  smb3_hud_compose(native,bar);
  int bar_top=smb3_hud_top();if(bar_top>240)bar_top=240;
@@ -140,11 +140,12 @@ const uint32_t *smb3_wide_present(const uint32_t *native) {
     opaque[y*426+x]=(pixel&3)!=0;
     canvas[y*426+x]=colors[pixel];
    }
-   /* The game frame with its overscan columns cropped, pasted at the
-    * frame's own position; only the columns outside it are composed here.
-    * Keep the native center, but leave both 12-column edge bands supplied
-    * by the complete map. They may contain stale PPU tiles or attributes. */
-   for(int y=0;y<bar_top;y++)memcpy(canvas+y*426+origin+WIDE_CROP,native+y*256+WIDE_CROP,WIDE_VISIBLE*sizeof(uint32_t));
+   /* The layer's picture with its overscan columns cropped, pasted at the
+    * frame's own position; only the columns outside it are composed here (as
+    * smb3pc pastes framebuf after hud_compose). Keep the native center, but
+    * leave both 12-column edge bands supplied by the complete map. They may
+    * contain stale PPU tiles or attributes. */
+   for(int y=0;y<bar_top;y++)memcpy(canvas+y*426+origin+WIDE_CROP,bar+y*256+WIDE_CROP,WIDE_VISIBLE*sizeof(uint32_t));
    /* Capture first: the edge repair needs the claimed-slot mask so no
     * sprite is painted from both sources. */
    smb3_enemies_capture();
@@ -178,6 +179,12 @@ const uint32_t *smb3_wide_present(const uint32_t *native) {
     for(int i=0;i<norder;i++){
      const Smb3EnemyPiece *pc=order[i].pc;
      int object=order[i].object;
+     /* World row to screen row, matching the frame's own draw: the sprite
+      * for a piece lands one row below the piece's world row. Dropping this
+      * +1 put every margin sprite a row high - the piranha's pipe mask then
+      * painted its black cap edge on the row above the pipe's cap line, and
+      * its head's dark base row stopped merging with that line, so the pipe's
+      * mouth showed a black bar that the rest of the picture does not have. */
      int y=layers[object].obj_y+layers[object].off_y-camera_y+pc->dy+1;
      int x=layers[object].obj_x+layers[object].off_x-wide_camera+pc->dx;
      unsigned tile=pc->tile,attr=pc->attr,base=(tile&1)*4096+(tile&0xfe)*16;

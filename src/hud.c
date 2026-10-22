@@ -11,11 +11,14 @@
  * the bar's content anchor - the first row below that break which runs on to the
  * bottom of the picture with the bar's CHR banking.
  *
- * Like hud_build(), every row the bar owns is drawn from the capture - from the
- * anchor until a row's capture is the bar's own, then from the row's own - at
- * that row's captured palette, banking and scroll, so the split's staged writes
- * cannot show. The rows between the split and the bar's first row are the
- * level's and stay as the machine drew them (see smb3_hud_compose).
+ * Like hud_build(), the picture is built from the split line down. The rows from
+ * the split to the bar's first row are still the level's - the split's staged
+ * $2006/$2005 writes have not landed yet - so they keep their own captured
+ * scroll and are drawn as the level has them; the ground under the player
+ * therefore runs to the level's real last scanline. From the bar's first row
+ * down the rows are the bar's: drawn from the anchor until the capture is the
+ * bar's own (the anchor row), then from their own, at that row's captured
+ * palette, banking and scroll, so the split's staged writes cannot show.
  *
  * Everything a row is drawn from is captured per line at dot 1 (CycLine): v,
  * fine X, $2000/$2001, palette RAM, the CHR index each slot resolved to, and
@@ -28,13 +31,16 @@
  * with a pixel winning, background priority, the left-column clip and greyscale,
  * all as the hardware applies them.
  *
- * A frame with no split (hud_top == 240) has no bar layer: every row stays as
- * the machine drew it.
+ * The layer keeps the picture in hud.cpp's cache: hud_matches() compares the
+ * state the picture was built from (the split, the two boundary rows, the
+ * anchor's scroll and OAM, the frame's nametables, and every row's scroll,
+ * $2000/$2001, palette and CHR banking), and hud_build() runs only when that
+ * changes; a steady frame costs one compare and the blit of the rows it drew.
+ * The mirroring itself is not a separate key: the frame's nametables are the
+ * mapped view, so a mirroring change that changes the picture changes them.
  *
- * hud.cpp keeps the built picture in a cache (hud_matches/hud_snapshot) and
- * rebuilds it only when its source state changes. This port rebuilds it on
- * every presentation, without the cache: the rows are cheap next to the wide
- * pass and the output is the same either way.
+ * Only the rows hud_build() drew are blitted, and nothing above the split is
+ * touched: the rows there are the level's own, drawn by the per-dot pass.
  *
  * Presentation only: nothing here feeds back into the machine. */
 
@@ -49,8 +55,36 @@
 #define PICTURE_H 240
 #define NO_HUD 240
 
-static int s_top = NO_HUD, s_first = -1, s_settled = -1;
+static int s_split = NO_HUD, s_first = -1, s_settled = -1;
+
+/* The rows hud_build() last produced, indexed by picture row, and which of them
+ * it drew (hud.cpp's hud.pixels / hud.on). */
+static uint32_t s_built[BAR_W * PICTURE_H];
+static uint8_t s_on[PICTURE_H];
+/* A composed picture for the 4:3 presentation. */
 static uint32_t s_picture[BAR_W * PICTURE_H];
+
+/* One row of hud.cpp's HudLayer::Source::Row. */
+typedef struct {
+    uint16_t v;
+    uint8_t fine_x, ctrl, mask, on, pad;
+    uint8_t pal[32];
+    uint32_t chr[8];
+} HudRow;
+
+/* What the cached picture was built from (HudLayer::Source). */
+typedef struct {
+    int top, first, settled;
+    uint16_t v;
+    uint8_t fine_x;
+    uint8_t oam[256];
+    uint8_t nt[0x1000];
+    HudRow row[PICTURE_H];
+} HudSource;
+
+static HudSource s_src;
+static int s_cached; /* s_src describes a built layer */
+static uint64_t s_builds;
 
 void smb3_hud_bounds(int *first, int *anchor)
 {
@@ -58,7 +92,9 @@ void smb3_hud_bounds(int *first, int *anchor)
     if (anchor) *anchor = s_settled;
 }
 
-int smb3_hud_top(void) { return s_first >= 0 ? s_first : s_top; }
+uint64_t smb3_hud_builds(void) { return s_builds; }
+
+int smb3_hud_top(void) { return s_first >= 0 ? s_first : s_split; }
 
 /* smb3pc's `on`: the line had rendering enabled. A line without it belongs to
  * the per-dot pass, whose backdrop the layer must not paint over. */
@@ -90,7 +126,7 @@ static int chain_cont(uint16_t prev, uint16_t cur) { return chain_step(prev) == 
  * continues the row above. NO_HUD when the frame has no break. */
 static int bar_first(const CycLine *lines)
 {
-    for (int y = s_top; y < NO_HUD; y++) {
+    for (int y = s_split; y < NO_HUD; y++) {
         const CycLine *h = &lines[y];
         if (!rendering_on(h)) return y; /* rendering off: the backdrop owns the row */
         if (y == 0) return y;
@@ -111,14 +147,66 @@ static int bar_first(const CycLine *lines)
 static int bar_settled(const CycLine *lines)
 {
     int bottom = PICTURE_H - 1;
-    while (bottom > s_top && !rendering_on(&lines[bottom])) bottom--;
-    for (int y = s_top; y + 1 < PICTURE_H; y++) {
+    while (bottom > s_split && !rendering_on(&lines[bottom])) bottom--;
+    for (int y = s_split; y + 1 < PICTURE_H; y++) {
         const CycLine *a = &lines[y], *b = &lines[y + 1];
         if (!rendering_on(a) || !rendering_on(b)) continue;
         if (memcmp(a->chr, lines[bottom].chr, sizeof a->chr)) continue;
         if (chain_cont(a->v, b->v)) return y;
     }
     return -1;
+}
+
+/* Whether the cached picture still describes this frame (hud.cpp's
+ * hud_matches): the state the picture was built from, so no mutation path has
+ * to remember to invalidate the layer. */
+static int hud_matches(int settled, int first)
+{
+    const HudSource *s = &s_src;
+    const CycLine *lines = cyc_frame_lines();
+    if (!s_cached) return 0;
+    if (s->top != s_split || s->settled != settled || s->first != first) return 0;
+    const CycLine *a = &lines[settled];
+    if (s->v != a->v || s->fine_x != a->fine_x) return 0;
+    if (memcmp(s->oam, a->oam, sizeof s->oam)) return 0;
+    if (memcmp(s->nt, cyc_frame_nametables(), sizeof s->nt)) return 0;
+    for (int i = 0; i < NO_HUD - s->top; i++) {
+        const CycLine *h = &lines[s->top + i];
+        const HudRow *r = &s->row[i];
+        if (r->v != h->v || r->fine_x != h->fine_x || r->ctrl != h->ctrl ||
+            r->mask != h->mask || r->on != (rendering_on(h) ? 1 : 0))
+            return 0;
+        if (memcmp(r->pal, h->pal, sizeof r->pal)) return 0;
+        if (memcmp(r->chr, h->chr, sizeof r->chr)) return 0;
+    }
+    return 1;
+}
+
+/* Record the state the cached picture is about to be built from. */
+static void hud_snapshot(int settled, int first)
+{
+    HudSource *s = &s_src;
+    const CycLine *lines = cyc_frame_lines();
+    const CycLine *a = &lines[settled];
+    s_cached = 1;
+    s->top = s_split;
+    s->first = first;
+    s->settled = settled;
+    s->v = a->v;
+    s->fine_x = a->fine_x;
+    memcpy(s->oam, a->oam, sizeof s->oam);
+    memcpy(s->nt, cyc_frame_nametables(), sizeof s->nt);
+    for (int i = 0; i < NO_HUD - s->top; i++) {
+        const CycLine *h = &lines[s->top + i];
+        HudRow *r = &s->row[i];
+        r->v = h->v;
+        r->fine_x = h->fine_x;
+        r->ctrl = h->ctrl;
+        r->mask = h->mask;
+        r->on = (uint8_t)(rendering_on(h) ? 1 : 0);
+        memcpy(r->pal, h->pal, sizeof r->pal);
+        memcpy(r->chr, h->chr, sizeof r->chr);
+    }
 }
 
 /* The row's first pixel's column in the two nametables side by side. The dot-1
@@ -263,47 +351,92 @@ static void draw_row(uint32_t *out, int y, int row_i, unsigned bar_fine_x, unsig
     }
 }
 
+/* Draw the whole layer, from the split line down, into s_built (hud_build).
+ * Rows above the bar's first row keep their own capture and are drawn as the
+ * level has them; from the bar's first row down, the rows between it and the
+ * anchor are drawn from the anchor - the split's staged writes have not all
+ * landed - and the rest from their own. */
+static void hud_build(void)
+{
+    const HudSource *s = &s_src;
+    const int rows = NO_HUD - s->top;
+    s_builds++;
+    memset(s_on, 0, sizeof s_on);
+    memset(s_built + s->top * BAR_W, 0, (size_t)rows * BAR_W * sizeof(uint32_t));
+
+    /* The bar's origin, in the 512-column two-nametable row: coarse X and
+     * nametable from the anchor row, fine X from the tail of the bar (the
+     * split's staged $2005 write lands a line or two in, so the head of the
+     * capture still carries the playfield's). */
+    int tail = rows - 1;
+    while (tail > 0 && !s->row[tail].on) tail--;
+    const unsigned bar_fine_x = s->row[tail].fine_x;
+    const unsigned bar_col = column_of(s->v, bar_fine_x);
+
+    int anchor_i = s->settled - s->top;
+    if (anchor_i < 0) anchor_i = 0;
+    if (anchor_i > rows - 1) anchor_i = rows - 1;
+
+    for (int i = 0; i < rows; i++) {
+        if (!s->row[i].on) continue; /* rendering was off: the per-dot pass drew this row */
+        const int y = s->top + i;
+        s_on[y] = 1;
+        /* The two layers meet at s.first: above it the rows continue the
+         * playfield - the split's staged writes have not landed yet - and are
+         * drawn from their own capture; from it down, from the anchor until
+         * the capture is the bar's own, then from their own. */
+        const int own = (y < s->first || i >= anchor_i);
+        draw_row(s_built, y, own ? y : s->settled, bar_fine_x, bar_col);
+    }
+}
+
+/* Composite the built layer over the frame: copy the rows it drew, and nothing
+ * else (hud_blit). Nothing is drawn above the split - the rows there are the
+ * level's own, drawn by the per-dot pass. */
+static void hud_blit(uint32_t *out)
+{
+    const int top = s_src.top;
+    if (!s_cached) return;
+    for (int y = top; y < NO_HUD;) {
+        if (!s_on[y]) {
+            y++;
+            continue;
+        }
+        int end = y;
+        while (end < NO_HUD && s_on[end]) end++;
+        memcpy(out + y * BAR_W, s_built + y * BAR_W, (size_t)(end - y) * BAR_W * sizeof(uint32_t));
+        y = end;
+    }
+}
+
 void smb3_hud_compose(const uint32_t *native, uint32_t *out)
 {
-    const CycLine *lines = cyc_frame_lines();
-    s_top = cyc_frame_split_line();
-    if (s_top < 0) s_top = NO_HUD;
-    if (s_top > NO_HUD) s_top = NO_HUD;
+    memcpy(out, native, sizeof s_built);
+    s_split = cyc_frame_split_line();
+    if (s_split < 0) s_split = NO_HUD;
+    if (s_split > NO_HUD) s_split = NO_HUD;
     s_first = -1;
     s_settled = -1;
-    memcpy(out, native, sizeof s_picture);
-    if (s_top >= NO_HUD) return; /* no split this frame: every row is the machine's */
+    if (s_split >= NO_HUD) {
+        /* No split this frame: no layer. Dropping the source key makes the
+         * next frame with a split rebuild instead of blitting a stale one. */
+        s_cached = 0;
+        return;
+    }
 
+    const CycLine *lines = cyc_frame_lines();
     int first = bar_first(lines);
-    if (first < s_top || first >= NO_HUD) first = s_top; /* no break: split at the IRQ */
+    if (first < s_split || first >= NO_HUD) first = s_split; /* no break: split at the IRQ */
     int settled = bar_settled(lines);
     if (settled < first) settled = first; /* anchor on a row the bar owns */
     s_first = first;
     s_settled = settled;
 
-    /* The bar's single horizontal origin: the anchor's coarse X with the tail's
-     * fine X (the split's staged $2005 write lands a line or two in, so the head
-     * of the capture still carries the playfield's). */
-    int tail = NO_HUD - 1;
-    while (tail > s_top && !rendering_on(&lines[tail])) tail--;
-    const unsigned bar_fine_x = lines[tail].fine_x;
-    const unsigned bar_col = column_of(lines[settled].v, bar_fine_x);
-
-    /* From the bar's first row down: from the anchor until the capture is the
-     * bar's own, then from the row's own.
-     *
-     * hud_build() draws the rows between the split and the bar's first row as
-     * well, from their own capture. This port leaves them as the machine drew
-     * them: those rows are the level's, the game can switch to the bar in the
-     * middle of one of them (a card giving way to the level, with the scroll
-     * write landing mid-line), and the per-line capture is one state for a
-     * whole row - so the redraw loses the first pixels of such a row (measured:
-     * 2 of 1749 frames, 23 pixels). The machine's own pixels are exact for
-     * every row above the bar's, and no row the bar owns is left unpainted. */
-    for (int y = first; y < NO_HUD; y++) {
-        if (!rendering_on(&lines[y])) continue; /* the per-dot pass drew this row */
-        draw_row(out, y, y < settled ? settled : y, bar_fine_x, bar_col);
+    if (!hud_matches(settled, first)) {
+        hud_snapshot(settled, first);
+        hud_build();
     }
+    hud_blit(out);
 }
 
 const uint32_t *smb3_hud_present(const uint32_t *native)

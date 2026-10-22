@@ -53,7 +53,19 @@ int main(int argc,char **argv){
    * that was still on the wire when the split began. */
   int bar_first,bar_anchor;smb3_hud_bounds(&bar_first,&bar_anchor);
   const uint32_t *hud=smb3_hud_present(native);
+  /* Presenting the same frame again is what the cache is for: the layer is
+   * rebuilt only when the state it was built from changes (hud_matches). */
+  uint64_t builds=smb3_hud_builds();
+  smb3_hud_present(native);
+  if(smb3_hud_builds()!=builds){fprintf(stderr,"HUD layer rebuilt for an unchanged frame at %d\n",f);return 21;}
   int bar_top=smb3_hud_top();if(bar_top>240)bar_top=240;
+  int split=cyc_frame_split_line();int layer_top=split>=0&&split<240?split:240;
+  /* Nothing above the split may change: those rows are the machine's own.
+   * From the split down hud_build() rebuilds every row, the level's rows
+   * between the split and the bar included. */
+  for(int y=0;y<layer_top;y++)if(memcmp(hud+y*256,native+y*256,256*sizeof(uint32_t))){
+   fprintf(stderr,"HUD layer touched row %d above the split at %d\n",y,f);return 20;
+  }
   /* The split IRQ is the only thing that can start a bar (hud.cpp's hud_top):
    * a frame without one gets no layer at all. */
   if(bar_first>=0&&cyc_frame_split_line()>=240){fprintf(stderr,"Bar without a split IRQ at %d\n",f);return 18;}
@@ -71,10 +83,10 @@ int main(int argc,char **argv){
   int play_x=active?origin+12:97;
   for(int y=0;y<240;y++){
    if(y<bar_top){
-    /* The level still owns these rows (they are the playfield's own pixels),
-     * so the wide picture pastes them with the frame and fills their margins
-     * with level content. */
-    if(memcmp(out+y*w+play_x,native+y*256+12,232*sizeof(uint32_t)))return 5;
+    /* The level still owns these rows (between the split and the bar they are
+     * the playfield's own capture), so the wide picture pastes the layer with
+     * the frame and fills their margins with level content. */
+    if(memcmp(out+y*w+play_x,hud+y*256+12,232*sizeof(uint32_t)))return 5;
     continue;
    }
    for(int x=0;x<232;x++)if(out[y*w+97+x]!=hud[y*256+12+x]){fprintf(stderr,"Bar row %d is not the bar layer's at %d\n",y,f);return 3;}

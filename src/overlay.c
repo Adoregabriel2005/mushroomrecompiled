@@ -145,9 +145,9 @@ static void draw_panel(OverlayTarget t, int x0, int y0, uint32_t fill, const uin
     draw_tile(t, x0 + PANEL_W - 8, y0 + PANEL_H - 8, chr, bottom_corner, K_PAPER, 0, 0, 1);
 }
 
-void overlay_menu(OverlayTarget t, int selected, const int on[6], int slot, const uint8_t *chr) {
-    static const char *labels[6] = {
-        "RESUME", "SAVE STATE", "LOAD STATE", "WIDESCREEN", "FULLSCREEN", "QUIT"
+void overlay_menu(OverlayTarget t, int selected, const int on[5], int slot, const uint8_t *chr) {
+    static const char *labels[5] = {
+        "RESUME", "SAVE STATE", "LOAD STATE", "FULLSCREEN", "QUIT"
     };
     const int x0 = (t.w - PANEL_W) / 2;
     const int y0 = PANEL_Y;
@@ -155,7 +155,7 @@ void overlay_menu(OverlayTarget t, int selected, const int on[6], int slot, cons
     draw_gametext(t, x0 + (PANEL_W - gametext_width("PAUSED")) / 2, y0 + 10, "PAUSED", chr);
 
     const int label_x = 24, cursor_x = 12, icon_x = 198;
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 5; i++) {
         int y = y0 + 28 + i * 14;
         draw_gametext(t, x0 + label_x, y, labels[i], chr);
         if (on && on[i]) draw_check(t, x0 + icon_x, y, K_BLACK);
@@ -167,8 +167,8 @@ void overlay_menu(OverlayTarget t, int selected, const int on[6], int slot, cons
     snprintf(text, sizeof text, "SLOT %d", slot < 1 ? 1 : slot > 5 ? 5 : slot);
     draw_gametext(t, x0 + 16, y0 + 116, text, chr);
     draw_gametext(t, x0 + 16, y0 + 128, "F5 SAVE  F7 LOAD", chr);
-    draw_gametext(t, x0 + 16, y0 + 140, "1-5 SLOT  F10 WIDE", chr);
-    draw_gametext(t, x0 + 16, y0 + 152, "F11 FULL  ESC CLOSE", chr);
+    draw_gametext(t, x0 + 16, y0 + 140, "1-5 SLOT  F11 FULL", chr);
+    draw_gametext(t, x0 + 16, y0 + 152, "ESC CLOSE", chr);
 }
 
 

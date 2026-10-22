@@ -141,6 +141,9 @@ set_target_properties(smb3-wide-verify PROPERTIES LINKER_LANGUAGE CXX)
 add_executable(smb3-scenes-verify tests/scenes_verify.c)
 target_link_libraries(smb3-scenes-verify PRIVATE smb3-core)
 set_target_properties(smb3-scenes-verify PROPERTIES LINKER_LANGUAGE CXX)
+add_executable(smb3-wide-collision-verify tests/wide_collision_verify.c)
+target_link_libraries(smb3-wide-collision-verify PRIVATE smb3-core)
+set_target_properties(smb3-wide-collision-verify PROPERTIES LINKER_LANGUAGE CXX)
 
 # The portable SDL2/Vulkan frontend (mushroom-sdl) is the single launcher on
 # every platform. With no remembered ROM it shows an in-app picker, so a

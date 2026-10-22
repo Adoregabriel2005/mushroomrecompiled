@@ -116,6 +116,9 @@ void cyc_mod_set_return_hook(void (*hook)(void)) {
 void cyc_mod_set_ram_read_hook(uint8_t (*hook)(uint16_t pc, uint16_t addr, uint8_t value)) {
     cyc_cpu_ram_read_policy = hook;
 }
+void cyc_mod_set_cart_read_hook(uint8_t (*hook)(uint16_t pc, uint16_t addr, uint8_t value)) {
+    cyc_cpu_cart_read_policy = hook;
+}
 void cyc_mod_allow_isolated_hooks(bool allow) {
     if (!s_open) return;
     s_isolated_hooks = allow;

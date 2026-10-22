@@ -61,13 +61,17 @@ static bool sdl_present(Video *base, const uint32_t *argb, int width, int height
         src_x = 8;
         src_w = 240;
     }
+    /* Whole pixels only. A fractional fit (1920/426 = 4.5) gives some columns
+     * four device pixels and the rest five, which is the uneven-pixel look;
+     * every source pixel has to cover the same number of window pixels, so the
+     * scale is the largest integer that fits and the remainder is black. */
     const double sx = (double)win_w / (double)src_w;
     const double sy = (double)win_h / (double)height;
-    const double scale = sx < sy ? sx : sy;
-    int dw = (int)((double)src_w * scale + 0.5);
-    int dh = (int)((double)height * scale + 0.5);
-    if (dw < 1) dw = 1;
-    if (dh < 1) dh = 1;
+    const double fit = sx < sy ? sx : sy;
+    int scale = (int)fit;
+    if (scale < 1) scale = 1;
+    int dw = src_w * scale;
+    int dh = height * scale;
     SDL_Rect src = {src_x, 0, src_w, height};
     SDL_Rect dst = {(win_w - dw) / 2, (win_h - dh) / 2, dw, dh};
     if (SDL_RenderCopy(v->renderer, v->texture, &src, &dst) != 0) {

@@ -130,6 +130,10 @@ void cyc_mod_set_return_hook(void (*hook)(void));
  * RAM, bus values and clocks are untouched. The callback must not mutate the
  * machine or reenter guest execution. NULL restores unmodified reads. */
 void cyc_mod_set_ram_read_hook(uint8_t (*hook)(uint16_t pc, uint16_t addr, uint8_t value));
+/* The cartridge work-RAM counterpart for $6000-$7FFF, at the same final
+ * data-read site and with the same contract. It is not a mapper-register or
+ * bus watch: fetches, dummy reads, RMW and I/O never reach it. */
+void cyc_mod_set_cart_read_hook(uint8_t (*hook)(uint16_t pc, uint16_t addr, uint8_t value));
 void cyc_mod_allow_isolated_hooks(bool allow);
 bool cyc_mod_call_commit_hooked(uint16_t routine, CycModRegs *regs);
 bool cyc_mod_call_commit(uint16_t routine, CycModRegs *regs);

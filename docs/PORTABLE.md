@@ -59,8 +59,6 @@ Useful options:
 --renderer vulkan|sdl   presentation backend (Vulkan when built with it, SDL2 fallback)
 --scale N               window scale 1-8
 --fullscreen            start fullscreen
---widescreen            start in 426x240 widescreen
---aspect fit|integer|stretch
 --scanlines 0|1|2
 --brightness 50-150
 --audio-rate 44100|48000|96000
@@ -97,9 +95,8 @@ across power-on, so progress survives a reset. Replays never touch the file.
 `G` saves the session so far as the first free `saves/replay-N.rec`: raw
 controller bytes, one per emulated frame, like smb3pc's desktop recordings.
 `--record FILE` streams the same bytes to a file; `--replay FILE` feeds them
-back instead of live input and quits when the recording ends. A replay must
-start with the same widescreen mode it was recorded with, and save states
-are refused while one plays.
+back instead of live input and quits when the recording ends. Save states are
+refused while a replay plays.
 
 ## Controls
 
@@ -115,13 +112,12 @@ are refused while one plays.
 | Load state | F7 | Menu |
 | Save session replay | G | — |
 | Select slot | 1-5 | Menu |
-| Widescreen | F10 | Menu |
 | Fullscreen | F11 | Menu |
 | Mute | F8 | Menu |
 | Volume | - / = | Menu |
 | Reset machine | R | Menu |
 
-The menu also exposes resume, save, load, widescreen, fullscreen, and quit.
+The menu also exposes resume, save, load, fullscreen, and quit.
 Gamepad mappings come from `assets/gamecontrollerdb.txt` when present; the
 built-in SDL mapping is used otherwise.
 
@@ -134,12 +130,13 @@ survive restarts.
 
 ## Scope and known gaps
 
-- The Vulkan presenter performs nearest-neighbour presentation, integer/fit/
-  stretch aspect handling, brightness, and optional scanlines. It is not a
-  shader-preset system.
+- The Vulkan presenter performs nearest-neighbour presentation at whole-pixel
+  scales, brightness, and optional scanlines. It is not a shader-preset system.
+  The picture is always the 426x240 16:9 canvas; the window is a whole multiple
+  of it and fullscreen uses the largest exact-multiple 16:9 display mode.
 - The portable frontend does not include the Win32 launcher's full settings
   pages or per-device button remapping UI. It loads `gamecontrollerdb.txt` and
-  uses the standard mapping above; settings such as scale, renderer, aspect,
+  uses the standard mapping above; settings such as scale, renderer,
   volume, sample rate, and slot are persisted in `config.ini`.
 - Music and sound effects run on two Blargg voice sets (music + sfx), routed
   by owner tags the translator emits around the game's sound routines

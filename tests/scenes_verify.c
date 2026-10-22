@@ -17,15 +17,65 @@ static int verify_native_scene(uint16_t address,uint8_t value){
  const uint32_t *native=glue_get_framebuffer(),*out=smb3_wide_present(native);int valid=!smb3_wide_active();
  int bar_first,bar_anchor;smb3_hud_bounds(&bar_first,&bar_anchor);
  const uint32_t *hud=smb3_hud_present(native);
+ int split=cyc_frame_split_line();int layer_top=split>=0&&split<240?split:240;
+ /* The bar can never start above the split that creates it. */
+ if(bar_first>=0&&bar_first<layer_top)valid=0;
  for(int y=0;y<240;y++){
-  /* The status bar is its own layer: only the rows it rebuilt differ from the
-   * machine's picture, and the picture pastes that layer, not the raw frame. */
-  int staged=bar_first>=0&&y>=bar_first&&y<=bar_anchor;
+  /* The status bar is its own layer: the rows from the split down are rebuilt
+   * from the frame's own captures (hud.cpp's hud_build), so only they may
+   * differ from the machine's picture, and the picture pastes that layer, not
+   * the raw frame. */
+  int staged=y>=layer_top&&y<=bar_anchor;
   if(!staged&&memcmp(hud+y*256,native+y*256,256*sizeof(uint32_t)))valid=0;
   if(memcmp(out+y*426+97,hud+y*256+12,232*sizeof(uint32_t)))valid=0;
   for(int x=0;x<97;x++)if(out[y*426+x]!=0xff000000u||out[y*426+329+x]!=0xff000000u)valid=0;
  }
  cyc_mod_poke(address,old);smb3_wide_capture();return valid;
+}
+static int verify_wide_end_scene(uint16_t address,uint8_t value){
+ uint8_t old=cyc_mod_peek(address);cyc_mod_poke(address,value);smb3_wide_capture();
+ uint64_t before=cyc_mem_state_hash();
+ const uint32_t *native=glue_get_framebuffer(),*out=smb3_wide_present(native);
+ const uint32_t *hud=smb3_hud_present(native);
+ int valid=smb3_wide_active(),origin=smb3_wide_origin();
+ int bar_top=smb3_hud_top();if(bar_top>240)bar_top=240;
+ if(origin<0||origin>170)valid=0;
+ for(int y=0;y<240;y++){
+  int x=y<bar_top?origin+12:97;
+  if(memcmp(out+y*426+x,hud+y*256+12,232*sizeof(uint32_t)))valid=0;
+  if(y>=bar_top)for(int i=0;i<97;i++)
+   if(out[y*426+i]!=0xff000000u||out[y*426+329+i]!=0xff000000u)valid=0;
+ }
+ int colored=0;
+ for(int y=0;y<bar_top&&!colored;y++)for(int x=0;x<426;x++){
+  if(x>=origin+12&&x<origin+244)continue;
+  if(out[y*426+x]!=0xff000000u){colored=1;break;}
+ }
+ if(!colored)valid=0;
+ if(cyc_mem_state_hash()!=before)valid=0;
+ cyc_mod_poke(address,old);smb3_wide_capture();return valid;
+}
+static int verify_end_spawn_blocked(uint16_t address,uint8_t value){
+ const uint8_t *r=cyc_cpu_ram();int free=0;
+ for(int s=0;s<5;s++)if(!r[0x661+s])free++;
+ int count=0;while(count<48&&cyc_mod_peek((uint16_t)(0x7b41+count*3))!=255)count++;
+ if(free<2||count<1)return 0;
+ int i=count-1;uint16_t rec=(uint16_t)(0x7b41+i*3),bit=(uint16_t)(0x7b10+i);
+ int camera=smb3_enemies_camera(r),x=((camera+426+15)&~15);
+ if(x<0||x>4080)return 0;
+ uint8_t old_flag=cyc_mod_peek(address),old_id=cyc_mod_peek(rec);
+ uint8_t old_col=cyc_mod_peek((uint16_t)(rec+1)),old_row=cyc_mod_peek((uint16_t)(rec+2));
+ uint8_t old_bit=cyc_mod_peek(bit);
+ /* Put one Goomba record on the first clear column beyond the wide picture,
+  * with its spawned bit clear. The end-card/run-off tick must not claim it. */
+ cyc_mod_poke(rec,0x72);cyc_mod_poke((uint16_t)(rec+1),(uint8_t)(x>>4));cyc_mod_poke((uint16_t)(rec+2),25);
+ cyc_mod_poke(bit,0);cyc_mod_poke(address,value);
+ uint64_t before=cyc_mem_state_hash();
+ smb3_enemies_tick();
+ int valid=cyc_mem_state_hash()==before;
+ cyc_mod_poke(rec,old_id);cyc_mod_poke((uint16_t)(rec+1),old_col);cyc_mod_poke((uint16_t)(rec+2),old_row);
+ cyc_mod_poke(bit,old_bit);cyc_mod_poke(address,old_flag);smb3_wide_capture();
+ return valid;
 }
 static void warp(void){
  if(warped||cpu.pc!=0x892a)return;
@@ -93,10 +143,11 @@ int main(int argc,char **argv){
     }
    }
    if(f==1140){
-    if(!verify_native_scene(0x559,1)||!verify_native_scene(0x7974,1)||
+    if(!verify_wide_end_scene(0x559,1)||!verify_wide_end_scene(0x7974,1)||
+       !verify_end_spawn_blocked(0x559,1)||!verify_end_spawn_blocked(0x7974,1)||
        !verify_native_scene(0x100,0x40)||!verify_native_scene(0x101,0x60)||
        !verify_native_scene(0x14,1))return 5;
-    puts("Reward, card/bonus, raster and exit scenes: native pixels and clean black margins verified");
+    puts("Level-end card/run-off: wide frame, composed margins and no late spawns; raster and exit scenes: native pixels and clean black margins verified");
    }
   }
  }

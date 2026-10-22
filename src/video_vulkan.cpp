@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <algorithm>
 #include <new>
 #include <vector>
@@ -114,7 +115,11 @@ public:
         const float sw = static_cast<float>(swap_extent_.width);
         const float sh = static_cast<float>(swap_extent_.height);
         const float disp_w = wide ? static_cast<float>(kFrameW) : static_cast<float>(kVisibleW);
-        const float scale = std::min(sw / disp_w, sh / kFrameH);
+        // Whole pixels only: a fractional fit (1920/426 = 4.5) gives some
+        // columns four device pixels and the rest five. Every source pixel has
+        // to cover the same number of device pixels, so this is the largest
+        // integer scale that fits and the remainder is the clear colour.
+        const float scale = std::max(1.0f, std::floor(std::min(sw / disp_w, sh / kFrameH)));
         const float vw = disp_w * scale;
         const float vh = kFrameH * scale;
         VkViewport viewport{(sw - vw) * 0.5f, (sh - vh) * 0.5f, vw, vh, 0.0f, 1.0f};

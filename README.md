@@ -4,10 +4,10 @@
 
 ## Widescreen and scene fixes — v1.5
 
-The downloadable version expands the scenery of horizontal stages to a 16:9 canvas without stretching tiles or sprites. The original HUD remains centered, with black bars on the sides. Select **Video > Aspect Ratio > 16:9**; new configurations already use this mode.
+The downloadable version expands the scenery of horizontal stages to a 16:9 canvas without stretching tiles or sprites. The original HUD remains centered, with black bars on the sides. That 16:9 picture is always presented, filling the screen; every picture pixel keeps the same width because the window is a whole multiple of the 426x240 canvas and fullscreen runs in the largest 16:9 display mode that is an exact multiple (1280x720 on a 1080p panel).
 
 The compositor uses the actual stage map. The widescreen mode extends object activation, horizontal culling, and rendering to the 16:9 area; vertical rooms and unsupported scenes remain in native framing. Read the [limits and tests](docs/WIDESCREEN.md). Historical packages remain available with updated download names.
-The current build keeps reward/bonus scenes centered with clean black margins and repairs object seams at the original viewport edges. It extends enemy activation and persistence to the 16:9 area and draws their sprites outside the old clipping region. Retains edge and menu fixes. Remembers the ROM and launches directly; Esc opens the menu during gameplay.
+The current build keeps bonus games and exit transitions centered with clean black margins, while the end-of-level card and run-off stay in the wide frame and follow the camera to the level edge without creating late margin enemies. It repairs object seams at the original viewport edges and extends enemy activation and persistence to the 16:9 area, drawing their sprites outside the old clipping region. Retains edge and menu fixes. Remembers the ROM and launches directly; Esc opens the menu during gameplay.
 
 ## Download and test
 
@@ -26,7 +26,7 @@ Requires Windows x64 and a video/audio device recognized by the system. No minim
 The launcher uses the project identity and the original Underplay image supplied by the project owner. In-window settings: keyboard, controller, video, audio, ROM, Project, and Credits. Apply saves changes; Discard preserves the previous ones.
 
 - Controls: automatic or per-device selection, remapping, dead zone, button test, D-pad and analog. USB/Bluetooth/receivers via SDL2 and SDL_GameControllerDB, based on Windows recognition and pairing.
-- Video: aspect ratio, integer scale/fit/crop, filter, scanlines, brightness, resolution, and borderless fullscreen. 16:9 expands the scenery and object activation range in supported horizontal stages while keeping the original HUD.
+- Video: whole-pixel window scale, scanlines, brightness, and fullscreen in the largest exact-multiple 16:9 display mode. 16:9 expands the scenery and object activation range in supported horizontal stages while keeping the original HUD.
 - Audio: volume, mute, device, 44.1/48/96 kHz, and 20/40/60 ms buffer reserve.
 - Save states: five slots; save/load from the menu.
 

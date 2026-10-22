@@ -1,8 +1,8 @@
 # Widescreen experimental — v1.5.0
 
-Vídeo > Proporção > 16:9 amplia a fase em um canvas 426 × 240, sem esticar sprites ou tiles. A câmera ampla respeita as bordas do mapa. O quadro central e o HUD (linhas 192–239) têm o overscan cortado — 12 pixels de cada lado, como no smb3pc — e ficam centralizados com 232 pixels, entre duas faixas pretas de 97 pixels.
+A fase é sempre apresentada no canvas 16:9 de 426 × 240, sem esticar sprites ou tiles; não há mais alternância de proporção no menu. A câmera ampla respeita as bordas do mapa. O quadro central e o HUD (linhas 192–239) têm o overscan cortado — 12 pixels de cada lado, como no smb3pc — e ficam centralizados com 232 pixels, entre duas faixas pretas de 97 pixels.
 
-O HUD é uma camada própria, como no `src/runtime/hud.cpp` do smb3pc, e o bloco é copiado dela com o overscan cortado e centralizado. A linha em que a barra começa vem do IRQ de scanline do cartucho: o mapper registra o último IRQ do quadro e a barra começa na linha seguinte (240 quando o quadro não tem split). A partir dali, a primeira linha que de fato pertence à barra é a primeira que não continua a linha anterior na captura por scanline do quadro — o `hud_bar_first()` da referência —, e a linha de onde o conteúdo é desenhado é a primeira abaixo dela que segue até o fim da imagem com os bancos de CHR da barra. As linhas que o split do meio do quadro encena — a primeira ou duas linhas da área do status, que chegam ao vídeo como faixa sólida da cor de fundo do cenário (azul ao ar livre) ou do cartão — são desenhadas a partir da âncora: o fundo vem do nametable do próprio quadro e do CHR no scroll da barra, e os sprites daquela linha vêm da OAM capturada, como o hardware faria. A barra então começa na sua primeira linha e nada encenado aparece acima dela. A linha de ancoragem também é redesenhada, porque a PPU buscou seus primeiros tiles antes da escrita do split: é ali que sobra um resto da linha de cima nas primeiras colunas. As linhas seguintes do HUD saem idênticas ao quadro nativo — o desenho as reproduz pixel a pixel —, e as linhas acima da barra mantêm os pixels da fase, então o chão vai até a última scanline do playfield. Um quadro sem split (título, mapa, menu) não ganha camada nenhuma. O ajuste vale também em 4:3: o quadro apresentado sai da mesma camada, mas o quadro interno da máquina, os hashes e o save state não mudam.
+O HUD é uma camada própria, como no `src/runtime/hud.cpp` do smb3pc, e o bloco é copiado dela com o overscan cortado e centralizado. A linha em que a barra começa vem do IRQ de scanline do cartucho: o mapper registra o último IRQ do quadro e a barra começa na linha seguinte (240 quando o quadro não tem split). A partir dali, a primeira linha que de fato pertence à barra é a primeira que não continua a linha anterior na captura por scanline do quadro — o `hud_bar_first()` da referência —, e a linha de onde o conteúdo é desenhado é a primeira abaixo dela que segue até o fim da imagem com os bancos de CHR da barra. As linhas que o split do meio do quadro encena — a primeira ou duas linhas da área do status, que chegam ao vídeo como faixa sólida da cor de fundo do cenário (azul ao ar livre) ou do cartão — são desenhadas a partir da âncora: o fundo vem do nametable do próprio quadro e do CHR no scroll da barra, e os sprites daquela linha vêm da OAM capturada, como o hardware faria. A barra então começa na sua primeira linha e nada encenado aparece acima dela. A linha de ancoragem também é redesenhada, porque a PPU buscou seus primeiros tiles antes da escrita do split: é ali que sobra um resto da linha de cima nas primeiras colunas. As linhas seguintes do HUD saem idênticas ao quadro nativo — o desenho as reproduz pixel a pixel —, e as linhas entre o split e a primeira linha da barra são redesenhadas da própria captura, com o scroll que a fase tinha naquela linha, de modo que o chão vai até a última scanline do playfield sem deixar de ser o desenho do `hud_build()`. Um quadro sem split (título, mapa, menu) não ganha camada nenhuma. O quadro interno da máquina, os hashes e o save state não mudam: a camada do HUD só decide o que é apresentado.
 
 ## Cenário e bordas
 
@@ -25,10 +25,10 @@ A ativação antecipada e o descarte mais distante mudam a sequência da partida
 ## Limites
 
 - A capacidade continua em cinco slots principais: fases cheias podem aguardar um slot livre. Objetos especiais, projéteis e controladores mantêm seus gatilhos originais.
-- Mapas, títulos, bônus, Toad Houses, salas verticais, transições e locais sem largura suficiente mantêm o enquadramento original.
+- Mapas, títulos, bônus, Toad Houses, salas verticais, transições e locais sem largura suficiente mantêm o enquadramento original. O cartão de fim de fase e a corrida do jogador não são transições: continuam no quadro amplo até `Level_ExitToMap`.
 - Todas as fases, chefes, efeitos de água/raster e combinações de inimigos ainda precisam de validação. O modo é experimental.
-- O canvas inteiro é ajustado à janela, mantendo o HUD e a proporção dos pixels.
-- Desativar 16:9 restaura a política original de spawn e descarte. Objetos já ativados seguem seu estado corrente até o jogo descartá-los.
+- A janela é sempre um múltiplo inteiro do canvas (426 × `scale` por 240 × `scale`), então cada pixel da imagem cobre exatamente o mesmo número de pixels da tela. Na tela cheia o jogo usa o maior modo 16:9 com altura múltipla de 240 — 1280 × 720 num painel 1080p — e entrega essa superfície ao compositor, que a amplia até preencher a tela.
+- Não há mais como desligar a expansão: cenas sem largura suficiente mantêm o enquadramento original, e as demais usam a política ampla de spawn e descarte.
 
 ## Testes
 
@@ -37,11 +37,37 @@ cd build
 .\smb3-wide-verify.exe "..\game.nes"
 ```
 
-O roteiro entra em 1-1 e rola a câmera. Confere o HUD, miolo nativo e barras pixel a pixel — inclusive que cada linha encenada pelo split continue o fundo da própria barra, e não o do cenário, que toda linha abaixo da âncora reproduza exatamente o quadro da PPU e que um quadro sem IRQ de split não ganhe camada —; injeta lixo nas bordas para conferir o reparo; verifica inimigos ativos fora da área antiga e retidos além do antigo limite de descarte; recusa índices de spawn duplicados. Uma Piranha no primeiro cano deve estar ativa e ter sprites na margem ampla, enquanto a mesma sequência em modo nativo ainda não a ativa.
+O roteiro entra em 1-1 e rola a câmera. Confere o HUD, miolo nativo e barras pixel a pixel — inclusive que cada linha encenada pelo split continue o fundo da própria barra, e não o do cenário, que toda linha abaixo da âncora reproduza exatamente o quadro da PPU, que nenhuma linha acima do split seja tocada, que uma segunda apresentação do mesmo quadro não reconstrua a camada e que um quadro sem IRQ de split não ganhe camada —; injeta lixo nas bordas para conferir o reparo; verifica inimigos ativos fora da área antiga e retidos além do antigo limite de descarte; recusa índices de spawn duplicados. Uma Piranha no primeiro cano deve estar ativa e ter sprites na margem ampla, enquanto a mesma sequência em modo nativo ainda não a ativa.
 
 Também compara 1.800 estados recompilados/interpretados com inimigos ampliados, verifica continuação determinística após save/load e confirma que a geração isolada de sprites não altera a máquina real. Esses testes cobrem o roteiro, sem comprovar todas as fases.
 
 Pesquisa técnica: [Southbird — Disassembly de referência](https://github.com/captainsouthbird/smb3), especialmente PRG000 e PRG005; [SM3Mix](http://www.sonicepoch.com/sm3mix/). O disassembly foi consultado para pesquisa; dados e gráficos vêm da cópia local do usuário. Sobre artefatos originais: [NESdev Mirroring](https://www.nesdev.org/wiki/Mirroring) e [Attribute tables](https://www.nesdev.org/wiki/PPU_attribute_tables).
+
+## v1.11 — fim de fase amplo
+
+O cartão de fim de fase e a corrida do jogador deixam de desligar a expansão. A janela acompanha a câmera até a borda do mapa, como no `wide_compose` do smb3pc: o quadro nativo desliza para o lado em vez de voltar ao centro, e o HUD continua centralizado. O caminho nativo de 256 × 240 não muda; os ganchos amplos só existem com o modo amplo ligado. A saída para o mapa (`Level_ExitToMap`), as transições por cano, os mapas, os bônus, as salas verticais e o final do jogo continuam em 4:3. O gerador amplo de inimigos para de criar registros durante o cartão e a corrida: o jogo já não avança o spawner nativo ali, e uma varredura da margem criava Goombas tardios sobre os que ainda estavam na tela.
+
+## v1.10 — apresentação em pixels inteiros
+
+O menu perdeu a entrada WIDESCREEN e o `config.ini` perdeu `widescreen` e `aspect`: a imagem apresentada é sempre o canvas 16:9, e o que sobrava de código morto de proporção saiu junto.
+
+A janela passou a ser dimensionada como 426 × `scale` por 240 × `scale`, e os dois apresentadores (SDL2 e Vulkan) desenham a imagem na maior escala inteira que cabe na janela, em vez de esticar por um fator fracionário. Antes, 1920 ÷ 426 = 4,507: o ajuste fracionário dava quatro pixels de tela para algumas colunas e cinco para as vizinhas, e cada sprite repetia o defeito internamente — o padrão de 4/5 que a captura do usuário mostrava.
+
+Na tela cheia o frontend pede o maior modo 16:9 cuja altura seja múltipla de 240. Num painel 1080p isso é 1280 × 720 (3× exato), não 1920 × 1080 (4,5×): a imagem é desenhada em pixels inteiros nessa superfície e o compositor a amplia 1,5× para preencher a tela. O pedido de tela cheia agora é adiado até a janela estar mapeada, porque o Wayland descarta silenciosamente um pedido feito antes disso.
+
+Medido na saída real de 1920 × 1080 do painel: cada célula de 16 pixels do tabuleiro do final sai com 70 pixels sólidos e mais dois de transição, idêntica em toda a largura da tela, sem nenhuma coluna de 4 e outra de 5. A captura equivalente do smb3pc em tela cheia a 1080p mostra exatamente o padrão 4/5, porque ele ajusta 426 colunas em 1920 com escala fracionária; a nitidez dele vem da janela padrão de 852 × 480 (2× exato).
+
+O limite é aritmético: 1080 ÷ 240 = 4,5, então não existe escala inteira que preencha um painel 1080p. Preencher a tela e manter arestas duras são objetivos incompatíveis nessa resolução; a escolha foi manter o desenho em 3× inteiro e deixar a ampliação final para o compositor. Em painéis 1440p e 4K a altura já é múltipla de 240 (6× e 9×), então a tela cheia sai em pixels inteiros de ponta a ponta.
+
+## v1.9 — porte completo do hud_build() e cache entre quadros
+
+A camada não tem mais desvios em relação ao `src/runtime/hud.cpp`. O desenho começa na linha do split, não na primeira linha da barra: `hud_build()` percorre `hud_top..239`, e as linhas entre o split e a primeira linha da barra são desenhadas da própria captura, com o scroll que o playfield tinha naquela linha (o `own = y < s.first || i >= anchor_i` da referência). O chão sob o jogador continua sendo o desenho da fase até a última scanline do nível.
+
+Isso custa o mesmo que custa na referência quando o jogo troca do cartão para a fase no meio de uma linha: a captura é um estado por linha inteira, e o `hud_build()` também não tem como reproduzir a metade que ficou do outro lado da escrita. Medido no roteiro de 1.800 quadros: 2 quadros (f=1564 e f=1565, split=192, primeira linha da barra=193) perdem 1 linha e 12/11 pixels cada, 23 no total; fora esse bloco, **zero** linhas e **zero** pixels diferem em qualquer ponto da imagem. A camada agora desenha exatamente as linhas que a referência desenha, das mesmas fontes.
+
+O cache entre quadros (`hud_matches`/`hud_snapshot`, o `HudLayer::Source`) foi portado junto. A camada guarda o que usou para construir a imagem — split, primeira linha, âncora, scroll e OAM da âncora, nametables do quadro e, por linha, scroll, `$2000`/`$2001`, paleta e bancos de CHR — e reconstrói só quando algum desses valores muda; a imagem construída é copiada para o quadro em blocos contínuos de linhas com rendering ligado, como o `hud_blit()`. O espelhamento não é uma chave separada porque os nametables do quadro já são a visão mapeada: uma troca de mirroring que mude a imagem muda a fotografia. No mesmo roteiro a camada foi construída 1.469 vezes para 1.748 quadros com split (279 reaproveitaram a anterior), e uma segunda apresentação do mesmo quadro nunca reconstrói — o `smb3_hud_builds()` confere isso no teste.
+
+A imagem ampla passa a colar as linhas da camada (como o `framebuf` depois do `hud_compose` da referência), e não mais o quadro nativo, então as linhas entre o split e a barra são as mesmas em 4:3 e em 16:9.
 
 ## v1.8 — split do IRQ e nametables do quadro
 
@@ -51,9 +77,9 @@ O fundo de uma linha não é mais lido da CIRAM viva. No fim do quadro (linha 24
 
 A cor de cada linha aplica também o greyscale do $2001 (bit 0), como o `color_mask` da referência e o `output_pixel` da PPU; antes a camada desenhava em cores quando o jogo tinha o vídeo em tons de cinza. Os sprites da barra usam a linha `(y - 1) - OAM Y`, a mesma da referência: os padrões de uma scanline foram buscados durante a anterior.
 
-A única parte do `hud.cpp` que não foi portada é o cache entre quadros (`hud_matches`/`hud_snapshot`): a camada é reconstruída a cada apresentação, com os mesmos pixels que o cache devolveria.
+Na v1.8, a única parte do `hud.cpp` que não estava portada era o cache entre quadros (`hud_matches`/`hud_snapshot`): a camada era reconstruída a cada apresentação, com os mesmos pixels que o cache devolveria. A v1.9 completa o porte.
 
-Conferido no roteiro de 1.800 quadros: 1.749 com barra, 1.139 linhas encenadas, e **zero** diferenças entre a camada e a máquina fora do bloco encenado — inclusive em 1.507 linhas de barra com sprites. As linhas acima da barra não são redesenhadas: o jogo troca do cartão para a fase no meio de uma delas (a escrita do scroll cai dentro da linha) e a captura é um estado por linha inteira; redesenhá-las como o `hud_build()` faz custa 23 pixels em 2 dos 1.749 quadros, então a camada preserva os pixels da máquina ali, que são exatos por construção.
+Conferido no roteiro de 1.800 quadros: 1.749 com barra, 1.139 linhas encenadas, e **zero** diferenças entre a camada e a máquina fora do bloco encenado — inclusive em 1.507 linhas de barra com sprites. Na v1.8, as linhas acima da barra não eram redesenhadas: o jogo troca do cartão para a fase no meio de uma delas (a escrita do scroll cai dentro da linha) e a captura é um estado por linha inteira; redesenhá-las como o `hud_build()` faz custa 23 pixels em 2 dos 1.749 quadros. A v1.9 passou a redesenhá-las como a referência, aceitando esse custo para que o porte seja completo.
 
 ## v1.7 — camada do HUD
 
@@ -67,8 +93,8 @@ O gancho que avisa o carregamento de fase (`smb3_wide_level_load`) era emitido f
 
 ## v1.5 — transições e bordas de objetos
 
-A expansão é desativada durante prêmio, cartões, raster especial e saída da fase. O centro usa exatamente o quadro nativo e todas as margens externas são pretas, sem reaproveitar o mapa anterior. O renderer cobre os oito slots de objetos existentes sem aumentar a capacidade de ativação dos cinco principais. As peças relativas dispensam qualquer alinhamento com a OAM do quadro, e sua cobertura também inclui as faixas de 12 pixels reconstruídas nas antigas bordas.
+Na v1.5, a expansão era desativada durante prêmio, cartões, raster especial e saída da fase. O centro usa exatamente o quadro nativo e todas as margens externas são pretas, sem reaproveitar o mapa anterior. O renderer cobre os oito slots de objetos existentes sem aumentar a capacidade de ativação dos cinco principais. As peças relativas dispensam qualquer alinhamento com a OAM do quadro, e sua cobertura também inclui as faixas de 12 pixels reconstruídas nas antigas bordas.
 
-O teste scenes_verify usa troca de destino e posicionamento apenas no processo de teste para percorrer duas fases altas, comparar o fundo reconstruído ao fundo real da PPU e simular os indicadores de prêmio, bônus, raster e saída. Essas intervenções não integram o aplicativo.
+O teste scenes_verify usa troca de destino e posicionamento apenas no processo de teste para percorrer duas fases altas, comparar o fundo reconstruído ao fundo real da PPU e simular os indicadores de bônus, raster, saída e, desde a v1.11, o cartão/fim de fase amplo. Essas intervenções não integram o aplicativo.
 
 O enquadramento usa o scroll realmente aplicado pela PPU, reconstruído no espaço do mapa. A câmera de gameplay em RAM pode estar alguns pixels à frente do quadro exibido; usá-la diretamente criava emendas entre as margens reconstruídas e o centro nativo, especialmente nas fases altas com deslocamento horizontal.

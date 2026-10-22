@@ -28,13 +28,11 @@
 
 typedef struct {
     char rom[4096];
-    bool widescreen;
     bool fullscreen;
     bool muted;
     bool vsync;
     int scale;
     int renderer; /* 0 = SDL2, 1 = Vulkan */
-    int aspect;   /* 0 = fit, 1 = integer, 2 = stretch */
     int scanlines;
     int brightness;
     int volume;
@@ -83,9 +81,13 @@ static bool g_screenshot_done;
 static uint64_t g_screenshot_frame = 1;
 static int g_frame_w;
 static int g_frame_h;
+/* Fullscreen is requested after the window is mapped: on Wayland a request
+ * made before the compositor knows the surface is silently dropped. */
+static bool g_fullscreen_pending;
+static Uint32 g_window_shown_at;
 
 static const char *const MENU_ITEMS[] = {
-    "RESUME", "SAVE STATE", "LOAD STATE", "WIDESCREEN", "FULLSCREEN", "QUIT"
+    "RESUME", "SAVE STATE", "LOAD STATE", "FULLSCREEN", "QUIT"
 };
 enum { MENU_COUNT = (int)(sizeof(MENU_ITEMS) / sizeof(MENU_ITEMS[0])) };
 
@@ -97,7 +99,6 @@ static void config_defaults(Config *cfg) {
 #else
     cfg->renderer = 0;
 #endif
-    cfg->aspect = 0;
     cfg->scanlines = 0;
     cfg->brightness = 100;
     cfg->volume = 100; /* smb3pc has no volume control: always full level */
@@ -449,18 +450,13 @@ static void config_load(Config *cfg, const char *path) {
                 trim(key);
                 trim(value);
                 if (!SDL_strcasecmp(key, "rom")) snprintf(cfg->rom, sizeof(cfg->rom), "%s", value);
-                else if (!SDL_strcasecmp(key, "widescreen")) cfg->widescreen = parse_bool(value);
                 else if (!SDL_strcasecmp(key, "fullscreen")) cfg->fullscreen = parse_bool(value);
                 else if (!SDL_strcasecmp(key, "muted")) cfg->muted = parse_bool(value);
                 else if (!SDL_strcasecmp(key, "vsync")) cfg->vsync = parse_bool(value);
                 else if (!SDL_strcasecmp(key, "scale")) cfg->scale = atoi(value);
                 else if (!SDL_strcasecmp(key, "renderer"))
                     cfg->renderer = !SDL_strcasecmp(value, "sdl") ? 0 : 1;
-                else if (!SDL_strcasecmp(key, "aspect")) {
-                    if (!SDL_strcasecmp(value, "integer")) cfg->aspect = 1;
-                    else if (!SDL_strcasecmp(value, "stretch")) cfg->aspect = 2;
-                    else cfg->aspect = 0;
-                } else if (!SDL_strcasecmp(key, "scanlines")) cfg->scanlines = atoi(value);
+                else if (!SDL_strcasecmp(key, "scanlines")) cfg->scanlines = atoi(value);
                 else if (!SDL_strcasecmp(key, "brightness")) cfg->brightness = atoi(value);
                 else if (!SDL_strcasecmp(key, "volume")) cfg->volume = atoi(value);
                 else if (!SDL_strcasecmp(key, "audio_rate")) cfg->audio_rate = atoi(value);
@@ -511,13 +507,11 @@ static void config_save(const Config *cfg) {
     char text[8192];
     int n = snprintf(text, sizeof(text),
                      "rom=%s\n"
-                     "widescreen=%d\n"
                      "fullscreen=%d\n"
                      "muted=%d\n"
                      "vsync=%d\n"
                      "scale=%d\n"
                      "renderer=%s\n"
-                     "aspect=%s\n"
                      "scanlines=%d\n"
                      "brightness=%d\n"
                      "volume=%d\n"
@@ -531,10 +525,9 @@ static void config_save(const Config *cfg) {
                      "key_down=%s\n"
                      "key_left=%s\n"
                      "key_right=%s\n",
-                     cfg->rom, cfg->widescreen ? 1 : 0, cfg->fullscreen ? 1 : 0,
+                     cfg->rom, cfg->fullscreen ? 1 : 0,
                      cfg->muted ? 1 : 0, cfg->vsync ? 1 : 0, cfg->scale,
                      cfg->renderer ? "vulkan" : "sdl",
-                     cfg->aspect == 1 ? "integer" : cfg->aspect == 2 ? "stretch" : "fit",
                      cfg->scanlines, cfg->brightness, cfg->volume, cfg->audio_rate, cfg->slot,
                      key_a, key_b, key_select, key_start, key_up, key_down, key_left, key_right);
     if (n > 0) SDL_RWwrite(rw, text, 1, (size_t)n);
@@ -573,8 +566,8 @@ static void load_slot(int slot) {
 
 /* Session replay: one controller byte per emulated frame, raw like smb3pc.
  * Paused menu frames never step the machine, so they are never recorded.
- * Replays start at boot with the same widescreen mode and never touch the
- * real save file; save states are refused while one plays. */
+ * Replays start at boot and never touch the real save file; save states are
+ * refused while one plays. */
 static void session_push(uint8_t pad) {
     if (g_session_len < g_session_cap) {
         g_session[g_session_len++] = pad;
@@ -607,28 +600,66 @@ static void save_replay_file(void) {
     }
 }
 
+/* The picture is always the 426x240 widescreen canvas, so the window is an
+ * exact integer multiple of it: every source pixel covers the same number of
+ * window pixels and nothing is letterboxed. */
 static void resize_window_to_frame(void) {
     if (!g_window || g_cfg.fullscreen) return;
-    int fw = 256, fh = 240;
-    (void)glue_get_present_framebuffer(&fw, &fh);
-    /* smb3pc: the 4:3 window is 3x the visible 240x240 picture, so at scale
-     * 3 the window is 720x720 for the cropped 256-column frame. */
-    if (fw == 256) fw = 240;
-    SDL_SetWindowSize(g_window, fw * g_cfg.scale, fh * g_cfg.scale);
+    SDL_SetWindowSize(g_window, SMB3_WIDE_WIDTH * g_cfg.scale, 240 * g_cfg.scale);
 }
 
-static void toggle_widescreen(void) {
-    g_cfg.widescreen = !g_cfg.widescreen;
-    glue_set_widescreen(g_cfg.widescreen);
-    resize_window_to_frame();
-    notify("WIDESCREEN %s", g_cfg.widescreen ? "ON" : "OFF");
-    config_save(&g_cfg);
+/* Fullscreen runs in the largest 16:9 display mode whose height is an exact
+ * multiple of the picture's 240 rows (1280x720 = 3x on a 1080p panel), so the
+ * picture is drawn with whole device pixels and the compositor scales that
+ * surface to the panel. Desktop fullscreen would render at the desktop
+ * resolution - 4.5x at 1080p - which is what makes some pixel columns four
+ * device pixels wide and the rest five. */
+static bool best_fullscreen_mode(SDL_DisplayMode *out) {
+    int display = g_window ? SDL_GetWindowDisplayIndex(g_window) : 0;
+    if (display < 0) display = 0;
+    int count = SDL_GetNumDisplayModes(display);
+    int best_scale = 0;
+    out->refresh_rate = 0;
+    for (int i = 0; i < count; i++) {
+        SDL_DisplayMode mode;
+        if (SDL_GetDisplayMode(display, i, &mode) != 0) continue;
+        if (mode.h <= 0 || mode.h % 240 != 0) continue;
+        const int scale = mode.h / 240;
+        if (scale < 1 || mode.w < SMB3_WIDE_WIDTH * scale) continue;
+        /* 16:9, allowing the rounding of real modes (1366x768 and friends). */
+        const long long want = (long long)mode.h * 16;
+        const long long have = (long long)mode.w * 9;
+        if (have < want * 995 / 1000 || have > want * 1005 / 1000) continue;
+        if (scale > best_scale ||
+            (scale == best_scale && mode.refresh_rate > out->refresh_rate)) {
+            *out = mode;
+            best_scale = scale;
+        }
+    }
+    return best_scale > 0;
+}
+
+static void set_fullscreen(bool fullscreen) {
+    if (!g_window) return;
+    if (fullscreen) {
+        SDL_DisplayMode mode;
+        if (best_fullscreen_mode(&mode)) {
+            if (SDL_SetWindowDisplayMode(g_window, &mode) != 0)
+                fprintf(stderr, "video: display mode %dx%d unavailable: %s\n",
+                        mode.w, mode.h, SDL_GetError());
+            /* Wayland derives the fullscreen surface from the window size. */
+            SDL_SetWindowSize(g_window, mode.w, mode.h);
+        }
+        SDL_SetWindowFullscreen(g_window, SDL_WINDOW_FULLSCREEN);
+    } else {
+        SDL_SetWindowFullscreen(g_window, 0);
+        resize_window_to_frame();
+    }
 }
 
 static void toggle_fullscreen(void) {
     g_cfg.fullscreen = !g_cfg.fullscreen;
-    SDL_SetWindowFullscreen(g_window, g_cfg.fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
-    if (!g_cfg.fullscreen) resize_window_to_frame();
+    set_fullscreen(g_cfg.fullscreen);
     notify("FULLSCREEN %s", g_cfg.fullscreen ? "ON" : "OFF");
     config_save(&g_cfg);
 }
@@ -667,9 +698,8 @@ static void activate_menu(void) {
         case 0: close_menu(); break;
         case 1: save_slot(g_slot); break;
         case 2: load_slot(g_slot); break;
-        case 3: toggle_widescreen(); break;
-        case 4: toggle_fullscreen(); break;
-        case 5: g_running = false; break;
+        case 3: toggle_fullscreen(); break;
+        case 4: g_running = false; break;
         default: break;
     }
 }
@@ -706,7 +736,6 @@ static void handle_key(SDL_Keycode key, bool repeat) {
     if (key == SDLK_F5) save_slot(g_slot);
     else if (key == SDLK_F7) load_slot(g_slot);
     else if (key == SDLK_g) save_replay_file();
-    else if (key == SDLK_F10) toggle_widescreen();
     else if (key == SDLK_F11) toggle_fullscreen();
     else if (key == SDLK_F8) toggle_mute();
     else if (key == SDLK_MINUS) adjust_volume(-5);
@@ -773,7 +802,7 @@ static void handle_event(SDL_Event *event) {
             const char *path = event->drop.file;
             if (path && glue_load_rom_utf8(path)) {
                 snprintf(g_cfg.rom, sizeof(g_cfg.rom), "%s", path);
-                glue_set_widescreen(g_cfg.widescreen);
+                glue_set_widescreen(true);
                 audio_out_clear(g_audio);
                 resize_window_to_frame();
                 config_save(&g_cfg);
@@ -822,7 +851,7 @@ static uint8_t read_pad(void) {
 }
 
 static void draw_menu(uint32_t *dst, int width, int height) {
-    int on[6] = {0, 0, 0, g_cfg.widescreen ? 1 : 0, g_cfg.fullscreen ? 1 : 0, 0};
+    int on[5] = {0, 0, 0, g_cfg.fullscreen ? 1 : 0, 0};
     OverlayTarget target = {dst, width, height};
     overlay_menu(target, g_menu_index, on, g_slot, g_chr);
 }
@@ -869,7 +898,7 @@ static bool init_video(int fw, int fh) {
         fprintf(stderr, "video: SDL_CreateWindow failed: %s\n", SDL_GetError());
         return false;
     }
-    SDL_SetWindowMinimumSize(g_window, 320, 240);
+    SDL_SetWindowMinimumSize(g_window, SMB3_WIDE_WIDTH, 240);
     g_video = video_create(g_window, want_vulkan ? VIDEO_BACKEND_VULKAN : VIDEO_BACKEND_SDL,
                            g_cfg.vsync);
     if (!g_video && want_vulkan) {
@@ -881,7 +910,7 @@ static bool init_video(int fw, int fh) {
                                     SDL_WINDOWPOS_CENTERED, fw * g_cfg.scale,
                                     fh * g_cfg.scale, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
         if (g_window) {
-            SDL_SetWindowMinimumSize(g_window, 320, 240);
+            SDL_SetWindowMinimumSize(g_window, SMB3_WIDE_WIDTH, 240);
             g_video = video_create(g_window, VIDEO_BACKEND_SDL, g_cfg.vsync);
         }
         if (g_video) notify("VULKAN UNAVAILABLE - USING SDL2");
@@ -893,8 +922,10 @@ static bool init_video(int fw, int fh) {
     char title[128];
     snprintf(title, sizeof(title), "Mushroom Recompiled - %s", video_name(g_video));
     SDL_SetWindowTitle(g_window, title);
-    if (g_cfg.fullscreen)
-        SDL_SetWindowFullscreen(g_window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+    /* The compositor only honours fullscreen once the window is mapped, so
+     * the request waits for the first frames (see the main loop). */
+    g_fullscreen_pending = g_cfg.fullscreen;
+    g_window_shown_at = SDL_GetTicks();
     return true;
 }
 
@@ -903,7 +934,6 @@ static void usage(const char *argv0) {
            "  --renderer vulkan|sdl   presentation backend (default vulkan with SDL2 fallback)\n"
            "  --scale N               window scale 1-8 (default 3)\n"
            "  --fullscreen            start fullscreen\n"
-           "  --widescreen            start with the 426x240 widescreen view\n"
            "  --scanlines 0|1|2       CRT scanline strength\n"
            "  --audio-rate 44100|48000|96000\n"
            "  --volume 0-100          --mute\n"
@@ -942,14 +972,6 @@ static bool parse_args(Config *cfg, int *frame_limit, bool *help, int argc, char
             cfg->renderer = 1;
         } else if (!strcmp(arg, "--fullscreen")) {
             cfg->fullscreen = true;
-        } else if (!strcmp(arg, "--widescreen")) {
-            cfg->widescreen = true;
-        } else if (!strcmp(arg, "--no-widescreen")) {
-            cfg->widescreen = false;
-        } else if (!strcmp(arg, "--aspect") && i + 1 < argc) {
-            const char *value = argv[++i];
-            cfg->aspect = !SDL_strcasecmp(value, "integer") ? 1 :
-                          !SDL_strcasecmp(value, "stretch") ? 2 : 0;
         } else if (!strcmp(arg, "--scanlines") && i + 1 < argc) {
             cfg->scanlines = atoi(argv[++i]);
         } else if (!strcmp(arg, "--brightness") && i + 1 < argc) {
@@ -1103,7 +1125,7 @@ int main(int argc, char **argv) {
         SDL_Quit();
         return 1;
     }
-    glue_set_widescreen(g_cfg.widescreen);
+    glue_set_widescreen(true);
     if (g_cfg.replay[0]) {
         FILE *rf = fopen(g_cfg.replay, "rb");
         if (!rf) {
@@ -1188,6 +1210,10 @@ int main(int argc, char **argv) {
     while (g_running) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) handle_event(&event);
+        if (g_fullscreen_pending && SDL_GetTicks() - g_window_shown_at >= 150) {
+            g_fullscreen_pending = false;
+            set_fullscreen(true);
+        }
 
         if (!g_menu) {
             uint8_t live = read_pad();

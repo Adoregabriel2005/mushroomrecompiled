@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-default_binary="$root/build/linux/app/MushroomRecompiled"
-if [[ -x "$root/MushroomRecompiled" ]]; then default_binary="$root/MushroomRecompiled"; fi
-binary=${MUSHROOM_BINARY:-"$default_binary"}
+binary=${MUSHROOM_BINARY:-"$root/build/linux/app/MushroomRecompiled"}
 [[ -x "$binary" ]] || { echo 'Build first: bash tools/build-linux.sh --rom /path/game.nes' >&2; exit 1; }
 args=(--fullscreen "$@")
 if [[ ${MUSHROOM_PERF_LOG:-0} == 1 ]]; then

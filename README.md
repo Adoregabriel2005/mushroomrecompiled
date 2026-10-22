@@ -69,6 +69,28 @@ cd build
 
 Auxiliary inspection: `node tools/rom.mjs <ROM.nes> [extraction directory]`; parser tests: `node --test tests/rom.test.mjs`.
 
+## Experimental Linux / Steam Deck build
+
+The minimal native SDL2 frontend supports stereo audio, Steam Input-compatible
+controllers, fullscreen, 4:3 / expanded 16:9, PC pause and one quicksave slot.
+Simulation timing is independent of the 30/40/60 FPS presentation limit, with
+bounded catch-up after stalls. The Win32 frontend and Windows build remain.
+
+```sh
+sudo apt-get install build-essential cmake ninja-build pkg-config libsdl2-dev
+bash tools/build-linux.sh --check  # ROM-free compilation and host tests
+bash tools/build-linux.sh --rom '/path/game.nes' --verify
+bash run-steamdeck.sh --rom '/path/game.nes' --fps 40
+```
+
+See [STEAMDECK.md](STEAMDECK.md) for controls, dependencies, optional rotated
+performance logs, canonical ROM SHA-256 and limitations. This is native CPU
+recompilation with emulated NES hardware, not a full native game engine.
+No ROM, generated game C, saves, binaries or Nintendo game assets are added by
+this patch or its ROM-free CI. Users provide their own compatible ROM locally.
+SteamOS compatibility may require rebuilding on the target system; physical
+Steam Deck verification is separate from automated host tests.
+
 ## Credits and licenses
 
 

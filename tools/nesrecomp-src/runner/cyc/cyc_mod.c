@@ -12,6 +12,7 @@
 #include "cyc_trace.h"
 #include "hw_internal.h"
 #include "../../common/nes_fds.h"
+#include "snd_owner.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +23,9 @@
  * watches for it. The routine's RTS dummy-reads $5FFE; the scope undoes that
  * like everything else. */
 #define RETURN_PC 0x5FFFu
+
+/* Owner save area: owner byte + 256 S-indexed slots. */
+static uint8_t s_snd_owner[SND_OWNER_STATE_BYTES];
 
 /* ---- ROM read substitution (cyc_mod.h) ----
  * A cheat set is a handful of entries at most, so a linear scan behind a NULL
@@ -111,6 +115,9 @@ void cyc_mod_set_return_hook(void (*hook)(void)) {
 }
 void cyc_mod_set_ram_read_hook(uint8_t (*hook)(uint16_t pc, uint16_t addr, uint8_t value)) {
     cyc_cpu_ram_read_policy = hook;
+}
+void cyc_mod_set_cart_read_hook(uint8_t (*hook)(uint16_t pc, uint16_t addr, uint8_t value)) {
+    cyc_cpu_cart_read_policy = hook;
 }
 void cyc_mod_allow_isolated_hooks(bool allow) {
     if (!s_open) return;
@@ -223,6 +230,10 @@ bool cyc_mod_isolate_begin(void)
         }
     }
     cyc_snapshot_take(s_snap);
+    /* The voice-set owner is not part of the machine snapshot (smb3pc keeps
+     * it in its own sandbox save); an isolated JSR/RTS pair balances, but
+     * the entry value must survive the scope. */
+    snd_owner_save(s_snd_owner);
     s_open = true;
     s_isolated_hooks = false;
     s_stats.scopes++;
@@ -305,6 +316,7 @@ void cyc_mod_isolate_end(void)
     if (!s_open) return;
     hw_isolated = false;
     cyc_snapshot_restore(s_snap);
+    snd_owner_load(s_snd_owner, sizeof(s_snd_owner), true);
     cyc_ring_muted = 0;
     cyc_trace_enabled = s_trace_was;
     cyc_hooks_suspend(false);

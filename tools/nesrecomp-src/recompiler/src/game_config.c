@@ -162,6 +162,45 @@ static bool game_config_load_toml(GameConfig *cfg, const char *path) {
         }
     }
 
+    /* [[sound_owner]]: JSR entries whose APU writes belong to a voice set. */
+    toml_array_t *sound_owners = toml_array_in(root, "sound_owner");
+    if (sound_owners) for (int i = 0; i < toml_array_nelem(sound_owners) && cfg->sound_owner_count < GAME_CFG_MAX_SOUND_OWNERS; i++) {
+        toml_table_t *t = toml_table_at(sound_owners, i);
+        if (!t) continue;
+        int idx = cfg->sound_owner_count;
+        cfg->sound_owners[idx].addr = toml_hex(t, "addr");
+        const char *owner = toml_string_or(t, "owner", "inherit");
+        if (!strcmp(owner, "music")) cfg->sound_owners[idx].owner = 0;
+        else if (!strcmp(owner, "sfx")) cfg->sound_owners[idx].owner = 1;
+        else if (!strcmp(owner, "both")) cfg->sound_owners[idx].owner = 2;
+        else {
+            fprintf(stderr, "[GameConfig] [[sound_owner]] owner = \"%s\": expected music, sfx or both\n", owner);
+            continue;
+        }
+        if (cfg->sound_owners[idx].addr) cfg->sound_owner_count++;
+    }
+
+    /* [[sound_gate]]: BNE sites whose target is forced to fall through, so
+     * music is not muted while a sound effect shares the channel. */
+    toml_array_t *sound_gates = toml_array_in(root, "sound_gate");
+    if (sound_gates) for (int i = 0; i < toml_array_nelem(sound_gates) && cfg->sound_gate_count < GAME_CFG_MAX_SOUND_GATES; i++) {
+        toml_table_t *t = toml_table_at(sound_gates, i);
+        if (!t) continue;
+        int idx = cfg->sound_gate_count;
+        cfg->sound_gates[idx].addr = toml_hex(t, "addr");
+        cfg->sound_gates[idx].bank = toml_int_or(t, "bank", -1);
+        if (cfg->sound_gates[idx].addr) cfg->sound_gate_count++;
+    }
+
+    /* [sound]: level-load reset and the pause routine's $4015 range. */
+    toml_table_t *sound = toml_table_in(root, "sound");
+    if (sound) {
+        cfg->sound_reset_addr = toml_hex(sound, "reset_addr");
+        cfg->sound_reset_bank = toml_int_or(sound, "reset_bank", -1);
+        cfg->sound_pause_start = toml_hex(sound, "pause_start");
+        cfg->sound_pause_end = toml_hex(sound, "pause_end");
+    }
+
     /* [mapper] */
     toml_table_t *mapper = toml_table_in(root, "mapper");
     if (mapper) {

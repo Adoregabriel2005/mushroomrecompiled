@@ -21,6 +21,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The split line the cartridge's scanline IRQ marked this frame (cyc_core.h
+ * cyc_frame_split_line). Cleared at prerender by hw_ppu.c. */
+int hw_split_line = 240;
+int cyc_frame_split_line(void) { return hw_split_line; }
+
 /* ------------------------------------------------------------------------- */
 /* Bank tables                                                               */
 /* ------------------------------------------------------------------------- */
@@ -399,6 +404,10 @@ static void mmc3_clock_irq(void)
     if (hw_cart.m.irq_counter == 0 || hw_cart.m.irq_reload) hw_cart.m.irq_counter = hw_cart.m.irq_latch;
     else hw_cart.m.irq_counter--;
     if (hw_cart.m.irq_counter == 0 && hw_cart.m.irq_enable) {
+        /* The status bar is the bottom split of the frame, so the last IRQ of
+         * the frame wins: its rows start on the next line (cyc_core.h
+         * cyc_frame_split_line, for a game's own HUD layer). */
+        if (ppu.scanline < 239) hw_split_line = (int)ppu.scanline + 1;
         if (hw_cart.mapper != 48) hw_cart.m.irq_out = 1;
         else if (!hw_cart.m.latch && !hw_cart.m.irq_out) hw_cart.m.latch = TC0690_IRQ_DELAY;
     }

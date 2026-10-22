@@ -87,7 +87,28 @@ uint8_t cyc_render_nametable(uint16_t a)
     return ppu.ciram[(a & 0x3FF) | hw_cart_ciram_a10((uint16_t)(0x2000 | (a & 0xFFF)))];
 }
 
+uint8_t cyc_render_frame_nametable(uint16_t a) { return hw_frame_nt[a & 0xFFF]; }
+
 uint8_t cyc_render_palette(int entry) { return ppu.palette[entry & 31] & 0x3F; }
+
+/* The same fetches through one captured line's own palette and banking, so a
+ * game's layer can rebuild a row the way the PPU drew it (cyc_core.h CycLine). */
+uint8_t cyc_render_line_chr(int y, uint16_t a)
+{
+    const CycLine *l = line(y);
+    return hw_cart.chr[l->chr[(a >> 10) & 7] | (a & 0x3FF)];
+}
+
+uint32_t cyc_render_line_color(int y, int entry)
+{
+    const CycLine *l = line(y);
+    /* The line's own emphasis and greyscale, as the PPU applied them on the way
+     * to the video output (hw_ppu.c output_pixel): $2001 bit 0 clears the low
+     * four bits of every colour. */
+    unsigned emphasis = (l->mask >> 5) & 7;
+    unsigned color = l->pal[entry & 31] & ((l->mask & 1) ? 0x30u : 0x3Fu);
+    return hw_palette_argb[color | emphasis << 6];
+}
 
 uint32_t cyc_render_color(int entry)
 {

@@ -66,3 +66,51 @@ bank = 4
 [[extra_label]]
 addr = 0x8D28
 bank = 14
+
+# Music gates: BNE branches that skip music notes/envelopes while a sound
+# effect shares the channel (prg031.asm E574/E5A7/E625/E660, fixed bank).
+# Removed so music keeps playing under effects; the interpreter sees the same
+# fall-through through a ROM-read override that zeroes the branch offset.
+[[sound_gate]]
+addr = 0xE541
+
+[[sound_gate]]
+addr = 0xE57D
+
+[[sound_gate]]
+addr = 0xE5F3
+
+[[sound_gate]]
+addr = 0xE631
+
+# Music and sound effects use separate Blargg APU voice sets. The cycle
+# backend saves/restores the owner around every JSR/RTS; these entries are the
+# SMB3 routines that select the set (addresses from the disassembly).
+[[sound_owner]]
+addr = 0xA000
+owner = "sfx"          # Sound_Engine_Begin
+[[sound_owner]]
+addr = 0xE34F
+owner = "music"        # Sound_PlayMusic
+[[sound_owner]]
+addr = 0xA449
+owner = "sfx"          # Sound_PlayLevel1
+[[sound_owner]]
+addr = 0xA661
+owner = "sfx"          # Sound_PlayLevel2
+[[sound_owner]]
+addr = 0xA2AB
+owner = "sfx"          # Sound_PlayPlayer
+[[sound_owner]]
+addr = 0xA0A1
+owner = "sfx"          # Sound_PlayMapSounds
+
+[[extra_func]]
+addr = 0xA23D
+bank = 16
+
+[sound]
+reset_addr = 0xA242    # first instruction of the level-init body
+reset_bank = 16
+pause_start = 0xA017   # SndPause
+pause_end = 0xA078     # Sound_Process

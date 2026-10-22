@@ -128,6 +128,7 @@ const uint8_t *cyc_ppu_ciram(size_t *len);
 const uint8_t *cyc_ppu_palette(void);
 const uint8_t *cyc_ppu_oam(void);
 const uint8_t *cyc_chr_ram(size_t *len);
+const uint8_t *cyc_chr_rom(size_t *len);
 
 /* What CPU RAM holds at power-on. The console leaves no defined state; the
  * default is the pattern AccuracyCoin's power-on page reports from the
@@ -196,8 +197,25 @@ const uint16_t *cyc_frame_index(void);
 typedef struct {
     uint16_t v;
     uint8_t  fine_x, ctrl, mask, pad;
+    /* The rest of what the line was drawn from, also at dot 1: palette RAM,
+     * the CHR index each $0400 slot resolved to, and sprite RAM. A game's own
+     * layer can rebuild one of its rows exactly from these, even when the live
+     * palette, banking or OAM have moved on by the time the frame ends. */
+    uint8_t  pal[32];
+    uint32_t chr[8];
+    uint8_t  oam[256];
 } CycLine;
 const CycLine *cyc_frame_lines(void);        /* [240] */
+/* The first row the cartridge's scanline IRQ handed to the status bar in this
+ * frame (the last IRQ of the frame wins, its bar starting on the next line).
+ * 240 when the frame has no split. Observation only. */
+int cyc_frame_split_line(void);
+/* $2000-$2FFF as the PPU mapped it when the frame ended (quadrant q at q *
+ * 0x400): the picture's own nametables. The game's NMI handler rewrites tiles
+ * (level column streaming) as soon as vblank starts, so a layer rebuilt from
+ * state after the frame must read the nametables here, not through the live
+ * CIRAM mapping. Observation only. */
+const uint8_t *cyc_frame_nametables(void);
 /* [256 * 240]: 1 where the background's pixel was opaque (a nonzero pattern
  * value with the background shown there), under any sprite. */
 const uint8_t *cyc_frame_bg_opaque(void);

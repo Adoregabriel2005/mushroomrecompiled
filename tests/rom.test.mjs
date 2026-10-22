@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { inspectRom } from '../tools/rom.mjs';
+import { inspectRom, validateSmb3Rom } from '../tools/rom.mjs';
 
 function fixture(trainer = false) {
   const data = Buffer.alloc(16 + (trainer ? 512 : 0) + 32768 + 8192);
@@ -35,4 +35,20 @@ test('rejeita arquivo truncado, lixo final, mapper errado e NES 2.0', () => {
 test('aceita NES 2.0 MMC3 sem extensões', () => {
   const nes2 = fixture(); nes2[7] = 8;
   assert.equal(inspectRom(nes2).format, 'NES 2.0');
+});
+
+test('o mesmo PRG/CHR em cabeçalhos iNES e NES 2.0 tem os mesmos hashes', () => {
+  const ines = fixture();
+  const nes2 = fixture();
+  nes2[7] = 8;
+  const a = inspectRom(ines);
+  const b = inspectRom(nes2);
+  assert.equal(a.format, 'iNES');
+  assert.equal(b.format, 'NES 2.0');
+  assert.equal(a.prgSha256, b.prgSha256);
+  assert.equal(a.chrSha256, b.chrSha256);
+});
+
+test('validateSmb3Rom rejeita um payload que não é a revisão suportada', () => {
+  assert.throws(() => validateSmb3Rom(fixture()), /Super Mario Bros|revisão suportada|hash/);
 });

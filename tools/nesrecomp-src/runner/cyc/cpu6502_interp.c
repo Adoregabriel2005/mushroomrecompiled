@@ -5,6 +5,7 @@
  * code (<prefix>_cyc.c) is generated from the same templates. Regenerate with
  *   NESRecomp --emit-cycle-interpreter runner/cyc/cpu6502_interp.c */
 #include "cpu6502.h"
+#include "snd_owner.h"
 
 void cpu_interp_step(void) {
     uint16_t pc = cpu.pc;
@@ -326,6 +327,7 @@ void cpu_interp_step(void) {
         cpu_write((uint16_t)(0x100 | cpu.s), (uint8_t)((pc + 2) >> 8), 0);
         cpu_write((uint16_t)(0x100 | (uint8_t)(cpu.s - 1)), (uint8_t)(pc + 2), 0);
         b2 = cpu_read((uint16_t)(pc + 2), CYC_POLL | CYC_DONE);
+        snd_owner_push(cpu.s, 0xFF); /* interpreted call inherits the owner */
         cpu.s = (uint8_t)(cpu.s - 2);
         cpu.pc = (uint16_t)(b1 | b2 << 8);
         return;
@@ -954,6 +956,7 @@ void cpu_interp_step(void) {
         uint8_t hi = cpu_read((uint16_t)(0x100 | (uint8_t)(cpu.s + 2)), 0);
         cpu_read((uint16_t)(lo | hi << 8), CYC_POLL | CYC_DONE);
         cpu.s = (uint8_t)(cpu.s + 2);
+        snd_owner_pop(cpu.s); /* sound owner */
         cpu.pc = (uint16_t)((lo | hi << 8) + 1);
         if (cyc_cpu_rts_observer) cyc_cpu_rts_observer();
         return;

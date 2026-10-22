@@ -83,9 +83,18 @@ uint8_t cyc_render_line_mask(int y);
 const uint8_t *cyc_render_oam(void);              /* 256 bytes */
 uint8_t  cyc_render_chr(uint16_t ppu_addr);       /* $0000-$1FFF */
 uint8_t  cyc_render_nametable(uint16_t ppu_addr); /* $2000-$2FFF */
+/* The same through the frame's own nametables (cyc_core.h
+ * cyc_frame_nametables): what the picture was drawn from, before the game's
+ * NMI handler rewrote tiles for the next one. */
+uint8_t  cyc_render_frame_nametable(uint16_t ppu_addr);
 uint8_t  cyc_render_palette(int entry);           /* palette RAM $3F00 + entry (0-31), 6 bits */
 /* A palette RAM entry as ARGB, with the emphasis the picture's last line had. */
 uint32_t cyc_render_color(int entry);
+/* The same two, through line y's own capture (palette, CHR banking and
+ * emphasis as that line used them), for a game's layer rebuilding a row after
+ * the live state has moved on. */
+uint8_t  cyc_render_line_chr(int y, uint16_t ppu_addr);
+uint32_t cyc_render_line_color(int y, int entry);
 
 /* ---- drawing ---- */
 enum {

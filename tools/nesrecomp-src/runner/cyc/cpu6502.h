@@ -52,9 +52,16 @@ extern void (*cyc_cpu_rts_observer)(void);
  * open bus and all cycles. Only the instruction's RAM data value may change;
  * instruction fetches, dummy reads, RMW and I/O never use this callback. */
 extern uint8_t (*cyc_cpu_ram_read_policy)(uint16_t pc, uint16_t addr, uint8_t value);
+/* The same policy for cartridge work RAM ($6000-$7FFF). It shares the final
+ * data-read site so a cart read keeps the instruction's exact PC, which the
+ * bus-level path cannot: compiled code only keeps the chunk-entry pc. */
+extern uint8_t (*cyc_cpu_cart_read_policy)(uint16_t pc, uint16_t addr, uint8_t value);
 static inline uint8_t cpu_ram_read_value(uint16_t pc, uint16_t addr, uint8_t value) {
-    return addr < 0x2000 && cyc_cpu_ram_read_policy
-        ? cyc_cpu_ram_read_policy(pc, (uint16_t)(addr & 0x7ff), value) : value;
+    if (addr < 0x2000 && cyc_cpu_ram_read_policy)
+        return cyc_cpu_ram_read_policy(pc, (uint16_t)(addr & 0x7ff), value);
+    if (addr >= 0x6000 && addr < 0x8000 && cyc_cpu_cart_read_policy)
+        return cyc_cpu_cart_read_policy(pc, addr, value);
+    return value;
 }
 
 /* Flags for one CPU cycle. */

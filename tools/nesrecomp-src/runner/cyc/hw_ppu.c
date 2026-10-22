@@ -43,6 +43,22 @@ uint8_t  hw_frame_bg[256 * 240];
 const CycLine *cyc_frame_lines(void) { return hw_frame_lines; }
 const uint8_t *cyc_frame_bg_opaque(void) { return hw_frame_bg; }
 
+uint8_t hw_frame_nt[0x1000];
+const uint8_t *cyc_frame_nametables(void) { return hw_frame_nt; }
+
+/* The nametables as the PPU mapped them, captured when the frame ends. The
+ * game's NMI handler rewrites tiles as soon as vblank starts (level column
+ * streaming), so a layer rebuilt from state after the frame has nothing left to
+ * read the picture's own nametable through: this is that view, quadrant q at
+ * offset q * 0x400. Observation only. */
+static void capture_nametables(void)
+{
+    for (int q = 0; q < 4; q++) {
+        unsigned a10 = hw_cart_ciram_a10((uint16_t)(0x2000 + (q << 10))) & 0xC00u;
+        memcpy(hw_frame_nt + q * 0x400, ppu.ciram + a10, 0x400);
+    }
+}
+
 /* cyc_core.h CycLine, at dot 1 of visible line sl. */
 static inline void capture_line(int sl)
 {
@@ -52,6 +68,9 @@ static inline void capture_line(int sl)
     l->ctrl = (uint8_t)(ppu.sprite_table << 3 | ppu.bg_table << 4 | ppu.sprite16 << 5);
     l->mask = (uint8_t)(ppu.greyscale | ppu.show_bg8 << 1 | ppu.show_spr8 << 2 | ppu.show_bg << 3 | ppu.show_spr << 4 |
                         ppu.emphasis << 5);
+    memcpy(l->pal, ppu.palette, sizeof l->pal);
+    for (int i = 0; i < 8; i++) l->chr[i] = hw_cart_chr_index((uint16_t)(i * 0x400)) & ~0x3FFu;
+    memcpy(l->oam, ppu.oam, sizeof l->oam);
 }
 
 /* Dots an open-bus bit of the PPU's CPU-side data bus holds a 1. */
@@ -934,15 +953,22 @@ HW_ALWAYS_INLINE void advance_dot(void)
             hw_extra_timing.active = 0;
             if (++ppu.scanline > hw_prerender_line()) ppu.scanline = 0;
         }
-        if (!hw_extra_timing.active && ppu.scanline == hw_observe_line) hw_observe_hit = hw_frame_done = true;
+        if (!hw_extra_timing.active && ppu.scanline == hw_observe_line) {
+            if (!hw_frame_done) capture_nametables();
+            hw_observe_hit = hw_frame_done = true;
+        }
     }
     if (ppu.scanline >= 241) {
         if (ppu.scanline == 241) {
             if (ppu.dot == 0) ppu.vblank_pending = 1;
-            else if (ppu.dot == 1) hw_frame_done = hw_frame_end_hit = true;
+            else if (ppu.dot == 1) {
+                if (!hw_frame_done) capture_nametables();
+                hw_frame_done = hw_frame_end_hit = true;
+            }
         } else if (ppu.scanline == hw_prerender_line() - 1 && ppu.dot == 340) {
             ppu.odd_frame = !ppu.odd_frame;
         } else if (ppu.scanline == hw_prerender_line() && ppu.dot == 1) {
+            hw_split_line = 240; /* the next frame's split has not happened yet */
             ppu.vblank = 0;
             ppu.can_s0hit = 1;
             ppu.s0hit = 0;
@@ -1547,6 +1573,7 @@ void ppu_power_on(void)
     memcpy(ppu.palette, power_on_palette, sizeof(ppu.palette));
     memset(hw_frame_index, 0, sizeof(hw_frame_index));
     memset(hw_frame_lines, 0, sizeof(hw_frame_lines));
+    memset(hw_frame_nt, 0, sizeof(hw_frame_nt));
     memset(hw_frame_bg, 0, sizeof(hw_frame_bg));
 }
 

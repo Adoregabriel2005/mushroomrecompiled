@@ -4,10 +4,10 @@
 
 ## Widescreen and scene fixes — v1.5
 
-The downloadable version expands the scenery of horizontal stages to a 16:9 canvas without stretching tiles or sprites. The original HUD remains centered, with black bars on the sides. Select **Video > Aspect Ratio > 16:9**; new configurations already use this mode.
+The downloadable version expands the scenery of horizontal stages to a 16:9 canvas without stretching tiles or sprites. The original HUD remains centered, with black bars on the sides. That 16:9 picture is always presented, filling the screen; every picture pixel keeps the same width because the window is a whole multiple of the 426x240 canvas and fullscreen runs in the largest 16:9 display mode that is an exact multiple (1280x720 on a 1080p panel).
 
 The compositor uses the actual stage map. The widescreen mode extends object activation, horizontal culling, and rendering to the 16:9 area; vertical rooms and unsupported scenes remain in native framing. Read the [limits and tests](docs/WIDESCREEN.md). Historical packages remain available with updated download names.
-The current build keeps reward/bonus scenes centered with clean black margins and repairs object seams at the original viewport edges. It extends enemy activation and persistence to the 16:9 area and draws their sprites outside the old clipping region. Retains edge and menu fixes. Remembers the ROM and launches directly; Esc opens the menu during gameplay.
+The current build keeps bonus games and exit transitions centered with clean black margins, while the end-of-level card and run-off stay in the wide frame and follow the camera to the level edge without creating late margin enemies. It repairs object seams at the original viewport edges and extends enemy activation and persistence to the 16:9 area, drawing their sprites outside the old clipping region. Retains edge and menu fixes. Remembers the ROM and launches directly; Esc opens the menu during gameplay.
 
 ## Download and test
 
@@ -26,7 +26,7 @@ Requires Windows x64 and a video/audio device recognized by the system. No minim
 The launcher uses the project identity and the original Underplay image supplied by the project owner. In-window settings: keyboard, controller, video, audio, ROM, Project, and Credits. Apply saves changes; Discard preserves the previous ones.
 
 - Controls: automatic or per-device selection, remapping, dead zone, button test, D-pad and analog. USB/Bluetooth/receivers via SDL2 and SDL_GameControllerDB, based on Windows recognition and pairing.
-- Video: aspect ratio, integer scale/fit/crop, filter, scanlines, brightness, resolution, and borderless fullscreen. 16:9 expands the scenery and object activation range in supported horizontal stages while keeping the original HUD.
+- Video: whole-pixel window scale, scanlines, brightness, and fullscreen in the largest exact-multiple 16:9 display mode. 16:9 expands the scenery and object activation range in supported horizontal stages while keeping the original HUD.
 - Audio: volume, mute, device, 44.1/48/96 kHz, and 20/40/60 ms buffer reserve.
 - Save states: five slots; save/load from the menu.
 
@@ -41,7 +41,7 @@ The launcher uses the project identity and the original Underplay image supplied
 | Fullscreen | F11 | Via menu |
 | Save state slot | 1 to 5 | Via menu |
 
-Specific physical controllers still need retesting. Automated testing uses a virtual SDL joystick; this does not prove compatibility with every model.
+Specific physical controllers still need retesting. Automated testing uses a virtual SDL joystick; this does not prove compatibility with every model. The portable SDL2/Vulkan frontend uses the defaults documented in [PORTABLE.md](docs/PORTABLE.md), including configurable keyboard bindings.
 
 ## Technical status
 
@@ -53,13 +53,44 @@ The following also passed: continuation after save/load, audio at all three samp
 
 ## Building
 
+### Linux: portable SDL2/Vulkan frontend
+
+The native build uses the same engine and generated C blocks. Install CMake,
+Ninja, pkg-config, SDL2, and (optionally) the Vulkan headers, `glslc`, and
+Python 3 for the Vulkan presenter:
+
+```sh
+sudo apt install build-essential cmake ninja-build pkg-config \
+                 libsdl2-dev libvulkan-dev glslc python3
+```
+
+Generate the C blocks once, then build:
+
+```sh
+cmake -S tools/nesrecomp-src/recompiler -B build/recompiler-native \
+      -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build/recompiler-native -j 8
+./build/recompiler-native/NESRecomp "Game.nes" \
+    --game game.toml --cycle-seed-file docs/smb3-cycle-seeds.txt
+
+cmake -S . -B build/native -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build/native -j 8
+./build/native/mushroom-sdl --rom "Game.nes"
+```
+
+If Vulkan or `glslc` is missing, the executable still builds and uses the SDL2
+renderer. See [PORTABLE.md](docs/PORTABLE.md) for options, save-state locations,
+controls, and the current scope.
+
+### Windows
+
 Requires Windows, CMake, LLVM-MinGW/Clang, and mingw32-make in PATH. The first setup downloads the official SDL2 2.30.0 package and verifies its SHA-256.
 
 ```powershell
 .\build-local.ps1 -RomPath "C:\path\GAME NAME.nes"
 ```
 
-The script compiles the NESRecomp generator, produces the C blocks using your ROM and the seeds in docs/smb3-cycle-seeds.txt, and compiles the application. Generated files are not versioned. Output: build/MushroomRecompiled-v1.5.0.exe.
+The script compiles the NESRecomp generator, produces the C blocks using your ROM and the seeds in docs/smb3-cycle-seeds.txt, and compiles the application. Both the goodNES and No-Intro/Rev 1 dumps are accepted: they share the same PRG/CHR payload and differ only in the iNES/NES 2.0 header, so the script validates the payload hashes. Generated files are not versioned. Output: build/MushroomRecompiled-v1.5.0.exe. When SDL2 is available, CMake also builds `build/mushroom-sdl.exe`, the portable frontend described in [PORTABLE.md](docs/PORTABLE.md).
 
 ```powershell
 .\build-local.ps1 -RomPath "Game name.NES" -Verify

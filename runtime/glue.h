@@ -47,9 +47,6 @@ uint64_t glue_frame_count(void);
 /* Save State */
 bool     glue_save_state(const wchar_t *path);
 bool     glue_load_state(const wchar_t *path);
-/* UTF-8 paths on both Windows and POSIX. */
-bool     glue_save_state_utf8(const char *path);
-bool     glue_load_state_utf8(const char *path);
 
 #ifdef __cplusplus
 }

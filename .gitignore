@@ -26,7 +26,6 @@ cycle-misses.txt
 *.zip
 /tools/*
 !/tools/run-hidden.ps1
-!/tools/build-linux.sh
 !/tools/nesrecomp-src/
 /tools/nesrecomp-src/*
 !/tools/nesrecomp-src/common/

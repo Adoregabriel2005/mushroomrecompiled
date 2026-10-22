@@ -6,7 +6,7 @@ try {
     $cmake=(Get-Command cmake -ErrorAction Stop).Source
     if (-not (Test-Path -LiteralPath $RomPath)) { throw "ROM ausente: $RomPath" }
     $rom=(Resolve-Path -LiteralPath $RomPath).Path
-    if ((Get-FileHash -LiteralPath $rom -Algorithm SHA256).Hash -ne '1DDC4B429490E298C05FA70389034107C0CB50F671C7C1BAAA3F228224AFC2E9') { throw 'Esperada ROM USA Rev 1 utilizada pelo projeto.' }
+    if ((Get-FileHash -LiteralPath $rom -Algorithm SHA256).Hash -ne '4377A7F5E6EB50BDD2AC6F249BF1A7085500ACA8EB41F38545C3A2731C51A579') { throw 'Esperada ROM USA Rev 1 utilizada pelo projeto.' }
     New-Item -ItemType Directory -Force $BuildDir | Out-Null
     function Run-Native([string]$Exe,[string]$NativeArguments,[string]$Log) {
         & ./tools/run-hidden.ps1 -Executable $Exe -Arguments $NativeArguments -Log $Log

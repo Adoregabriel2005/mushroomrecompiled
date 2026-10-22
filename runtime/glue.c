@@ -1,5 +1,4 @@
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "portable_path.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,7 +38,7 @@ static bool load_file(FILE *f) {
     if (!image) { fclose(f); return false; }
     bool ok=fread(image,1,(size_t)n,f)==(size_t)n;
     fclose(f);
-    uint32_t crc=crc32(image+16,(size_t)n-16);
+    uint32_t crc=ok ? crc32(image+16,(size_t)n-16) : 0;
     ok=ok && crc==0x2e6301ed && smb3_wide_load(image,(size_t)n) && cyc_load_ines(image,(size_t)n);
     free(image);
     if (!ok) return false;
@@ -49,8 +48,8 @@ static bool load_file(FILE *f) {
     glue_reset();
     return true;
 }
-bool glue_load_rom(const char *p) { return p && load_file(fopen(p,"rb")); }
-bool glue_load_rom_wide(const wchar_t *p) { return p && load_file(_wfopen(p,L"rb")); }
+bool glue_load_rom(const char *p) { return p && load_file(mushroom_fopen_utf8(p,"rb")); }
+bool glue_load_rom_wide(const wchar_t *p) { return p && load_file(mushroom_wfopen(p,L"rb")); }
 bool glue_is_rom_loaded(void) { return loaded; }
 uint32_t glue_get_rom_crc32(void) { return rom_crc; }
 void glue_init(void) { glue_reset(); }
@@ -90,18 +89,18 @@ void glue_set_audio_sample_rate(uint32_t rate) {
 uint32_t glue_audio_sample_rate(void) { return (uint32_t)sample_rate; }
 double glue_frame_rate(void) { return 1.0/cyc_frame_seconds(); }
 uint64_t glue_frame_count(void) { return frames; }
-bool glue_save_state(const wchar_t *path) {
-    if (!loaded || !path) return false;
+static bool save_state_path(const wchar_t *wide_path, const char *utf8_path) {
+    if (!loaded || (!wide_path && !utf8_path)) return false;
     uint8_t *data=NULL; size_t len=0; char error[256];
     if (!cyc_state_save(&data,&len,error,sizeof error)) return false;
-    FILE *f=_wfopen(path,L"wb");
+    FILE *f=wide_path ? mushroom_wfopen(wide_path,L"wb") : mushroom_fopen_utf8(utf8_path,"wb");
     bool ok=f && fwrite(data,1,len,f)==len;
     if (f && fclose(f)) ok=false;
     free(data); return ok;
 }
-bool glue_load_state(const wchar_t *path) {
-    if (!loaded || !path) return false;
-    FILE *f=_wfopen(path,L"rb"); if (!f) return false;
+static bool load_state_file(FILE *f) {
+    if (!f) return false;
+
     if (fseek(f,0,SEEK_END)) { fclose(f); return false; }
     long n=ftell(f);
     if (n<=0 || n>64*1024*1024 || fseek(f,0,SEEK_SET)) { fclose(f); return false; }
@@ -113,3 +112,8 @@ bool glue_load_state(const wchar_t *path) {
     if (ok) {smb3_wide_reset();smb3_enemies_reset();}
     free(data); return ok;
 }
+
+bool glue_save_state(const wchar_t *p) { return save_state_path(p,NULL); }
+bool glue_load_state(const wchar_t *p) { return loaded && p && load_state_file(mushroom_wfopen(p,L"rb")); }
+bool glue_save_state_utf8(const char *p) { return save_state_path(NULL,p); }
+bool glue_load_state_utf8(const char *p) { return loaded && p && load_state_file(mushroom_fopen_utf8(p,"rb")); }

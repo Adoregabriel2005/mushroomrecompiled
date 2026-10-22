@@ -9,8 +9,8 @@ extern "C" {
 
 typedef struct AudioOut AudioOut;
 
-/* Opens the default SDL2 audio device with a queue (no callback), like
- * smb3pc. The device is stereo; input is mono and is duplicated here. */
+/* Opens the default SDL2 audio device with a queue (no callback).
+ * The device is stereo; input is mono and is duplicated here. */
 AudioOut *audio_out_create(int sample_rate, int volume, bool muted);
 void audio_out_destroy(AudioOut *audio);
 void audio_out_push(AudioOut *audio, const int16_t *mono, size_t count);

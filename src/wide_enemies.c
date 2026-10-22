@@ -26,7 +26,7 @@ static bool scene_prev;
 void smb3_wide_level_load(void){load_grace=4;}
 /* One-frame hold for skipped draws: piranha plants skip their drawer every
  * fourth frame, so a fresh isolated capture can be legitimately empty. Like
- * smb3pc's held pieces, the last drawn OAM is repeated once; a second empty
+ * the held pieces, the last drawn OAM is repeated once; a second empty
  * frame shows nothing, as the game does. */
 static int8_t prev_offx[SMB3_OBJECT_SLOTS],prev_offy[SMB3_OBJECT_SLOTS];
 static uint8_t prev_id[SMB3_OBJECT_SLOTS],prev_rec[SMB3_OBJECT_SLOTS];
@@ -103,7 +103,7 @@ static uint8_t held_id[SMB3_OBJECT_SLOTS],held_rec[SMB3_OBJECT_SLOTS];
 bool smb3_enemies_scene(const uint8_t *r){
  int set=r[0x70a],screens=r[0x372]+1;
  /* The hit end card ($7974) and Player_EndLevel ($559) are still the level:
-  * smb3pc widens through both and lets the window follow the run-off. Only
+  * wide mode widens through both and lets the window follow the run-off. Only
   * Level_ExitToMap ($14), the junction reloads, vertical rooms and non-level
   * scenes return to native framing. */
  return set>=1&&set<=14&&set!=7&&!r[0x3ef]&&screens>1&&screens<=15&&
@@ -159,7 +159,7 @@ static uint8_t read_policy(uint16_t pc,uint16_t addr,uint8_t value){
   if(ret==0xccb1||ret==0xd170)return 0;
  }
  /* The delete table alternates right/left distances by Y parity (even rows
-  * carry high byte $01, odd rows $FF). Like smb3pc's delete slack, move each
+  * carry high byte $01, odd rows $FF). Like the delete slack, move each
   * boundary 176 pixels past the matching edge of the expanded viewport, so
   * an object is only removed once it has left the wide picture instead of
   * popping while still on screen. */
@@ -199,7 +199,7 @@ void smb3_enemies_tick(void){
   * Keep the five major slots: never overwrite a live object or trigger an
   * event/controller early. Init runs normally on the next game update.
   * Only records strictly outside the visible picture are created here; they
-  * walk in like smb3pc's widened spawn window. Everything inside is the
+  * walk in like the widened spawn window. Everything inside is the
   * game's own spawner, so nothing ever pops onto the screen. */
  /* Spawn columns: the first 16-pixel column fully past each picture edge.
   * pic_right always starts past the last visible pixel, so x >= pic_right

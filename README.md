@@ -1,113 +1,156 @@
 # Mushroom Recompiled
 
-**The ROM is not included with the project or the ZIP.** Select your compatible copy from the menu. The full game has not yet been validated.
+An experimental, unofficial native port of Super Mario Bros. 3 (USA). The 6502 code is translated to C by NESRecomp and compiled natively; the runtime synchronizes the PPU, APU, DMA and MMC3 mapper.
 
-## Widescreen and scene fixes — v1.5
+**The ROM is not included.** You must supply your own legally obtained copy of Super Mario Bros. 3 (USA, PRG1). The full game has not yet been validated.
 
-The downloadable version expands the scenery of horizontal stages to a 16:9 canvas without stretching tiles or sprites. The original HUD remains centered, with black bars on the sides. That 16:9 picture is always presented, filling the screen; every picture pixel keeps the same width because the window is a whole multiple of the 426x240 canvas and fullscreen runs in the largest 16:9 display mode that is an exact multiple (1280x720 on a 1080p panel).
+## Features
 
-The compositor uses the actual stage map. The widescreen mode extends object activation, horizontal culling, and rendering to the 16:9 area; vertical rooms and unsupported scenes remain in native framing. Read the [limits and tests](docs/WIDESCREEN.md). Historical packages remain available with updated download names.
-The current build keeps bonus games and exit transitions centered with clean black margins, while the end-of-level card and run-off stay in the wide frame and follow the camera to the level edge without creating late margin enemies. It repairs object seams at the original viewport edges and extends enemy activation and persistence to the 16:9 area, drawing their sprites outside the old clipping region. Retains edge and menu fixes. Remembers the ROM and launches directly; Esc opens the menu during gameplay.
+- **Widescreen (16:9):** widens the scenery of horizontal stages without stretching tiles or sprites. The original HUD stays centred with black bars. Vertical rooms, the map and title screens keep the native frame.
+- **Whole-pixel scaling:** every frame is presented on a 426 × 240 canvas at an integer multiple. Fullscreen uses the largest exact 16:9 mode (1280 × 720 on a 1080p panel).
+- **Video:** Vulkan presentation (the only backend), optional scanlines and brightness.
+- **Audio:** 44.1, 48 or 96 kHz output, with volume and mute.
+- **Input:** keyboard and gamepad (SDL_GameControllerDB), with remappable keys.
+- **ROM picker:** load from `--rom`, from a single nearby `.nes` file, or from a picker in the window (drag and drop works). The validated path is remembered.
+- **Saves:** SRAM progress saved automatically, five save-state slots, and session replays.
+- **PC menu:** Esc or the Guide button opens resume, save/load state, fullscreen and quit.
 
-## Download and test
+## Controls
 
-Download the [portable Windows package](https://github.com/Adoregabriel2005/mushroomrecompiled/releases/tag/v1.5.0-exp), extract the complete ZIP, and run **MushroomRecompiled.exe**.
-
-1. Choose **Select ROM**.
-2. Point to the game ROM as a `.nes` file.
-3. After validation, the game starts. On subsequent launches, the remembered ROM is loaded directly.
-
-**Esc** pauses and opens the menu to save, load, continue, configure, or quit. If no ROM is registered, or if the saved file is missing/incompatible, the launcher appears. Direct startup does not automatically load a save state.
-
-Requires Windows x64 and a video/audio device recognized by the system. No minimum requirements certification has been performed. Read the [testing guide](docs/TESTAR.md) and the [settings documentation](docs/INTERFACE.md).
-
-## Interface
-
-The launcher uses the project identity and the original Underplay image supplied by the project owner. In-window settings: keyboard, controller, video, audio, ROM, Project, and Credits. Apply saves changes; Discard preserves the previous ones.
-
-- Controls: automatic or per-device selection, remapping, dead zone, button test, D-pad and analog. USB/Bluetooth/receivers via SDL2 and SDL_GameControllerDB, based on Windows recognition and pairing.
-- Video: whole-pixel window scale, scanlines, brightness, and fullscreen in the largest exact-multiple 16:9 display mode. 16:9 expands the scenery and object activation range in supported horizontal stages while keeping the original HUD.
-- Audio: volume, mute, device, 44.1/48/96 kHz, and 20/40/60 ms buffer reserve.
-- Save states: five slots; save/load from the menu.
-
-| Action | Default keyboard | Default controller |
+| Action | Keyboard | Gamepad |
 |---|---|---|
-| Move | Arrow keys | D-pad / analog |
-| B: run / tail | Z | X / Square |
-| A: jump / fly | X | A / Cross |
-| Select: items | Shift | Back / Share |
-| Start: NES pause | Enter | Start / Options |
-| PC menu | Esc | Home / Guide, remappable |
-| Fullscreen | F11 | Via menu |
-| Save state slot | 1 to 5 | Via menu |
+| Move | Arrow keys | D-pad / left stick |
+| B (run / tail) | Z | B / X |
+| A (jump / fly) | X | A / Y |
+| Select | Left or Right Shift | Back |
+| Start | Enter | Start |
+| PC menu | Esc | Guide |
+| Fullscreen | F11 | — |
+| Mute | F8 | — |
+| Volume | - / = | — |
+| Save / load state | F5 / F7 | — |
+| Save-state slot | 1–5 | — |
+| Save session replay | G | — |
+| Console reset (SRAM kept) | R | — |
 
-Specific physical controllers still need retesting. Automated testing uses a virtual SDL joystick; this does not prove compatibility with every model. The portable SDL2/Vulkan frontend uses the defaults documented in [PORTABLE.md](docs/PORTABLE.md), including configurable keyboard bindings.
+Keys can be remapped with `key_*` entries in `config.ini`.
 
-## Technical status
+## Known limitations
 
-Cycle-accurate NESRecomp backend: 6502 code translated to C and compiled natively, with PPU/APU/DMA/MMC3 synchronized by the runtime.
+- Only the USA revision is supported. goodNES and No-Intro/Rev 1 dumps are accepted because they share the same PRG/CHR payload.
+- Physical controllers and audio devices have not been tested exhaustively.
+- Widescreen does not apply to vertical rooms, the map or title screens.
+- No minimum hardware requirements have been certified.
 
-In the 3,000-frame test script, approximately **99.995% of cycles** ran recompiled code. An instruction crossing a bank boundary uses an interpreted fallback. All 3,000 state hashes matched the interpreted execution under the same hardware model. This validates the translation for that script, not all stages nor independent equivalence with a physical console.
+## Building on Linux
 
-The following also passed: continuation after save/load, audio at all three sample rates, and interface tests (seven pages, apply/discard, and virtual hotplug). Details in [STATUS](docs/STATUS.md).
+Install the build tools, SDL2 and the Vulkan headers. `libvulkan-dev` and `glslc` are required for the frontend; without them only the engine and the verifiers build.
 
-## Building
-
-### Linux: portable SDL2/Vulkan frontend
-
-The native build uses the same engine and generated C blocks. Install CMake,
-Ninja, pkg-config, SDL2, and (optionally) the Vulkan headers, `glslc`, and
-Python 3 for the Vulkan presenter:
+**Debian / Ubuntu**
 
 ```sh
 sudo apt install build-essential cmake ninja-build pkg-config \
                  libsdl2-dev libvulkan-dev glslc python3
 ```
 
-Generate the C blocks once, then build:
+**Fedora**
 
 ```sh
-cmake -S tools/nesrecomp-src/recompiler -B build/recompiler-native \
-      -G Ninja -DCMAKE_BUILD_TYPE=Release
+sudo dnf install gcc-c++ cmake ninja-build pkgconf-pkg-config \
+                 SDL2-devel vulkan-loader-devel glslc python3
+```
+
+**Arch / Manjaro**
+
+```sh
+sudo pacman -S base-devel cmake ninja pkgconf sdl2 vulkan-headers \
+               vulkan-icd-loader shaderc python
+```
+
+**openSUSE**
+
+```sh
+sudo zypper install gcc-c++ cmake ninja pkg-config libSDL2-devel \
+                    vulkan-devel shaderc python3
+```
+
+Package names vary between releases; if one is missing, search your package manager for SDL2 and Vulkan development headers.
+
+Build the project (the ROM is translated into C at build time):
+
+```sh
+cmake -S tools/nesrecomp-src/recompiler -B build/recompiler-native -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build/recompiler-native -j 8
-./build/recompiler-native/NESRecomp "Game.nes" \
-    --game game.toml --cycle-seed-file docs/smb3-cycle-seeds.txt
+./build/recompiler-native/NESRecomp "Game.nes" --game game.toml --cycle-seed-file docs/smb3-cycle-seeds.txt
 
 cmake -S . -B build/native -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build/native -j 8
 ./build/native/mushroom-sdl --rom "Game.nes"
 ```
 
-If Vulkan or `glslc` is missing, the executable still builds and uses the SDL2
-renderer. See [PORTABLE.md](docs/PORTABLE.md) for options, save-state locations,
-controls, and the current scope.
+Run `./build/native/mushroom-sdl --help` for all options.
 
-### Windows
+## Building on Windows
 
-Requires Windows, CMake, LLVM-MinGW/Clang, and mingw32-make in PATH. The first setup downloads the official SDL2 2.30.0 package and verifies its SHA-256.
+You need CMake, LLVM-MinGW (or another Clang/GCC toolchain with `mingw32-make`) on the PATH, PowerShell, and the Vulkan SDK (which provides `glslc`). The first run downloads the official SDL2 2.30.0 development package and verifies its SHA-256.
 
 ```powershell
-.\build-local.ps1 -RomPath "C:\path\GAME NAME.nes"
+.\build-local.ps1 -RomPath "C:\path\Game name.nes"
 ```
 
-The script compiles the NESRecomp generator, produces the C blocks using your ROM and the seeds in docs/smb3-cycle-seeds.txt, and compiles the application. Both the goodNES and No-Intro/Rev 1 dumps are accepted: they share the same PRG/CHR payload and differ only in the iNES/NES 2.0 header, so the script validates the payload hashes. Generated files are not versioned. Output: build/MushroomRecompiled-v1.5.0.exe. When SDL2 is available, CMake also builds `build/mushroom-sdl.exe`, the portable frontend described in [PORTABLE.md](docs/PORTABLE.md).
+This validates the ROM, generates the C code, and builds `build/MushroomRecompiled.exe`. Add `-Verify` to also run the core verifier.
 
-```powershell
-.\build-local.ps1 -RomPath "Game name.NES" -Verify
-cd build
-.\smb3-ui-verify.exe
+## Command-line options
+
+| Option | Meaning |
+|---|---|
+| `--rom FILE` | Load a ROM (otherwise the remembered or nearby ROM is used) |
+| `--scale N` | Window scale 1–8 (default 3) |
+| `--fullscreen` | Start fullscreen |
+| `--scanlines 0\|1\|2` | CRT scanline strength |
+| `--brightness 50-150` | Picture brightness |
+| `--audio-rate 44100\|48000\|96000` | Audio sample rate |
+| `--volume 0-100`, `--mute` | Audio level |
+| `--slot 1-5` | Active save slot |
+| `--menu` | Start paused in the PC menu |
+| `--record FILE` / `--replay FILE` | Record or play raw controller bytes |
+| `--frames N` | Run N frames then exit (smoke test) |
+| `--screenshot PATH`, `--screenshot-frame N` | Write a presented frame as PNG |
+| `--no-vsync` | Disable vsync |
+
+## Where files are stored
+
+- `config.ini`: ROM path, video, audio and key settings. Linux: `~/.local/share/MushroomRecompiled/MushroomRecompiled/`. Windows: `%APPDATA%\MushroomRecompiled\MushroomRecompiled\`.
+- `saves/`: SRAM progress (`smb3.srm`), save states (`state-1.sst` … `state-5.sst`) and replays (`replay-N.rec`) in the same folder.
+
+## Verification
+
+The ROM parser tests need no ROM:
+
+```sh
+node --test tests/rom.test.mjs
 ```
 
-Auxiliary inspection: `node tools/rom.mjs <ROM.nes> [extraction directory]`; parser tests: `node --test tests/rom.test.mjs`.
+The native verifiers take the ROM path as the first argument:
+
+```sh
+./build/native/smb3-verify "Game.nes"
+./build/native/smb3-wide-verify "Game.nes"
+./build/native/smb3-scenes-verify "Game.nes"
+./build/native/smb3-wide-collision-verify "Game.nes"
+```
+
+More detail: [testing guide](docs/TESTING.md), [portable frontend](docs/PORTABLE.md), [widescreen notes](docs/WIDESCREEN.md).
+
+## Disclaimers
+
+- **No Nintendo or SMB3 assets are in this repository.** It contains no ROM, no generated game code, and no graphics, music or sound data from the game. The 6502 code and data are read from your own ROM at build time. Do not share ROMs, generated files or save data.
+- **AI-assisted code.** Parts of this project were written or edited with the help of AI coding tools. The code has been reviewed and tested only to the extent described in the docs. It may contain bugs or behaviour that differs from the original game. Review it before relying on it.
 
 ## Credits and licenses
 
+Beta testers: **ALEISTECH** and **RETROCESSO**.
 
-
-Beta testers: **ALEISTECH** and **RETROCESSO**. Thanks for the testing and bug reports.
-
-Independent, unofficial project. [Branding](docs/BRANDING.md).
-
-The integration code is licensed under MIT. NESRecomp is licensed under **PolyForm Noncommercial 1.0.0**; the MIT license of the interface does not alter the runtime's terms. See [LICENSE_SCOPE](LICENSE_SCOPE.md) and LICENSES. The ROM and generated assets are not published; the release executable contains code and materials derived from the game.
+This is an independent, unofficial project. The integration code is MIT-licensed. NESRecomp is licensed under PolyForm Noncommercial 1.0.0, which is not changed by the MIT license here. The APU audio uses Nes_Snd_Emu 0.1.7 and Blip_Buffer 0.3.3 by Shay Green, licensed under the GNU LGPL (text in `src/audio/nes_apu/LGPL.txt`). See [LICENSE_SCOPE](LICENSE_SCOPE.md) and the `LICENSES` folder. ROMs and generated assets are not published.
 
 [![Powered by Underplay](png.png)](https://underplay.com.br)

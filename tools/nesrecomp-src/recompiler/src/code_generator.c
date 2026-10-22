@@ -4143,7 +4143,7 @@ static void emit_dispatch(FILE *f, const EmittedWrapper *wrappers, int wrapper_c
      * stack-boundary contract requires the 6502 RAM stack to mirror the C
      * call stack, which only holds when every JSR pushes (push_all_jsr). */
     fprintf(f,
-        "/* Interpreter-fallback precondition flag (see runner/src/interp.c). */\n"
+        "/* Interpreter-fallback precondition flag (see runner/cyc/cpu6502_interp.c). */\n"
         "int g_recomp_push_all_jsr = %d;\n\n", cfg->push_all_jsr ? 1 : 0);
 
     /* Forward-declare every dispatch target. The switch below calls these

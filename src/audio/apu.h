@@ -25,8 +25,8 @@ public:
     Apu& operator=(const Apu&) = delete;
 
     void reset();
-    // Select the Blip_Buffer output rate. The default is 48000 Hz, the rate
-    // smb3pc uses. Call between renders; it clears buffered samples.
+    // Select the Blip_Buffer output rate. The default is 48000 Hz.
+    // Call between renders; it clears buffered samples.
     void set_sample_rate(int sample_rate);
     int sample_rate() const;
     // Mid-run reset: silence every oscillator now, discard queued writes and any buffered

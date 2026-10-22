@@ -108,6 +108,6 @@ size_t audio_out_queued(const AudioOut *a) {
 }
 
 size_t audio_out_target(const AudioOut *a) {
-    /* 40 ms stereo S16, the same queue target as smb3pc. */
+    /* 40 ms stereo S16 queue target. */
     return a ? (size_t)(a->sample_rate / 25) * 2u * sizeof(int16_t) : 0;
 }

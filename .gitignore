@@ -13,6 +13,9 @@
 /.agents/
 /.codex/
 config.ini
+/.freebuff/
+/build-dot/
+/.tmp-shots/
 verify-frame*.png
 ui-*.png
 cycle-misses.txt

@@ -1,12 +1,9 @@
 # Portable SDL2/Vulkan frontend
 
-`mushroom-sdl` is the cross-platform frontend. It uses the same NESRecomp
-engine, save-state format, widescreen compositor, and SMB3 payload validation
-as the Windows launcher, but replaces the Win32 shell with SDL2. The presenter
-has a Vulkan path and an SDL2 renderer fallback.
-
-The Windows launcher (`MushroomRecompiled-v1.5.0.exe`) remains available. The
-two frontends share the engine, not their UI code.
+`mushroom-sdl` is the cross-platform frontend. It uses the NESRecomp engine,
+the save-state format, the widescreen compositor and SMB3 payload validation.
+The UI is built on SDL2, and the picture is presented with Vulkan. The Windows build (`build/MushroomRecompiled.exe`) uses the
+same SDL2 frontend.
 
 ## Requirements
 
@@ -17,13 +14,14 @@ sudo apt install build-essential cmake ninja-build pkg-config \
                  libsdl2-dev libvulkan-dev glslc python3
 ```
 
-`libvulkan-dev`, `glslc`, and Python are only needed for the Vulkan presenter.
-Without them the build still succeeds and the frontend uses SDL2.
+`libvulkan-dev`, `glslc`, and Python are required for the frontend: without
+them only the engine and the verifiers build.
 
-Windows: CMake, a C compiler, SDL2 development files, and the Vulkan SDK for
-the Vulkan presenter. `glslc` must be on `PATH` during configuration so the
-shaders can be compiled and embedded. If Vulkan is not available at build or
-run time, the frontend falls back to the SDL2 renderer.
+Windows: CMake, a C compiler, SDL2 development files, and the Vulkan SDK
+(https://vulkan.lunarg.com/sdk/home). `glslc`, shipped with the SDK, must be
+on `PATH` during configuration so the shaders can be compiled and embedded.
+At run time the Vulkan loader (`vulkan-1.dll`) ships with the GPU driver, so
+nothing extra needs redistributing.
 
 ## Generate and build
 
@@ -41,7 +39,7 @@ cmake -S . -B build/native -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build/native -j 8
 ```
 
-The Windows script does the same generation and build in one step:
+The Windows script performs the same generation and build in one step:
 
 ```powershell
 .\build-local.ps1 -RomPath "C:\path\Game.nes"
@@ -56,7 +54,6 @@ The Windows script does the same generation and build in one step:
 Useful options:
 
 ```text
---renderer vulkan|sdl   presentation backend (Vulkan when built with it, SDL2 fallback)
 --scale N               window scale 1-8
 --fullscreen            start fullscreen
 --scanlines 0|1|2
@@ -73,7 +70,7 @@ Useful options:
 --screenshot-frame N    frame to capture (default 1)
 ```
 
-The ROM path and the frontend settings are stored in the platform preference
+The ROM path and frontend settings are stored in the platform preference
 directory:
 
 - Linux: `~/.local/share/MushroomRecompiled/MushroomRecompiled/config.ini`
@@ -83,17 +80,17 @@ Save states live in a `saves/` directory next to that file. Slot files are
 `state-1.sst` through `state-5.sst`. Writes go to a sibling `.tmp` file first
 and are renamed over the target, so a failed or interrupted save does not
 replace a good state with a partial file. The engine does not auto-load a state
-at startup, matching the existing launcher behaviour.
+at startup.
 
 The game's own progress slots live in work RAM, which the cartridge header
-marks non-battery. Like smb3pc, the frontend still persists that window in
+marks non-battery. The frontend still persists that window in
 `saves/smb3.srm`: loaded after the ROM, flushed about once a second while it
 changes and on exit, written through a `.tmp` file and rename. A file of the
 wrong size is reported and never overwritten. Console Reset (R) preserves RAM
 across power-on, so progress survives a reset. Replays never touch the file.
 
 `G` saves the session so far as the first free `saves/replay-N.rec`: raw
-controller bytes, one per emulated frame, like smb3pc's desktop recordings.
+controller bytes, one per emulated frame.
 `--record FILE` streams the same bytes to a file; `--replay FILE` feeds them
 back instead of live input and quits when the recording ends. Save states are
 refused while a replay plays.
@@ -134,10 +131,10 @@ survive restarts.
   scales, brightness, and optional scanlines. It is not a shader-preset system.
   The picture is always the 426x240 16:9 canvas; the window is a whole multiple
   of it and fullscreen uses the largest exact-multiple 16:9 display mode.
-- The portable frontend does not include the Win32 launcher's full settings
-  pages or per-device button remapping UI. It loads `gamecontrollerdb.txt` and
-  uses the standard mapping above; settings such as scale, renderer,
-  volume, sample rate, and slot are persisted in `config.ini`.
+- The frontend has no in-app settings pages and no per-device button remapping
+  UI. It loads `gamecontrollerdb.txt` and uses the standard mapping above;
+  settings such as scale, renderer, volume, sample rate, and slot are persisted
+  in `config.ini`. Keyboard bindings are edited there directly.
 - Music and sound effects run on two Blargg voice sets (music + sfx), routed
   by owner tags the translator emits around the game's sound routines
   (`[[sound_owner]]` in game.toml), with the sfx set reset at every level

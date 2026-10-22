@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 
-/* Exact smb3pc menu skin: peach panel, paper border tiles from CHR bank $5E,
+/* Menu skin: peach panel, paper border tiles from CHR bank $5E,
  * in-game dialog font, red cursor, check/cross markers. The panel is adapted
  * to this launcher's five-row menu and five save slots. */
 typedef struct {

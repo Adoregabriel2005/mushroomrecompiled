@@ -16,7 +16,6 @@ struct Video {
 extern "C" {
 #endif
 
-Video *video_sdl_create(SDL_Window *window, bool vsync);
 Video *video_vulkan_create(SDL_Window *window, bool vsync);
 
 #ifdef __cplusplus

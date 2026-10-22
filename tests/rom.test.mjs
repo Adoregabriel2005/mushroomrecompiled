@@ -10,7 +10,7 @@ function fixture(trainer = false) {
   return data;
 }
 
-test('separa bancos MMC3 e lê vetores do banco fixo', () => {
+test('splits MMC3 banks and reads vectors from the fixed bank', () => {
   const report = inspectRom(fixture());
   assert.equal(report.mapper, 4);
   assert.equal(report.banks.length, 4);
@@ -18,26 +18,26 @@ test('separa bancos MMC3 e lê vetores do banco fixo', () => {
   assert.equal(report.vectors.reset, 0xe00c);
   assert.equal(report.chrOffset, 32784);
 });
-test('trainer altera offsets sem alterar PRG', () => {
+test('trainer shifts offsets without changing PRG', () => {
   const report = inspectRom(fixture(true));
   assert.equal(report.prgOffset, 528);
   assert.equal(report.chrOffset, 33296);
 });
-test('rejeita arquivo truncado, lixo final, mapper errado e NES 2.0', () => {
-  assert.throws(() => inspectRom(Buffer.alloc(16)), /inválido/);
-  assert.throws(() => inspectRom(fixture().subarray(0, -1)), /Tamanho/);
-  assert.throws(() => inspectRom(Buffer.concat([fixture(), Buffer.alloc(1)])), /Tamanho/);
+test('rejects truncated files, trailing junk, wrong mapper and NES 2.0', () => {
+  assert.throws(() => inspectRom(Buffer.alloc(16)), /nvalid/);
+  assert.throws(() => inspectRom(fixture().subarray(0, -1)), /size/i);
+  assert.throws(() => inspectRom(Buffer.concat([fixture(), Buffer.alloc(1)])), /size/i);
   const wrongMapper = fixture(); wrongMapper[6] = 0;
   assert.throws(() => inspectRom(wrongMapper), /Mapper/);
   const nes2 = fixture(); nes2[7] = 8; nes2[9] = 1;
   assert.throws(() => inspectRom(nes2), /NES 2.0/);
 });
-test('aceita NES 2.0 MMC3 sem extensões', () => {
+test('accepts NES 2.0 MMC3 without extensions', () => {
   const nes2 = fixture(); nes2[7] = 8;
   assert.equal(inspectRom(nes2).format, 'NES 2.0');
 });
 
-test('o mesmo PRG/CHR em cabeçalhos iNES e NES 2.0 tem os mesmos hashes', () => {
+test('same PRG/CHR under iNES and NES 2.0 headers has the same hashes', () => {
   const ines = fixture();
   const nes2 = fixture();
   nes2[7] = 8;
@@ -49,6 +49,6 @@ test('o mesmo PRG/CHR em cabeçalhos iNES e NES 2.0 tem os mesmos hashes', () =>
   assert.equal(a.chrSha256, b.chrSha256);
 });
 
-test('validateSmb3Rom rejeita um payload que não é a revisão suportada', () => {
-  assert.throws(() => validateSmb3Rom(fixture()), /Super Mario Bros|revisão suportada|hash/);
+test('validateSmb3Rom rejects a payload that is not the supported revision', () => {
+  assert.throws(() => validateSmb3Rom(fixture()), /Super Mario Bros|supported revision|hash/);
 });

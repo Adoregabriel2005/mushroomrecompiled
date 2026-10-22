@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 
-/* The status bar as its own layer, ported from smb3pc's src/runtime/hud.cpp.
+/* The status bar as its own layer.
  *
  * The cartridge's scanline IRQ marks the split (cyc_frame_split_line, 240 when
  * the frame has none). From there down the picture is rebuilt from the frame's

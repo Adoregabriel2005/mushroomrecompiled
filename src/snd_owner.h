@@ -14,7 +14,7 @@ extern "C" {
  * JSR into a configured sound routine changes the owner; every other call
  * inherits the caller's owner, so shared helpers write for whoever called
  * them. The save/restore slot is the 6502 stack pointer at the call, matching
- * smb3pc's snd_sav[cpu.s].
+ * snd_sav[cpu.s] below.
  */
 enum {
     SND_OWNER_MUSIC = 0,

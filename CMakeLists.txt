@@ -8,7 +8,7 @@ set(RUNNER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/tools/nesrecomp-src/runner")
 set(SDL2_DIR "${RUNNER_ROOT}/external/SDL2")
 include("${RUNNER_ROOT}/cyc/cyc.cmake")
 
-# ---- game translation (like smb3pc: ROM in, C blocks out, at build time) ------
+# ---- game translation (ROM in, C blocks out, at build time) ------
 # The user's own ROM. Both dumps share the PRG/CHR payload and differ only in
 # the iNES header, so both filenames are accepted out of the box.
 set(SMB3_ROM "${CMAKE_SOURCE_DIR}/roms/Super Mario Bros. 3 (U) (PRG1) [!].nes" CACHE FILEPATH
@@ -97,8 +97,8 @@ else()
     endif()
 endif()
 
-if(MUSHROOM_SDL2_FOUND)
-    add_executable(mushroom-sdl src/app_sdl.c src/overlay.c src/video.c src/video_sdl.c src/video_vulkan.cpp src/audio_sdl.c)
+if(MUSHROOM_SDL2_FOUND AND MUSHROOM_HAVE_VULKAN)
+    add_executable(mushroom-sdl src/app_sdl.c src/overlay.c src/video.c src/video_vulkan.cpp src/audio_sdl.c)
     if(WIN32)
         set_target_properties(mushroom-sdl PROPERTIES OUTPUT_NAME MushroomRecompiled)
     endif()
@@ -109,11 +109,9 @@ if(MUSHROOM_SDL2_FOUND)
     endif()
     target_link_libraries(mushroom-sdl PRIVATE smb3-core ${MUSHROOM_SDL2_LIBRARY})
     set_target_properties(mushroom-sdl PROPERTIES LINKER_LANGUAGE CXX)
-    target_compile_definitions(mushroom-sdl PRIVATE MUSHROOM_HAVE_VULKAN=${MUSHROOM_HAVE_VULKAN})
-    if(MUSHROOM_HAVE_VULKAN)
-        target_link_libraries(mushroom-sdl PRIVATE Vulkan::Vulkan)
-        add_dependencies(mushroom-sdl mushroom-shaders)
-    endif()
+    target_compile_definitions(mushroom-sdl PRIVATE MUSHROOM_HAVE_VULKAN=1)
+    target_link_libraries(mushroom-sdl PRIVATE Vulkan::Vulkan)
+    add_dependencies(mushroom-sdl mushroom-shaders)
     if(UNIX)
         target_link_libraries(mushroom-sdl PRIVATE m ${CMAKE_DL_LIBS})
     endif()
@@ -128,7 +126,7 @@ if(MUSHROOM_SDL2_FOUND)
                     "${SDL2_DIR}/lib/x64/SDL2.dll" "$<TARGET_FILE_DIR:mushroom-sdl>")
     endif()
 else()
-    message(STATUS "SDL2 not found: building only the engine and verifiers")
+    message(STATUS "SDL2 or the Vulkan SDK not found: building only the engine and verifiers")
 endif()
 
 # The verifiers and the engine are portable; the launcher below is Win32.

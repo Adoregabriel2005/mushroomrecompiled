@@ -1,4 +1,4 @@
-// Exact smb3pc Vulkan presenter, adapted to SDL2. The 4:3 picture is the
+// Vulkan presenter for SDL2. The 4:3 picture is the
 // 256x240 compose buffer shown cropped to 240 columns (8 pixels of overscan
 // hidden on each side); widescreen is the whole 426x240 compose buffer.
 // Both use the same nearest-filtered fullscreen triangle, FIFO presentation,
@@ -656,7 +656,7 @@ const VideoOps kOps = {vulkan_destroy, vulkan_present, vulkan_name};
 }  // namespace
 
 Video *video_vulkan_create(SDL_Window *window, bool vsync) {
-    (void)vsync;  // FIFO is always vsynced, as in smb3pc.
+    (void)vsync;  // FIFO is always vsynced.
     auto *v = new (std::nothrow) VulkanVideo();
     if (!v) return nullptr;
     v->base.ops = &kOps;

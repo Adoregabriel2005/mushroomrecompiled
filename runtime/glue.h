@@ -55,7 +55,7 @@ bool     glue_load_state_utf8(const char *path);
 
 /* Synthetic battery save: the ROM header sets no battery bit, but the game
  * keeps its progress slots in work RAM ($6000-$7FFF), so persist that window
- * in saves/smb3.srm like smb3pc does. Power-on clears it; the frontend loads
+ * in saves/smb3.srm. Power-on clears it; the frontend loads
  * the file after ROM load and saves when it changes. */
 size_t   glue_sram_size(void);
 bool     glue_sram_export(uint8_t *out, size_t len);

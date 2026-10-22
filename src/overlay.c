@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
-/* Colours follow smb3pc's NES palette choices. The launcher's framebuffer is
+/* Colours follow the project's NES palette choices. The launcher's framebuffer is
  * ARGB8888 (R in the high byte), so the word layout differs from the donor's
  * R-in-low-byte buffer while the visible colours are identical. */
 static uint32_t rgb(uint32_t r, uint32_t g, uint32_t b) {
@@ -121,7 +121,7 @@ static void draw_cursor(OverlayTarget t, int x, int y) {
 }
 
 /* The six-row panel is 30 tiles wide and 21 tiles high. The border uses the
- * same world-map status-strip tiles as smb3pc, mirrored on the left. */
+ * same world-map status-strip tiles, mirrored on the left. */
 #define PANEL_W 240
 #define PANEL_H 168
 #define PANEL_Y ((240 - PANEL_H) / 2)

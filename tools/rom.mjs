@@ -28,10 +28,10 @@ function hash(bytes, offset, length) {
 }
 
 export function inspectRom(data) {
-  if (!Buffer.isBuffer(data)) fail('ROM inválida: esperado um Buffer');
-  if (data.length < 16) fail('Cabeçalho iNES inválido: arquivo menor que 16 bytes');
+  if (!Buffer.isBuffer(data)) fail('Invalid ROM: expected a Buffer');
+  if (data.length < 16) fail('Invalid iNES header: file shorter than 16 bytes');
   for (let i = 0; i < MAGIC.length; i++) {
-    if (data[i] !== MAGIC[i]) fail('Cabeçalho iNES inválido: assinatura NES ausente');
+    if (data[i] !== MAGIC[i]) fail('Invalid iNES header: missing NES signature');
   }
 
   const flags6 = data[6];
@@ -43,11 +43,11 @@ export function inspectRom(data) {
 
   // NES 2.0 console type: 0 = NES/Famicom. The project only supports that.
   if (nes2 && (flags9 & 0x03) !== 0) {
-    fail(`NES 2.0 com console ${flags9 & 0x03} não suportado`);
+    fail(`NES 2.0 console ${flags9 & 0x03} not supported`);
   }
 
   const mapper = (flags6 >> 4) | (flags7 & 0xf0) | (nes2 ? (flags8 & 0x0f) << 8 : 0);
-  if (mapper !== 4) fail(`Mapper ${mapper} não suportado (esperado 4, MMC3)`);
+  if (mapper !== 4) fail(`Mapper ${mapper} not supported (expected 4, MMC3)`);
 
   const trainer = (flags6 & 0x04) ? 512 : 0;
   const prgOffset = 16 + trainer;
@@ -55,9 +55,9 @@ export function inspectRom(data) {
   const chrSize = data[5] * 8192;
   const expected = prgOffset + prgSize + chrSize;
 
-  if (prgSize === 0) fail('ROM inválida: PRG vazio');
+  if (prgSize === 0) fail('Invalid ROM: empty PRG');
   if (data.length !== expected) {
-    fail(`Tamanho do arquivo não corresponde ao cabeçalho (${data.length} != ${expected})`);
+    fail(`File size does not match the header (${data.length} != ${expected})`);
   }
 
   const chrOffset = prgOffset + prgSize;
@@ -90,13 +90,13 @@ export function inspectRom(data) {
 export function validateSmb3Rom(data) {
   const report = inspectRom(data);
   if (report.prgSize !== SMB3_PAYLOAD.prgSize || report.chrSize !== SMB3_PAYLOAD.chrSize) {
-    fail(`ROM não é Super Mario Bros. 3 (USA): PRG/CHR ${report.prgSize}/${report.chrSize}`);
+    fail(`ROM is not Super Mario Bros. 3 (USA): PRG/CHR ${report.prgSize}/${report.chrSize}`);
   }
   if (report.prgSha256 !== SMB3_PAYLOAD.prgSha256) {
-    fail('ROM não é a revisão suportada: hash do PRG difere');
+    fail('ROM is not the supported revision: PRG hash differs');
   }
   if (report.chrSha256 !== SMB3_PAYLOAD.chrSha256) {
-    fail('ROM não é a revisão suportada: hash do CHR difere');
+    fail('ROM is not the supported revision: CHR hash differs');
   }
   return report;
 }
@@ -107,7 +107,7 @@ const invokedDirectly = process.argv[1] &&
 if (invokedDirectly) {
   const [romPath, outDir] = process.argv.slice(2);
   if (!romPath) {
-    console.error('Uso: node tools/rom.mjs <ROM.nes> [diretório de extração]');
+    console.error('Usage: node tools/rom.mjs <ROM.nes> [extract directory]');
     process.exit(2);
   }
   try {

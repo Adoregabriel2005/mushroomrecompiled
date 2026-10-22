@@ -16,7 +16,7 @@ extern "C" {
  * the audible output: one for music and one for sound effects. Generated code
  * tags JSRs into SMB3's sound routines with an owner (snd_owner.h), and every
  * APU write is routed to the matching voice set. The two outputs are summed
- * at full level and clamped, as in smb3pc.
+ * at full level and clamped.
  */
 void cyc_audio_power_on(uint64_t cyc, int sample_rate);
 void cyc_audio_set_sample_rate(int sample_rate);

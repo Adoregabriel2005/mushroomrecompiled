@@ -41,7 +41,7 @@ struct AudioEngine {
         snd_owner_reset();
         // The game enables its channels through the music set at startup.
         // The effect set needs the same enables, or a note written before the
-        // engine's first $4015 write is silent (same as smb3pc).
+        // engine's first $4015 write is silent (as with the music set).
         sfx.write(0x4015, 0x0F, static_cast<int64_t>(cyc));
         pending.clear();
     }

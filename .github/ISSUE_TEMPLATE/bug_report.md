@@ -1,23 +1,23 @@
 ---
-name: Problema no teste
-about: Relatar uma falha reproduzível no SMB3 Recompiled
+name: Test problem
+about: Report a reproducible bug in Mushroom Recompiled
 title: ''
 labels: bug
 assignees: ''
 ---
 
-**Versão do release:**
-**Windows e CPU/GPU:**
-**Dispositivo de áudio:**
-**Controle e conexão (teclado/USB/Bluetooth/receptor):**
+**Release version:**
+**Operating system and CPU/GPU:**
+**Audio device:**
+**Controller and connection (keyboard/USB/Bluetooth/receiver):**
 
-**Como reproduzir:**
+**Steps to reproduce:**
 1.
 2.
 3.
 
-**O que aconteceu / o que era esperado:**
+**What happened / what was expected:**
 
-**Captura, se ajudar:**
+**Screenshot, if helpful:**
 
-Não anexe ROM, saves ou configurações pessoais. Para identificar a ROM, informe somente região/revisão e hash.
+Do not attach a ROM, saves, or personal settings. To identify the ROM, provide only the region/revision and hash.

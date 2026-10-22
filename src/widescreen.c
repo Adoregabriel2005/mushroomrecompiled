@@ -68,7 +68,7 @@ static unsigned terrain_pixel(int wx,int wy,int set) {
  unsigned pixel=((chr[pattern]>>bit)&1)|(((chr[pattern+8]>>bit)&1)<<1);
  return pixel?((tile>>6)*4+pixel):0;
 }
-/* smb3pc overscan: screen columns 0-11 and 244-255 are left to the extra-
+/* Overscan: screen columns 0-11 and 244-255 are left to the extra-
  * column pass, four columns further in than the NES's own 8-pixel blanking,
  * so the half-tile smear at the frame's edge and stale tile fetches never
  * show. Repair those two 12-column strips from the full level map, rather
@@ -117,12 +117,12 @@ const uint32_t *smb3_wide_present(const uint32_t *native) {
   * Horizontal multi-screen levels have a fully expanded block map in SRAM. */
  bool playable=tables_ok&&captured&&smb3_enemies_scene(ram)&&
   (cyc_render_line_mask(8)&0x08);
- /* The status bar as its own layer (hud.c, after smb3pc's hud.cpp): the frame
+ /* The status bar as its own layer (hud.c): the frame
   * is the layer's picture, the rows from the split down rebuilt from the
   * frame's own captures, so no stripe of playfield backdrop or card colour
   * shows above the bar. The level's rows between the split and the bar's first
   * row keep their own capture and are treated as playfield - the ground runs
-  * on beside the bar, up to the bar's own first row (smb3pc's bar_top). */
+  * on beside the bar, up to the bar's own first row (bar_top). */
  static uint32_t bar[SMB3_WIDE_HEIGHT*256];
  smb3_hud_compose(native,bar);
  int bar_top=smb3_hud_top();if(bar_top>240)bar_top=240;
@@ -141,8 +141,8 @@ const uint32_t *smb3_wide_present(const uint32_t *native) {
     canvas[y*426+x]=colors[pixel];
    }
    /* The layer's picture with its overscan columns cropped, pasted at the
-    * frame's own position; only the columns outside it are composed here (as
-    * smb3pc pastes framebuf after hud_compose). Keep the native center, but
+    * frame's own position; only the columns outside it are composed here (the
+    * composed frame is pasted after hud_compose). Keep the native center, but
     * leave both 12-column edge bands supplied by the complete map. They may
     * contain stale PPU tiles or attributes. */
    for(int y=0;y<bar_top;y++)memcpy(canvas+y*426+origin+WIDE_CROP,bar+y*256+WIDE_CROP,WIDE_VISIBLE*sizeof(uint32_t));

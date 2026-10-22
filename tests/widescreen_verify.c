@@ -46,7 +46,7 @@ int main(int argc,char **argv){
    if(cyc_mem_state_hash()!=before){fprintf(stderr,"Sprite drawing changed live machine\n");return 11;}
    if(!glue_save_state(L"verify-wide-enemies.bin"))return 12;
   }
-  /* The status bar is its own layer (hud.c, after smb3pc's hud.cpp): the rows
+  /* The status bar is its own layer (hud.c): the rows
    * the split stages are drawn from the bar's settled row, and every other
    * HUD row is the machine's own, pixel for pixel. A staged row must continue
    * the bar - the same background its settled row shows - not the playfield

@@ -1,8 +1,8 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
-/* One drawer piece, positioned relative to its object's world origin (like
- * smb3pc's WidePiece): drawer output is scroll-independent, so the margin
+/* One drawer piece, positioned relative to its object's world origin:
+ * drawer output is scroll-independent, so the margin
  * copy lands exactly where the frame's own draw put it - no per-frame
  * offset search to jitter. slot keeps the frame's OAM order so overlapping
  * margin sprites keep hardware priority. */

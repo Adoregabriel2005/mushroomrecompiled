@@ -32,7 +32,6 @@ typedef struct {
     bool muted;
     bool vsync;
     int scale;
-    int renderer; /* 0 = SDL2, 1 = Vulkan */
     int scanlines;
     int brightness;
     int volume;
@@ -94,14 +93,9 @@ enum { MENU_COUNT = (int)(sizeof(MENU_ITEMS) / sizeof(MENU_ITEMS[0])) };
 static void config_defaults(Config *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->scale = 3;
-#if defined(MUSHROOM_HAVE_VULKAN) && MUSHROOM_HAVE_VULKAN
-    cfg->renderer = 1;
-#else
-    cfg->renderer = 0;
-#endif
     cfg->scanlines = 0;
     cfg->brightness = 100;
-    cfg->volume = 100; /* smb3pc has no volume control: always full level */
+    cfg->volume = 100; /* the engine has no volume control: always full level */
     cfg->audio_rate = 48000;
     cfg->slot = 1;
     cfg->vsync = true;
@@ -454,8 +448,6 @@ static void config_load(Config *cfg, const char *path) {
                 else if (!SDL_strcasecmp(key, "muted")) cfg->muted = parse_bool(value);
                 else if (!SDL_strcasecmp(key, "vsync")) cfg->vsync = parse_bool(value);
                 else if (!SDL_strcasecmp(key, "scale")) cfg->scale = atoi(value);
-                else if (!SDL_strcasecmp(key, "renderer"))
-                    cfg->renderer = !SDL_strcasecmp(value, "sdl") ? 0 : 1;
                 else if (!SDL_strcasecmp(key, "scanlines")) cfg->scanlines = atoi(value);
                 else if (!SDL_strcasecmp(key, "brightness")) cfg->brightness = atoi(value);
                 else if (!SDL_strcasecmp(key, "volume")) cfg->volume = atoi(value);
@@ -511,7 +503,6 @@ static void config_save(const Config *cfg) {
                      "muted=%d\n"
                      "vsync=%d\n"
                      "scale=%d\n"
-                     "renderer=%s\n"
                      "scanlines=%d\n"
                      "brightness=%d\n"
                      "volume=%d\n"
@@ -527,7 +518,6 @@ static void config_save(const Config *cfg) {
                      "key_right=%s\n",
                      cfg->rom, cfg->fullscreen ? 1 : 0,
                      cfg->muted ? 1 : 0, cfg->vsync ? 1 : 0, cfg->scale,
-                     cfg->renderer ? "vulkan" : "sdl",
                      cfg->scanlines, cfg->brightness, cfg->volume, cfg->audio_rate, cfg->slot,
                      key_a, key_b, key_select, key_start, key_up, key_down, key_left, key_right);
     if (n > 0) SDL_RWwrite(rw, text, 1, (size_t)n);
@@ -564,7 +554,7 @@ static void load_slot(int slot) {
     else notify("LOAD SLOT %d FAILED", slot);
 }
 
-/* Session replay: one controller byte per emulated frame, raw like smb3pc.
+/* Session replay: one raw controller byte per emulated frame.
  * Paused menu frames never step the machine, so they are never recorded.
  * Replays start at boot and never touch the real save file; save states are
  * refused while one plays. */
@@ -880,43 +870,21 @@ static bool present_frame(void) {
 }
 
 static bool init_video(int fw, int fh) {
-    bool want_vulkan = g_cfg.renderer != 0;
-    Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
-    if (want_vulkan) flags |= SDL_WINDOW_VULKAN;
     g_window = SDL_CreateWindow("Mushroom Recompiled", SDL_WINDOWPOS_CENTERED,
                                 SDL_WINDOWPOS_CENTERED, fw * g_cfg.scale,
-                                fh * g_cfg.scale, flags);
-    if (!g_window && want_vulkan) {
-        fprintf(stderr, "video: Vulkan window failed, falling back to SDL2: %s\n", SDL_GetError());
-        want_vulkan = false;
-        g_cfg.renderer = 0;
-        g_window = SDL_CreateWindow("Mushroom Recompiled", SDL_WINDOWPOS_CENTERED,
-                                    SDL_WINDOWPOS_CENTERED, fw * g_cfg.scale,
-                                    fh * g_cfg.scale, flags & ~SDL_WINDOW_VULKAN);
-    }
+                                fh * g_cfg.scale,
+                                SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_VULKAN);
     if (!g_window) {
-        fprintf(stderr, "video: SDL_CreateWindow failed: %s\n", SDL_GetError());
+        fprintf(stderr, "video: SDL_CreateWindow (Vulkan) failed: %s\n", SDL_GetError());
         return false;
     }
     SDL_SetWindowMinimumSize(g_window, SMB3_WIDE_WIDTH, 240);
-    g_video = video_create(g_window, want_vulkan ? VIDEO_BACKEND_VULKAN : VIDEO_BACKEND_SDL,
-                           g_cfg.vsync);
-    if (!g_video && want_vulkan) {
-        fprintf(stderr, "video: Vulkan unavailable, falling back to SDL2\n");
+    g_video = video_create(g_window, g_cfg.vsync);
+    if (!g_video) {
+        fprintf(stderr, "video: Vulkan presenter failed to start "
+                        "(no Vulkan-capable GPU/driver found)\n");
         SDL_DestroyWindow(g_window);
         g_window = NULL;
-        g_cfg.renderer = 0;
-        g_window = SDL_CreateWindow("Mushroom Recompiled", SDL_WINDOWPOS_CENTERED,
-                                    SDL_WINDOWPOS_CENTERED, fw * g_cfg.scale,
-                                    fh * g_cfg.scale, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
-        if (g_window) {
-            SDL_SetWindowMinimumSize(g_window, SMB3_WIDE_WIDTH, 240);
-            g_video = video_create(g_window, VIDEO_BACKEND_SDL, g_cfg.vsync);
-        }
-        if (g_video) notify("VULKAN UNAVAILABLE - USING SDL2");
-    }
-    if (!g_video) {
-        fprintf(stderr, "video: no renderer available\n");
         return false;
     }
     char title[128];
@@ -931,7 +899,6 @@ static bool init_video(int fw, int fh) {
 
 static void usage(const char *argv0) {
     printf("Usage: %s --rom GAME.NES [options]\n"
-           "  --renderer vulkan|sdl   presentation backend (default vulkan with SDL2 fallback)\n"
            "  --scale N               window scale 1-8 (default 3)\n"
            "  --fullscreen            start fullscreen\n"
            "  --scanlines 0|1|2       CRT scanline strength\n"
@@ -964,12 +931,8 @@ static bool parse_args(Config *cfg, int *frame_limit, bool *help, int argc, char
             snprintf(cfg->rom, sizeof(cfg->rom), "%s", argv[++i]);
         } else if (!strcmp(arg, "--scale") && i + 1 < argc) {
             cfg->scale = atoi(argv[++i]);
-        } else if (!strcmp(arg, "--renderer") && i + 1 < argc) {
-            cfg->renderer = !SDL_strcasecmp(argv[++i], "sdl") ? 0 : 1;
-        } else if (!strcmp(arg, "--sdl")) {
-            cfg->renderer = 0;
         } else if (!strcmp(arg, "--vulkan")) {
-            cfg->renderer = 1;
+            /* Accepted for compatibility: Vulkan is now the only presenter. */
         } else if (!strcmp(arg, "--fullscreen")) {
             cfg->fullscreen = true;
         } else if (!strcmp(arg, "--scanlines") && i + 1 < argc) {

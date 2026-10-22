@@ -1,9 +1,8 @@
 #include "video_internal.h"
 
-Video *video_create(SDL_Window *window, VideoBackend backend, bool vsync) {
+Video *video_create(SDL_Window *window, bool vsync) {
     if (!window) return NULL;
-    if (backend == VIDEO_BACKEND_VULKAN) return video_vulkan_create(window, vsync);
-    return video_sdl_create(window, vsync);
+    return video_vulkan_create(window, vsync);
 }
 
 void video_destroy(Video *video) {

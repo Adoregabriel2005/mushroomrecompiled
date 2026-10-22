@@ -1,4 +1,4 @@
-/* The status bar as its own layer: a port of smb3pc's src/runtime/hud.cpp.
+/* The status bar as its own layer.
  *
  * The frame is two layers with one boundary between them, not a per-row
  * reconstruction of the game's writes. The cartridge's scanline IRQ marks where
@@ -25,13 +25,13 @@
  * OAM. The nametables come from cyc_frame_nametables(), the mapping the picture
  * was drawn with: by the time this pass runs the live palette and banking have
  * moved on, and the game's NMI handler has already rewritten tiles (level
- * column streaming) for the next frame. The row renderer is the
- * reference's - background fetched one tile at a time, sprites evaluated for the
+ * column streaming) for the next frame. The row renderer mirrors the hardware -
+ * background fetched one tile at a time, sprites evaluated for the
  * row from the bar's snapshot and composited over the finished row, first sprite
  * with a pixel winning, background priority, the left-column clip and greyscale,
  * all as the hardware applies them.
  *
- * The layer keeps the picture in hud.cpp's cache: hud_matches() compares the
+ * The layer keeps the picture in its own cache: hud_matches() compares the
  * state the picture was built from (the split, the two boundary rows, the
  * anchor's scroll and OAM, the frame's nametables, and every row's scroll,
  * $2000/$2001, palette and CHR banking), and hud_build() runs only when that
@@ -96,7 +96,7 @@ uint64_t smb3_hud_builds(void) { return s_builds; }
 
 int smb3_hud_top(void) { return s_first >= 0 ? s_first : s_split; }
 
-/* smb3pc's `on`: the line had rendering enabled. A line without it belongs to
+/* The capture's `on`: the line had rendering enabled. A line without it belongs to
  * the per-dot pass, whose backdrop the layer must not paint over. */
 static int rendering_on(const CycLine *l) { return (l->mask & 0x18) != 0; }
 

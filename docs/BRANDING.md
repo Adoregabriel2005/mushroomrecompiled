@@ -1,9 +1,9 @@
-# Identidade do projeto
+# Project identity
 
-Mushroom Recompiled é o nome escolhido pelo responsável pelo projeto.
+Mushroom Recompiled is the name chosen by the project maintainer.
 
-A imagem png.png foi fornecida pelo usuário e copiada sem alteração. O arquivo é usado no launcher e no final do README, com link para https://underplay.com.br . Os direitos dessa identidade permanecem com seus titulares; o arquivo não é relicenciado sob MIT.
+The image png.png was supplied by the user and copied without modification. The file is used in the launcher and at the end of the README, with a link to https://underplay.com.br . The rights to this identity remain with their holders; the file is not relicensed under MIT.
 
-Não há artes de divulgação, capas, ícones ou capturas do jogo nos arquivos atuais do projeto ou no novo pacote. A ROM compatível deve ser fornecida por quem vai jogar. Os pacotes históricos foram preservados por solicitação do responsável e podem manter o conteúdo antigo.
+There is no promotional artwork, covers, icons, or game screenshots in the current project files or the new package. A compatible ROM must be supplied by whoever plays the game. Historical packages were preserved at the maintainer's request and may keep their earlier content.
 
-Beta testers: ALEISTECH e RETROCESSO.
+Beta testers: ALEISTECH and RETROCESSO.

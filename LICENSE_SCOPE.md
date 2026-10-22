@@ -1,12 +1,13 @@
-# Escopo das licenças
+# License scope
 
-A licença MIT na raiz cobre o código próprio de integração e interface deste projeto. Ela não substitui licenças de terceiros e não licencia o jogo da Nintendo.
+The MIT license in the root covers this project's own integration and interface code. It does not replace third-party licenses and does not license the Nintendo game.
 
-- NESRecomp, em tools/nesrecomp-src: PolyForm Noncommercial 1.0.0, copyright Matthew Stanley. Texto integral em tools/nesrecomp-src/LICENSE. O executável inclui esse runtime; a licença MIT da interface não autoriza uso comercial do conjunto.
-- SDL2 e SDL_GameControllerDB: zlib, textos em LICENSES.
-- emu2413: MIT, texto em LICENSES/emu2413.txt e no diretório vendor.
-- Identidade Underplay: arquivo fornecido pelo responsável, utilizado sem alteração; os direitos permanecem com seus titulares. Consulte docs/BRANDING.md. Nenhuma arte promocional do jogo integra os arquivos atuais ou o novo pacote. Pacotes históricos preservados podem conter materiais de terceiros sob seus direitos originais.
+- NESRecomp, in tools/nesrecomp-src: PolyForm Noncommercial 1.0.0, copyright Matthew Stanley. Full text in tools/nesrecomp-src/LICENSE. The executable includes this runtime; the MIT license of the interface does not authorize commercial use of the combined work.
+- SDL2 and SDL_GameControllerDB: zlib, texts in LICENSES.
+- emu2413: MIT, text in LICENSES/emu2413.txt and in the vendor directory.
+- Nes_Snd_Emu 0.1.7 and Blip_Buffer 0.3.3 by Shay Green (copyright 2003-2005), used for the APU audio in src/audio/nes_apu: GNU LGPL. Full text in src/audio/nes_apu/LGPL.txt.
+- Underplay identity: file supplied by the project maintainer, used without modification; rights remain with their holders. See docs/BRANDING.md. No promotional game artwork is part of the current files or the new package. Preserved historical packages may contain third-party materials under their original rights.
 
-A ROM, os saves e os fontes gerados a partir da ROM não são versionados. O usuário fornece sua ROM para gerar o código localmente. O release de teste inclui o executável compilado, mas não o arquivo .nes. A ausência da ROM no ZIP não significa ausência de código ou materiais derivados do jogo no executável.
+The ROM, saves, and source files generated from the ROM are not versioned. The user supplies their own ROM to generate the code locally. The test release includes the compiled executable but not the .nes file. The absence of the ROM from the ZIP does not mean the executable contains no code or derived material from the game.
 
-A referência de experiência é Mônica no Castelo do Dragão Recomp, de Adoregabriel2005. Não foi substituída a licença dos projetos ou materiais de referência.
+The experience reference is Mônica no Castelo do Dragão Recomp, by Adoregabriel2005. The licenses of those projects and reference materials were not replaced.

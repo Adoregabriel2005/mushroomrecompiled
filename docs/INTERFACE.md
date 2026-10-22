@@ -1,14 +1,14 @@
-# Interface e controles
+# Interface and controls
 
-O programa é um binário único: dois cliques iniciam o jogo direto. Sem `--rom` e sem ROM lembrada, um único `.nes` próximo (ao lado do app, no diretório atual ou em `roms/`) abre direto; com zero ou vários, abre um seletor dentro da janela (setas/Enter, gamepad, ou arrastar o arquivo para a janela). A ROM usada é validada e lembrada por caminho absoluto em `config.ini` para as próximas aberturas.
+The program is a single binary: double-clicking it starts the game directly. Without `--rom` and without a remembered ROM, a single `.nes` file next to the app, in the current directory, or in `roms/` opens directly. With zero or several candidates, a picker opens inside the window (arrow keys/Enter, gamepad, or drag a file onto the window). The ROM in use is validated and remembered by absolute path in `config.ini` for later launches.
 
-- Teclado: setas, X = A, Z = B, Shift = Select, Enter = Start. Tudo remapeável via `key_*` em `config.ini`.
-- Menu do PC (Esc ou botão Guide): RESUME, SAVE STATE, LOAD STATE, FULLSCREEN, QUIT. Navega com setas/WASD ou D-pad; Enter/Espaço/A/Start ativa, B fecha.
-- Atalhos: F5 salva, F7 carrega, 1–5 trocam o slot de save state. F11 alterna tela cheia, F8 mudo, -/= volume. G grava a sessão em `saves/replay-N.rec`. R é o Reset do console (mantém a SRAM).
-- Controle: abertura automática com hotplug; D-pad e analógico esquerdo (zona morta ~12000); A/B/X/Y, Back = Select, Start = Start. Guide abre o menu.
-- Vídeo: `--renderer vulkan|sdl` (Vulkan com fallback para SDL2), `--scale 1-8`, `--scanlines`, `--brightness 50-150`, tela cheia. O quadro é sempre o canvas 16:9 de 426 × 240 e a janela é um múltiplo inteiro dele, então todo pixel da imagem ocupa a mesma largura. Na tela cheia o jogo usa o maior modo 16:9 cuja altura é múltipla de 240 — 1280 × 720 num painel 1080p — e o compositor amplia essa superfície até preencher a tela. 16:9 amplia o cenário horizontal com HUD original centralizado; salas verticais e cenas voltam ao quadro nativo.
-- Áudio: volume, mudo, `--audio-rate 44100|48000|96000`. Saída NES mono nos dois canais.
-- Persistência: `config.ini` guarda ROM, vídeo, áudio e teclas. Progresso em `saves/smb3.srm` (janela $6000–$7FFF), save states em `saves/state-1..5.sst`.
-- Linha de comando: `--record/--replay` (1 byte de controle por quadro), `--frames N` e `--screenshot` para testes, `--menu` inicia pausado, `--slot 1-5`, `--no-vsync`, `--help` lista tudo.
+- Keyboard: arrow keys, X = A, Z = B, Shift = Select, Enter = Start. Everything is remappable through `key_*` in `config.ini`.
+- PC menu (Esc or the Guide button): RESUME, SAVE STATE, LOAD STATE, FULLSCREEN, QUIT. Navigate with the arrow keys/WASD or the D-pad; Enter/Space/A/Start activates, B closes.
+- Shortcuts: F5 saves, F7 loads, 1–5 select the save-state slot. F11 toggles fullscreen, F8 mutes, -/= adjust volume. G writes the session to `saves/replay-N.rec`. R is the console Reset (SRAM is kept).
+- Gamepad: opened automatically with hotplug support. D-pad and left stick (dead zone ~12000); A/Y = NES A, B/X = NES B, Back = Select, Start = Start. Guide opens the menu.
+- Video: `--scale 1-8`, `--scanlines`, `--brightness 50-150`, fullscreen. The frame is always the 16:9 canvas of 426 × 240, and the window is an integer multiple of it, so every image pixel has the same width. In fullscreen the game uses the largest 16:9 mode whose height is a multiple of 240 — 1280 × 720 on a 1080p panel — and the compositor scales that surface to fill the screen. 16:9 widens the horizontal scenery with the original HUD centred; vertical rooms and scenes return to the native frame.
+- Audio: volume, mute, `--audio-rate 44100|48000|96000`. The NES output is mono on both channels.
+- Persistence: `config.ini` stores the ROM, video, audio and key settings. Progress is kept in `saves/smb3.srm` (window $6000–$7FFF); save states are in `saves/state-1..5.sst`.
+- Command line: `--record/--replay` (one control byte per frame), `--frames N` and `--screenshot` for testing, `--menu` starts paused, `--slot 1-5`, `--no-vsync`. `--help` lists everything.
 
-Ver a composição 16:9 e a ativação de inimigos em 1-1 em WIDESCREEN.md. Limitações e garantias do build em PORTABLE.md.
+See [WIDESCREEN.md](WIDESCREEN.md) for the 16:9 composition and 1-1 enemy activation. See [PORTABLE.md](PORTABLE.md) for build guarantees and limitations.

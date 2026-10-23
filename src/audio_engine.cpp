@@ -56,6 +56,13 @@ struct AudioEngine {
     void write(uint16_t addr, uint8_t value, uint64_t cyc) {
         const int64_t now = static_cast<int64_t>(cyc);
         const uint8_t owner = snd_owner_current();
+        // The enables register ($4015) is routed by owner, but a write that
+        // clears every channel is a "stop everything" gesture: the map's
+        // level-entry halt writes $4015=$00 from the sfx side, and if it did
+        // not reach both sets the music set would keep its last map note
+        // ringing through the whole transition into the level. (The pause
+        // writes are wrapped in SND_OWNER_BOTH by codegen; the $0F that
+        // usually follows a halt stays per-owner.)
         if (addr == 0x4017 || owner == SND_OWNER_BOTH ||
             (addr == 0x4015 && value == 0x00 && owner == SND_OWNER_SFX)) {
             music.write(addr, value, now);

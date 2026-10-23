@@ -60,7 +60,8 @@ static void draw_tile(OverlayTarget t, int x, int y, const uint8_t *chr, FontTil
 
 #define ADVANCE 9
 
-static void draw_gametext(OverlayTarget t, int x, int y, const char *text, const uint8_t *chr) {
+static void draw_gametext_color(OverlayTarget t, int x, int y, const char *text,
+                                const uint8_t *chr, uint32_t color) {
     if (!chr) return;
     for (int pass = 0; pass < 2; pass++) {
         int gx = x;
@@ -80,10 +81,14 @@ static void draw_gametext(OverlayTarget t, int x, int y, const char *text, const
                     }
                 }
             } else {
-                draw_tile(t, gx, y, chr, ft, K_PAPER, 0, 0, 0);
+                draw_tile(t, gx, y, chr, ft, color, 0, 0, 0);
             }
         }
     }
+}
+
+static void draw_gametext(OverlayTarget t, int x, int y, const char *text, const uint8_t *chr) {
+    draw_gametext_color(t, x, y, text, chr, K_PAPER);
 }
 
 static int gametext_width(const char *text) { return (int)strlen(text) * ADVANCE; }
@@ -120,55 +125,184 @@ static void draw_cursor(OverlayTarget t, int x, int y) {
     }
 }
 
-/* The six-row panel is 30 tiles wide and 21 tiles high. The border uses the
- * same world-map status-strip tiles, mirrored on the left. */
-#define PANEL_W 240
-#define PANEL_H 168
-#define PANEL_Y ((240 - PANEL_H) / 2)
+/* The menu panel is 41 tiles wide with a dynamic height; the border uses
+ * the same world-map status-strip tiles, mirrored on the left. */
+#define MENU_PANEL_W 328
 
-static void draw_panel(OverlayTarget t, int x0, int y0, uint32_t fill, const uint8_t *chr) {
+static int tab_row_count(int tab) {
+    switch (tab) {
+        case TAB_VIDEO: return 4;
+        case TAB_AUDIO: return 1;
+        case TAB_GAME: return 3;
+        case TAB_CONTROLS: return 8;
+        case TAB_SYSTEM: return 2;
+        default: return 0;
+    }
+}
+
+static const char *menu_row_label(int tab, int row) {
+    switch (tab) {
+        case TAB_VIDEO:
+            if (row == 0) return "FULLSCREEN";
+            if (row == 1) return "WIDESCREEN";
+            if (row == 2) return "FPS COUNTER";
+            return "SCANLINES";
+        case TAB_AUDIO:
+            return "VOLUME";
+        case TAB_GAME:
+            if (row == 0) return "SAVE STATE";
+            if (row == 1) return "LOAD STATE";
+            return "SLOT";
+        case TAB_CONTROLS:
+            if (row == 0) return "A";
+            if (row == 1) return "B";
+            if (row == 2) return "SELECT";
+            if (row == 3) return "START";
+            if (row == 4) return "UP";
+            if (row == 5) return "DOWN";
+            if (row == 6) return "LEFT";
+            return "RIGHT";
+        default:
+            return row == 0 ? "RESUME" : "QUIT";
+    }
+}
+
+/* Small left/right triangles flanking an adjustable value. */
+static void draw_arrow(OverlayTarget t, int x, int y, int dir, uint32_t color) {
+    for (int row = 0; row < 7; row++) {
+        int half = row < 4 ? row : 6 - row;
+        for (int i = 0; i <= half; i++)
+            put(t, x + (dir > 0 ? i : -i), y + row, color);
+    }
+}
+
+static void draw_panel(OverlayTarget t, int x0, int y0, int w, int h, uint32_t fill,
+                       const uint8_t *chr) {
     const FontTile top = {0x5E, 0x21}, bottom = {0x5E, 0x24};
     const FontTile left = {0x5E, 0x26}, right = {0x5E, 0x27};
     const FontTile top_corner = {0x5E, 0x22}, bottom_corner = {0x5E, 0x25};
-    fill_rect(t, x0, y0, PANEL_W, PANEL_H, fill);
-    for (int x = x0 + 8; x < x0 + PANEL_W - 8; x += 8) {
+    fill_rect(t, x0, y0, w, h, fill);
+    for (int x = x0 + 8; x < x0 + w - 8; x += 8) {
         draw_tile(t, x, y0, chr, top, K_PAPER, 0, 0, 1);
-        draw_tile(t, x, y0 + PANEL_H - 8, chr, bottom, K_PAPER, 0, 0, 1);
+        draw_tile(t, x, y0 + h - 8, chr, bottom, K_PAPER, 0, 0, 1);
     }
-    for (int y = y0 + 8; y < y0 + PANEL_H - 8; y += 8) {
+    for (int y = y0 + 8; y < y0 + h - 8; y += 8) {
         draw_tile(t, x0, y, chr, left, K_PAPER, 0, 0, 1);
-        draw_tile(t, x0 + PANEL_W - 8, y, chr, right, K_PAPER, 0, 0, 1);
+        draw_tile(t, x0 + w - 8, y, chr, right, K_PAPER, 0, 0, 1);
     }
     draw_tile(t, x0, y0, chr, top_corner, K_PAPER, 0, 1, 1);
-    draw_tile(t, x0 + PANEL_W - 8, y0, chr, top_corner, K_PAPER, 0, 0, 1);
-    draw_tile(t, x0, y0 + PANEL_H - 8, chr, bottom_corner, K_PAPER, 0, 1, 1);
-    draw_tile(t, x0 + PANEL_W - 8, y0 + PANEL_H - 8, chr, bottom_corner, K_PAPER, 0, 0, 1);
+    draw_tile(t, x0 + w - 8, y0, chr, top_corner, K_PAPER, 0, 0, 1);
+    draw_tile(t, x0, y0 + h - 8, chr, bottom_corner, K_PAPER, 0, 1, 1);
+    draw_tile(t, x0 + w - 8, y0 + h - 8, chr, bottom_corner, K_PAPER, 0, 0, 1);
 }
 
-void overlay_menu(OverlayTarget t, int selected, const int on[5], int slot, const uint8_t *chr) {
-    static const char *labels[5] = {
-        "RESUME", "SAVE STATE", "LOAD STATE", "FULLSCREEN", "QUIT"
-    };
-    const int x0 = (t.w - PANEL_W) / 2;
-    const int y0 = PANEL_Y;
-    draw_panel(t, x0, y0, K_PEACH, chr);
-    draw_gametext(t, x0 + (PANEL_W - gametext_width("PAUSED")) / 2, y0 + 10, "PAUSED", chr);
+void overlay_fps(OverlayTarget t, int fps, const uint8_t *chr) {
+    char text[16];
+    snprintf(text, sizeof text, "FPS %d", fps);
+    /* Top-left corner of the picture: inside the 4:3 overscan crop, on the
+     * added left columns in widescreen. No backing box: the stroked glyphs
+     * stay readable over gameplay on their own. */
+    draw_gametext(t, 12, 11, text, chr);
+}
 
-    const int label_x = 24, cursor_x = 12, icon_x = 198;
-    for (int i = 0; i < 5; i++) {
-        int y = y0 + 28 + i * 14;
-        draw_gametext(t, x0 + label_x, y, labels[i], chr);
-        if (on && on[i]) draw_check(t, x0 + icon_x, y, K_BLACK);
-        else if (selected == i) draw_cross(t, x0 + icon_x, y, K_PEACH_DIM);
+static const char *tab_names[TAB_COUNT] = {"VIDEO", "AUDIO", "GAME", "CONTROLS", "SYSTEM"};
+
+void overlay_menu(OverlayTarget t, int tab, int selected, const MenuState *st,
+                  const uint8_t *chr) {
+    if (tab < 0 || tab >= TAB_COUNT) tab = 0;
+    int rows = tab_row_count(tab);
+    /* Narrow frames (native 4:3) get a slimmer panel with a two-row tab
+     * bar so nothing is cut off at the sides. */
+    int w = t.w >= MENU_PANEL_W + 8 ? MENU_PANEL_W : (t.w - 8) & ~7;
+    if (w < 64) w = 64;
+    int compact = w < MENU_PANEL_W;
+    int rows_y = compact ? 54 : 42;
+    int h = (rows_y + rows * 12 + 11) & ~7;
+    const int x0 = (t.w - w) / 2;
+    const int y0 = (240 - h) / 2;
+    draw_panel(t, x0, y0, w, h, K_PEACH, chr);
+    draw_gametext(t, x0 + (w - gametext_width("PAUSED")) / 2, y0 + 8,
+                  "PAUSED", chr);
+
+    int tx;
+    if (!compact) {
+        int bar_w = 0;
+        for (int i = 0; i < TAB_COUNT; i++) bar_w += gametext_width(tab_names[i]);
+        bar_w += (TAB_COUNT - 1) * ADVANCE;
+        tx = x0 + (w - bar_w) / 2;
+        for (int i = 0; i < TAB_COUNT; i++) {
+            draw_gametext_color(t, tx, y0 + 24, tab_names[i], chr,
+                                i == tab ? K_SELECT : K_PAPER);
+            tx += gametext_width(tab_names[i]) + ADVANCE;
+        }
+    } else {
+        /* Two centred rows: VIDEO AUDIO GAME / CONTROLS SYSTEM. */
+        int top_w = gametext_width("VIDEO") + gametext_width("AUDIO") +
+                    gametext_width("GAME") + 2 * ADVANCE;
+        int bot_w = gametext_width("CONTROLS") + gametext_width("SYSTEM") + ADVANCE;
+        tx = x0 + (w - top_w) / 2;
+        for (int i = 0; i < 3; i++) {
+            draw_gametext_color(t, tx, y0 + 24, tab_names[i], chr,
+                                i == tab ? K_SELECT : K_PAPER);
+            tx += gametext_width(tab_names[i]) + ADVANCE;
+        }
+        tx = x0 + (w - bot_w) / 2;
+        for (int i = 3; i < TAB_COUNT; i++) {
+            draw_gametext_color(t, tx, y0 + 36, tab_names[i], chr,
+                                i == tab ? K_SELECT : K_PAPER);
+            tx += gametext_width(tab_names[i]) + ADVANCE;
+        }
     }
-    draw_cursor(t, x0 + cursor_x, y0 + 28 + selected * 14 - 1);
 
-    char text[40];
-    snprintf(text, sizeof text, "SLOT %d", slot < 1 ? 1 : slot > 5 ? 5 : slot);
-    draw_gametext(t, x0 + 16, y0 + 116, text, chr);
-    draw_gametext(t, x0 + 16, y0 + 128, "F5 SAVE  F7 LOAD", chr);
-    draw_gametext(t, x0 + 16, y0 + 140, "1-5 SLOT  F11 FULL", chr);
-    draw_gametext(t, x0 + 16, y0 + 152, "ESC CLOSE", chr);
+    const int label_x = 24, cursor_x = 12;
+    const int icon_x = x0 + w - 62;
+    const int value_right = x0 + w - 28;
+    for (int r = 0; r < rows; r++) {
+        int y = y0 + rows_y + r * 12;
+        draw_gametext(t, x0 + label_x, y, menu_row_label(tab, r), chr);
+        char value[32] = "";
+        int is_toggle = 0, toggle_on = 0, is_value = 0, is_binding = 0;
+        if (st) {
+            if (tab == TAB_VIDEO) {
+                if (r == 0) { is_toggle = 1; toggle_on = st->fullscreen; }
+                else if (r == 1) { is_toggle = 1; toggle_on = st->widescreen; }
+                else if (r == 2) { is_toggle = 1; toggle_on = st->show_fps; }
+                else {
+                    is_value = 1;
+                    snprintf(value, sizeof value, "%s",
+                             st->scanlines ? (st->scanlines > 1 ? "2" : "1") : "OFF");
+                }
+            } else if (tab == TAB_AUDIO) {
+                is_value = 1;
+                snprintf(value, sizeof value, "%d", st->volume);
+            } else if (tab == TAB_GAME) {
+                if (r == 2) {
+                    is_value = 1;
+                    snprintf(value, sizeof value, "%d", st->slot);
+                }
+            } else if (tab == TAB_CONTROLS && r >= 0 && r < 8) {
+                is_binding = 1;
+                if (st->capture_row == r) snprintf(value, sizeof value, "PRESS KEY");
+                else snprintf(value, sizeof value, "%s", st->key_names[r]);
+            }
+        }
+        if (is_toggle) {
+            if (toggle_on) draw_check(t, icon_x, y, K_BLACK);
+            else if (selected == r) draw_cross(t, icon_x, y, K_PEACH_DIM);
+        } else if (is_value || is_binding) {
+            int vx = value_right - gametext_width(value);
+            if (is_binding && st && st->capture_row == r)
+                draw_gametext_color(t, vx, y, value, chr, K_SELECT);
+            else
+                draw_gametext(t, vx, y, value, chr);
+            if (is_value && selected == r) {
+                draw_arrow(t, vx - 9, y + 1, -1, K_BLACK);
+                draw_arrow(t, vx + gametext_width(value) + 3, y + 1, 1, K_BLACK);
+            }
+        }
+        if (selected == r)
+            draw_cursor(t, x0 + cursor_x, y - 1);
+    }
 }
 
 

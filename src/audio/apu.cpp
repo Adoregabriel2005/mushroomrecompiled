@@ -28,6 +28,12 @@ struct Apu::Impl {
 
 namespace {
 
+// Blargg bakes a muffled "TV speaker" rolloff (-8.87 dB above 8800 Hz) into
+// the band-limited impulse every time a new volume is set. The NES itself
+// outputs full bandwidth, so select a flat EQ right after each volume()
+// call; otherwise every channel sounds dull.
+void flatten_eq(Nes_Apu& apu) { apu.treble_eq(blip_eq_t()); }
+
 int dmc_reader_tramp(void* user_data, cpu_addr_t addr) {
     Apu* self = static_cast<Apu*>(user_data);
     if (!self->read_cpu) return 0x55;  // flat sample when no memory hook yet
@@ -57,6 +63,7 @@ void Apu::reset() {
         std::fprintf(stderr, "apu: Blip_Buffer::sample_rate failed: %s\n", err);
     }
     d.apu.volume(1.0);
+    flatten_eq(d.apu);
     d.apu.reset(false, 0);
     d.apu.dmc_reader(&dmc_reader_tramp, this);
     d.buf.clear();
@@ -79,6 +86,7 @@ void Apu::reset_silence(int64_t now_cyc) {
     d.pending.clear();          // queued writes belong to the state being thrown away
     d.apu.output(&d.buf);       // re-select the shared linear buffer (mirrors reset())
     d.apu.volume(1.0);
+    flatten_eq(d.apu);
     d.apu.reset(false, 0);      // power-on: every oscillator silent, zeroed, lengths/envelopes/DMC cleared
     d.apu.dmc_reader(&dmc_reader_tramp, this);
     d.frame_start = now_cyc;    // rebase frame timing; the next render() spans only from here
@@ -120,6 +128,7 @@ void Apu::load_state(const uint8_t* p, int64_t now_cyc) {
     d.pending.clear();
     d.apu.output(&d.buf);
     d.apu.volume(1.0);
+    flatten_eq(d.apu);
     d.apu.load_snapshot(snap);  // resets the oscillators, then writes the saved registers and counters
     d.apu.dmc_reader(&dmc_reader_tramp, this);
     d.frame_start = now_cyc;

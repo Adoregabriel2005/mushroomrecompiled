@@ -56,11 +56,13 @@ Useful options:
 ```text
 --scale N               window scale 1-8
 --fullscreen            start fullscreen
+--widescreen            16:9 playfield (default)
+--4:3                   native 4:3 frame
 --scanlines 0|1|2
 --brightness 50-150
 --audio-rate 44100|48000|96000
 --volume 0-100
---mute
+--fps
 --slot 1-5
 --replay FILE           feed raw controller bytes (one per frame)
 --record FILE           write one controller byte per emulated frame
@@ -108,22 +110,32 @@ refused while a replay plays.
 | Save state | F5 | Menu |
 | Load state | F7 | Menu |
 | Save session replay | G | — |
-| Select slot | 1-5 | Menu |
+| Switch menu tab | 1-5, Tab | LB / RB |
 | Fullscreen | F11 | Menu |
-| Mute | F8 | Menu |
+| FPS counter | F10 | Menu |
+| Widescreen 16:9 / 4:3 | — | Menu |
 | Volume | - / = | Menu |
 | Reset machine | R | Menu |
 
-The menu also exposes resume, save, load, fullscreen, and quit.
+The menu has VIDEO (fullscreen, widescreen, FPS counter, scanlines),
+AUDIO (volume), GAME (save state, load state, slot), CONTROLS (keyboard
+bindings) and SYSTEM (resume, quit) tabs. Tab or 1-5 (LB/RB on the
+gamepad) switches tabs; Up/Down moves, Left/Right adjusts the value
+rows, Enter activates, Esc closes. The widescreen toggle switches
+between the 16:9 playfield and the native 4:3 frame and is remembered in
+`config.ini` (`widescreen=1`).
 Gamepad mappings come from `assets/gamecontrollerdb.txt` when present; the
 built-in SDL mapping is used otherwise.
 
-Keyboard bindings can be changed in `config.ini` with the `key_a`, `key_b`,
+Keyboard bindings can be changed in the menu's CONTROLS tab: Enter on a
+row captures the next pressed key (Esc cancels), and grabbing a key that
+is already bound swaps the two bindings, so swapping A and B is one
+capture. They are stored in `config.ini` as the `key_a`, `key_b`,
 `key_select`, `key_start`, `key_up`, `key_down`, `key_left`, and `key_right`
-keys. Values are SDL scancode names such as `Z`, `X`, `Left Shift`, `Return`,
-`Up`, `Down`, `Left`, and `Right`. Keyboard menu navigation remains on the
-arrow keys, W/S, Enter, and Escape. The config is written on exit, so bindings
-survive restarts.
+keys with SDL scancode names such as `Z`, `X`, `Left Shift`, `Return`,
+`Up`, `Down`, `Left`, and `Right`. Keyboard menu navigation is Tab and
+the arrow keys, W/S and A/D, Enter, and Escape. The config is written on
+exit, so bindings survive restarts.
 
 ## Scope and known gaps
 

@@ -29,7 +29,8 @@
 typedef struct {
     char rom[4096];
     bool fullscreen;
-    bool muted;
+    bool widescreen;
+    bool show_fps;
     bool vsync;
     int scale;
     int scanlines;
@@ -75,6 +76,13 @@ static int g_menu_index;
 static int g_slot;
 static char g_notice[96];
 static uint32_t g_notice_until;
+/* Learned SDL_Delay overshoot in milliseconds. Every sleep runs slightly
+ * long; the pacer subtracts this so the average frame lands on the tick. */
+static double g_sleep_bias_ms = 0.0;
+/* Emulated frames per second, updated every half second. */
+static int g_fps_shown;
+static int g_fps_frames;
+static Uint64 g_fps_t0;
 static char g_screenshot[4096];
 static bool g_screenshot_done;
 static uint64_t g_screenshot_frame = 1;
@@ -85,10 +93,64 @@ static int g_frame_h;
 static bool g_fullscreen_pending;
 static Uint32 g_window_shown_at;
 
-static const char *const MENU_ITEMS[] = {
-    "RESUME", "SAVE STATE", "LOAD STATE", "FULLSCREEN", "QUIT"
-};
-enum { MENU_COUNT = (int)(sizeof(MENU_ITEMS) / sizeof(MENU_ITEMS[0])) };
+/* Pause-menu tabs (see overlay.h) and the row being recorded by the
+ * CONTROLS capture mode, or -1. */
+static int g_menu_tab;
+static int g_capture = -1;
+
+static int menu_row_count(void) {
+    static const int counts[TAB_COUNT] = {4, 1, 3, 8, 2};
+    if (g_menu_tab < 0 || g_menu_tab >= TAB_COUNT) return 0;
+    return counts[g_menu_tab];
+}
+
+static void set_tab(int tab) {
+    g_menu_tab = (tab % TAB_COUNT + TAB_COUNT) % TAB_COUNT;
+    g_menu_index = 0;
+    g_capture = -1;
+}
+
+static void notify(const char *fmt, ...);
+static void config_save(const Config *cfg);
+static const char *key_name(SDL_Scancode key);
+
+/* CONTROLS rows map to the keyboard bindings: A, B, SELECT, START,
+ * UP, DOWN, LEFT, RIGHT. */
+static SDL_Scancode *binding_for(int row) {
+    switch (row) {
+        case 0: return &g_cfg.key_a;
+        case 1: return &g_cfg.key_b;
+        case 2: return &g_cfg.key_select;
+        case 3: return &g_cfg.key_start;
+        case 4: return &g_cfg.key_up;
+        case 5: return &g_cfg.key_down;
+        case 6: return &g_cfg.key_left;
+        case 7: return &g_cfg.key_right;
+        default: return NULL;
+    }
+}
+
+/* Records a key for a CONTROLS row. If the key is already bound elsewhere
+ * the two bindings swap, so swapping A and B is a single capture. */
+static void bind_key(int row, SDL_Keycode key) {
+    SDL_Scancode *target = binding_for(row);
+    if (!target) return;
+    SDL_Scancode sc = SDL_GetScancodeFromKey(key);
+    if (sc == SDL_SCANCODE_UNKNOWN) {
+        notify("KEY NOT USABLE");
+        return;
+    }
+    SDL_Scancode old = *target;
+    for (int i = 0; i < 8; i++) {
+        SDL_Scancode *other = binding_for(i);
+        if (other && i != row && *other == sc) *other = old;
+    }
+    *target = sc;
+    notify("%s IS %s", row == 0 ? "A" : row == 1 ? "B" : row == 2 ? "SELECT" :
+            row == 3 ? "START" : row == 4 ? "UP" : row == 5 ? "DOWN" :
+            row == 6 ? "LEFT" : "RIGHT", key_name(sc));
+    config_save(&g_cfg);
+}
 
 static void config_defaults(Config *cfg) {
     memset(cfg, 0, sizeof(*cfg));
@@ -99,6 +161,7 @@ static void config_defaults(Config *cfg) {
     cfg->audio_rate = 48000;
     cfg->slot = 1;
     cfg->vsync = true;
+    cfg->widescreen = true;
     cfg->key_a = SDL_SCANCODE_X;
     cfg->key_b = SDL_SCANCODE_Z;
     cfg->key_select = SDL_SCANCODE_LSHIFT;
@@ -445,7 +508,8 @@ static void config_load(Config *cfg, const char *path) {
                 trim(value);
                 if (!SDL_strcasecmp(key, "rom")) snprintf(cfg->rom, sizeof(cfg->rom), "%s", value);
                 else if (!SDL_strcasecmp(key, "fullscreen")) cfg->fullscreen = parse_bool(value);
-                else if (!SDL_strcasecmp(key, "muted")) cfg->muted = parse_bool(value);
+                else if (!SDL_strcasecmp(key, "show_fps")) cfg->show_fps = parse_bool(value);
+                else if (!SDL_strcasecmp(key, "widescreen")) cfg->widescreen = parse_bool(value);
                 else if (!SDL_strcasecmp(key, "vsync")) cfg->vsync = parse_bool(value);
                 else if (!SDL_strcasecmp(key, "scale")) cfg->scale = atoi(value);
                 else if (!SDL_strcasecmp(key, "scanlines")) cfg->scanlines = atoi(value);
@@ -500,7 +564,8 @@ static void config_save(const Config *cfg) {
     int n = snprintf(text, sizeof(text),
                      "rom=%s\n"
                      "fullscreen=%d\n"
-                     "muted=%d\n"
+                     "widescreen=%d\n"
+                     "show_fps=%d\n"
                      "vsync=%d\n"
                      "scale=%d\n"
                      "scanlines=%d\n"
@@ -517,7 +582,8 @@ static void config_save(const Config *cfg) {
                      "key_left=%s\n"
                      "key_right=%s\n",
                      cfg->rom, cfg->fullscreen ? 1 : 0,
-                     cfg->muted ? 1 : 0, cfg->vsync ? 1 : 0, cfg->scale,
+                     cfg->widescreen ? 1 : 0,
+                     cfg->show_fps ? 1 : 0, cfg->vsync ? 1 : 0, cfg->scale,
                      cfg->scanlines, cfg->brightness, cfg->volume, cfg->audio_rate, cfg->slot,
                      key_a, key_b, key_select, key_start, key_up, key_down, key_left, key_right);
     if (n > 0) SDL_RWwrite(rw, text, 1, (size_t)n);
@@ -590,12 +656,18 @@ static void save_replay_file(void) {
     }
 }
 
-/* The picture is always the 426x240 widescreen canvas, so the window is an
- * exact integer multiple of it: every source pixel covers the same number of
- * window pixels and nothing is letterboxed. */
+/* The window follows the live picture: the 426x240 widescreen canvas or the
+ * 256x240 native frame, at an exact integer multiple so every source pixel
+ * covers the same number of window pixels and nothing is letterboxed.
+ * While the menu is open the window keeps the wide canvas even in 4:3:
+ * the menu is drawn full-size over a pillarboxed frame. */
 static void resize_window_to_frame(void) {
     if (!g_window || g_cfg.fullscreen) return;
-    SDL_SetWindowSize(g_window, SMB3_WIDE_WIDTH * g_cfg.scale, 240 * g_cfg.scale);
+    int fw = SMB3_WIDE_WIDTH, fh = 240;
+    (void)glue_get_present_framebuffer(&fw, &fh);
+    if (fw <= 0 || fh <= 0) return;
+    if (g_menu && fh == 240 && fw < SMB3_WIDE_WIDTH) fw = SMB3_WIDE_WIDTH;
+    SDL_SetWindowSize(g_window, fw * g_cfg.scale, fh * g_cfg.scale);
 }
 
 /* Fullscreen runs in the largest 16:9 display mode whose height is an exact
@@ -654,43 +726,86 @@ static void toggle_fullscreen(void) {
     config_save(&g_cfg);
 }
 
-static void toggle_mute(void) {
-    g_cfg.muted = !g_cfg.muted;
-    audio_out_set_muted(g_audio, g_cfg.muted);
-    notify("SOUND %s", g_cfg.muted ? "OFF" : "ON");
+static void toggle_widescreen(void) {
+    g_cfg.widescreen = !g_cfg.widescreen;
+    glue_set_widescreen(g_cfg.widescreen);
+    resize_window_to_frame();
+    notify("WIDESCREEN %s", g_cfg.widescreen ? "16:9" : "4:3");
     config_save(&g_cfg);
 }
 
-static void adjust_volume(int delta) {
-    int volume = g_cfg.volume + delta;
+static void toggle_fps(void) {
+    g_cfg.show_fps = !g_cfg.show_fps;
+    notify("FPS %s", g_cfg.show_fps ? "ON" : "OFF");
+    config_save(&g_cfg);
+}
+
+static void set_volume(int volume) {
     if (volume < 0) volume = 0;
     if (volume > 100) volume = 100;
     g_cfg.volume = volume;
     audio_out_set_volume(g_audio, volume);
-    notify("VOLUME %d", volume);
+}
+
+static void adjust_volume(int delta) {
+    set_volume(g_cfg.volume + delta);
+    notify("VOLUME %d", g_cfg.volume);
     config_save(&g_cfg);
 }
 
 static void open_menu(void) {
     g_menu = true;
     g_menu_index = 0;
+    resize_window_to_frame();
     audio_out_pause(g_audio, true);
 }
 
 static void close_menu(void) {
     g_menu = false;
+    g_capture = -1;
+    config_save(&g_cfg);
+    resize_window_to_frame();
     audio_out_clear(g_audio);
     audio_out_pause(g_audio, false);
 }
 
+/* Left/right on a menu row: toggles flip, values step. In-menu edits
+ * apply live and persist on close. */
+/* Left/Right steps value rows only; toggles flip with Enter. */
+static void menu_adjust(int dir) {
+    if (g_menu_tab == TAB_VIDEO && g_menu_index == 3) {
+        g_cfg.scanlines = (g_cfg.scanlines + dir + 3) % 3;
+    } else if (g_menu_tab == TAB_AUDIO) {
+        set_volume(g_cfg.volume + dir * 5);
+    } else if (g_menu_tab == TAB_GAME && g_menu_index == 2) {
+        int slot = g_slot + dir;
+        if (slot < 1) slot = 5;
+        if (slot > 5) slot = 1;
+        g_slot = slot;
+        g_cfg.slot = slot;
+    }
+}
+
 static void activate_menu(void) {
-    switch (g_menu_index) {
-        case 0: close_menu(); break;
-        case 1: save_slot(g_slot); break;
-        case 2: load_slot(g_slot); break;
-        case 3: toggle_fullscreen(); break;
-        case 4: g_running = false; break;
-        default: break;
+    if (g_menu_tab == TAB_VIDEO) {
+        if (g_menu_index == 0) toggle_fullscreen();
+        else if (g_menu_index == 1) toggle_widescreen();
+        else if (g_menu_index == 2) {
+            g_cfg.show_fps = !g_cfg.show_fps;
+            config_save(&g_cfg);
+        }
+        else menu_adjust(1);
+    } else if (g_menu_tab == TAB_AUDIO) {
+        menu_adjust(1);
+    } else if (g_menu_tab == TAB_GAME) {
+        if (g_menu_index == 0) save_slot(g_slot);
+        else if (g_menu_index == 1) load_slot(g_slot);
+        else menu_adjust(1);
+    } else if (g_menu_tab == TAB_CONTROLS) {
+        g_capture = g_menu_index;
+    } else if (g_menu_tab == TAB_SYSTEM) {
+        if (g_menu_index == 0) close_menu();
+        else g_running = false;
     }
 }
 
@@ -703,6 +818,17 @@ static void set_slot(int slot) {
 }
 
 static void handle_key(SDL_Keycode key, bool repeat) {
+    if (g_menu && g_capture >= 0) {
+        /* CONTROLS capture: the next pressed key becomes the binding. */
+        if (!repeat) {
+            if (key == SDLK_ESCAPE) g_capture = -1;
+            else {
+                bind_key(g_capture, key);
+                g_capture = -1;
+            }
+        }
+        return;
+    }
     if (key == SDLK_ESCAPE) {
         if (!repeat) {
             if (g_menu) close_menu();
@@ -711,14 +837,22 @@ static void handle_key(SDL_Keycode key, bool repeat) {
         return;
     }
     if (g_menu) {
+        int rows = menu_row_count();
+        if (rows < 1) return;
         if (key == SDLK_UP || key == SDLK_w) {
-            g_menu_index = (g_menu_index + MENU_COUNT - 1) % MENU_COUNT;
+            g_menu_index = (g_menu_index + rows - 1) % rows;
         } else if (key == SDLK_DOWN || key == SDLK_s) {
-            g_menu_index = (g_menu_index + 1) % MENU_COUNT;
+            g_menu_index = (g_menu_index + 1) % rows;
+        } else if (key == SDLK_LEFT || key == SDLK_a) {
+            menu_adjust(-1);
+        } else if (key == SDLK_RIGHT || key == SDLK_d) {
+            menu_adjust(1);
+        } else if (key == SDLK_TAB) {
+            if (!repeat) set_tab(g_menu_tab + (SDL_GetModState() & KMOD_SHIFT ? -1 : 1));
         } else if (key == SDLK_RETURN || key == SDLK_KP_ENTER || key == SDLK_SPACE) {
             if (!repeat) activate_menu();
         } else if (key >= SDLK_1 && key <= SDLK_5) {
-            if (!repeat) set_slot(key - SDLK_0);
+            if (!repeat) set_tab(key - SDLK_1);
         }
         return;
     }
@@ -727,7 +861,7 @@ static void handle_key(SDL_Keycode key, bool repeat) {
     else if (key == SDLK_F7) load_slot(g_slot);
     else if (key == SDLK_g) save_replay_file();
     else if (key == SDLK_F11) toggle_fullscreen();
-    else if (key == SDLK_F8) toggle_mute();
+    else if (key == SDLK_F10) toggle_fps();
     else if (key == SDLK_MINUS) adjust_volume(-5);
     else if (key == SDLK_EQUALS) adjust_volume(5);
     else if (key == SDLK_r) {
@@ -775,15 +909,26 @@ static void handle_event(SDL_Event *event) {
             break;
         case SDL_CONTROLLERBUTTONDOWN:
             if (g_menu) {
+                int rows = menu_row_count();
                 if (event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_UP)
-                    g_menu_index = (g_menu_index + MENU_COUNT - 1) % MENU_COUNT;
+                    g_menu_index = (g_menu_index + rows - 1) % rows;
                 else if (event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN)
-                    g_menu_index = (g_menu_index + 1) % MENU_COUNT;
+                    g_menu_index = (g_menu_index + 1) % rows;
+                else if (event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_LEFT)
+                    menu_adjust(-1);
+                else if (event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_RIGHT)
+                    menu_adjust(1);
+                else if (event->cbutton.button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER)
+                    set_tab(g_menu_tab - 1);
+                else if (event->cbutton.button == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)
+                    set_tab(g_menu_tab + 1);
                 else if (event->cbutton.button == SDL_CONTROLLER_BUTTON_A ||
-                         event->cbutton.button == SDL_CONTROLLER_BUTTON_START)
-                    activate_menu();
-                else if (event->cbutton.button == SDL_CONTROLLER_BUTTON_B)
-                    close_menu();
+                         event->cbutton.button == SDL_CONTROLLER_BUTTON_START) {
+                    if (g_capture < 0) activate_menu();
+                } else if (event->cbutton.button == SDL_CONTROLLER_BUTTON_B) {
+                    if (g_capture >= 0) g_capture = -1;
+                    else close_menu();
+                }
             } else if (event->cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE) {
                 open_menu();
             }
@@ -792,7 +937,7 @@ static void handle_event(SDL_Event *event) {
             const char *path = event->drop.file;
             if (path && glue_load_rom_utf8(path)) {
                 snprintf(g_cfg.rom, sizeof(g_cfg.rom), "%s", path);
-                glue_set_widescreen(true);
+                glue_set_widescreen(g_cfg.widescreen);
                 audio_out_clear(g_audio);
                 resize_window_to_frame();
                 config_save(&g_cfg);
@@ -841,9 +986,21 @@ static uint8_t read_pad(void) {
 }
 
 static void draw_menu(uint32_t *dst, int width, int height) {
-    int on[5] = {0, 0, 0, g_cfg.fullscreen ? 1 : 0, 0};
+    MenuState st;
+    st.fullscreen = g_cfg.fullscreen ? 1 : 0;
+    st.widescreen = g_cfg.widescreen ? 1 : 0;
+    st.show_fps = g_cfg.show_fps ? 1 : 0;
+    st.scanlines = g_cfg.scanlines;
+    st.volume = g_cfg.volume;
+    st.slot = g_slot < 1 ? 1 : g_slot > 5 ? 5 : g_slot;
+    st.capture_row = g_capture;
+    const SDL_Scancode keys[8] = {g_cfg.key_a, g_cfg.key_b, g_cfg.key_select,
+                                  g_cfg.key_start, g_cfg.key_up, g_cfg.key_down,
+                                  g_cfg.key_left, g_cfg.key_right};
+    for (int i = 0; i < 8; i++)
+        snprintf(st.key_names[i], sizeof(st.key_names[i]), "%s", key_name(keys[i]));
     OverlayTarget target = {dst, width, height};
-    overlay_menu(target, g_menu_index, on, g_slot, g_chr);
+    overlay_menu(target, g_menu_tab, g_menu_index, &st, g_chr);
 }
 
 static bool present_frame(void) {
@@ -857,8 +1014,32 @@ static bool present_frame(void) {
         g_present = grown;
         g_present_capacity = pixels;
     }
-    memcpy(g_present, framebuffer, pixels * sizeof(*g_present));
+    if (g_menu && width < SMB3_WIDE_WIDTH && height == 240) {
+        /* Full-size menu over a narrow frame: pillarbox the frame onto the
+         * wide canvas first so the panel is never cut off. */
+        size_t wide_pixels = (size_t)SMB3_WIDE_WIDTH * (size_t)height;
+        if (wide_pixels > g_present_capacity) {
+            uint32_t *grown = realloc(g_present, wide_pixels * sizeof(*grown));
+            if (!grown) return false;
+            g_present = grown;
+            g_present_capacity = wide_pixels;
+        }
+        memset(g_present, 0, wide_pixels * sizeof(*g_present));
+        int x0 = (SMB3_WIDE_WIDTH - width) / 2;
+        for (int y = 0; y < height; y++) {
+            memcpy(g_present + (size_t)y * SMB3_WIDE_WIDTH + x0,
+                   framebuffer + (size_t)y * width,
+                   (size_t)width * sizeof(*g_present));
+        }
+        width = SMB3_WIDE_WIDTH;
+    } else {
+        memcpy(g_present, framebuffer, pixels * sizeof(*g_present));
+    }
     if (g_menu) draw_menu(g_present, width, height);
+    if (g_cfg.show_fps) {
+        OverlayTarget fps_target = {g_present, width, height};
+        overlay_fps(fps_target, g_fps_shown, g_chr);
+    }
     if (g_notice[0] && SDL_GetTicks() < g_notice_until)
         cyc_overlay_toast(g_present, width, height, g_notice, NULL);
 
@@ -901,9 +1082,12 @@ static void usage(const char *argv0) {
     printf("Usage: %s --rom GAME.NES [options]\n"
            "  --scale N               window scale 1-8 (default 3)\n"
            "  --fullscreen            start fullscreen\n"
+           "  --widescreen            16:9 playfield (default)\n"
+           "  --4:3                   native 4:3 frame\n"
            "  --scanlines 0|1|2       CRT scanline strength\n"
            "  --audio-rate 44100|48000|96000\n"
-           "  --volume 0-100          --mute\n"
+           "  --volume 0-100\n"
+           "  --fps                   show the FPS counter\n"
            "  --slot 1-5              active save slot\n"
            "  --replay FILE           feed raw controller bytes (one per frame)\n"
            "  --record FILE           write one controller byte per emulated frame\n"
@@ -935,6 +1119,10 @@ static bool parse_args(Config *cfg, int *frame_limit, bool *help, int argc, char
             /* Accepted for compatibility: Vulkan is now the only presenter. */
         } else if (!strcmp(arg, "--fullscreen")) {
             cfg->fullscreen = true;
+        } else if (!strcmp(arg, "--widescreen")) {
+            cfg->widescreen = true;
+        } else if (!strcmp(arg, "--4:3")) {
+            cfg->widescreen = false;
         } else if (!strcmp(arg, "--scanlines") && i + 1 < argc) {
             cfg->scanlines = atoi(argv[++i]);
         } else if (!strcmp(arg, "--brightness") && i + 1 < argc) {
@@ -943,8 +1131,8 @@ static bool parse_args(Config *cfg, int *frame_limit, bool *help, int argc, char
             cfg->audio_rate = atoi(argv[++i]);
         } else if (!strcmp(arg, "--volume") && i + 1 < argc) {
             cfg->volume = atoi(argv[++i]);
-        } else if (!strcmp(arg, "--mute")) {
-            cfg->muted = true;
+        } else if (!strcmp(arg, "--fps")) {
+            cfg->show_fps = true;
         } else if (!strcmp(arg, "--slot") && i + 1 < argc) {
             cfg->slot = atoi(argv[++i]);
         } else if (!strcmp(arg, "--replay") && i + 1 < argc) {
@@ -1075,7 +1263,7 @@ int main(int argc, char **argv) {
         return g_cfg.rom[0] ? 1 : 2;
     }
 
-    g_audio = audio_out_create(g_cfg.audio_rate, g_cfg.volume, g_cfg.muted);
+    g_audio = audio_out_create(g_cfg.audio_rate, g_cfg.volume);
     if (g_audio) {
         g_cfg.audio_rate = audio_out_sample_rate(g_audio);
     } else {
@@ -1088,7 +1276,7 @@ int main(int argc, char **argv) {
         SDL_Quit();
         return 1;
     }
-    glue_set_widescreen(true);
+    glue_set_widescreen(g_cfg.widescreen);
     if (g_cfg.replay[0]) {
         FILE *rf = fopen(g_cfg.replay, "rb");
         if (!rf) {
@@ -1166,6 +1354,8 @@ int main(int argc, char **argv) {
     uint64_t iterations = 0;
     Uint64 frequency = SDL_GetPerformanceFrequency();
     Uint64 next_tick = SDL_GetPerformanceCounter();
+    g_fps_t0 = next_tick;
+    g_fps_frames = 0;
     const double frame_rate = glue_frame_rate();
     const double frame_seconds = frame_rate > 1.0 ? 1.0 / frame_rate : 1.0 / 60.0;
     int16_t audio_buffer[4096];
@@ -1197,6 +1387,14 @@ int main(int argc, char **argv) {
             if (g_record_fp) fwrite(&fed, 1, 1, g_record_fp);
             glue_set_pad1(fed);
             glue_step_frame();
+            g_fps_frames++;
+            Uint64 fps_now = SDL_GetPerformanceCounter();
+            if (fps_now - g_fps_t0 >= frequency / 2) {
+                g_fps_shown = (int)((double)g_fps_frames * (double)frequency /
+                                    (double)(fps_now - g_fps_t0) + 0.5);
+                g_fps_frames = 0;
+                g_fps_t0 = fps_now;
+            }
             if (!g_replay && g_sram_ok && ++g_sram_frames >= 60) {
                 g_sram_frames = 0;
                 if (!glue_sram_save(g_sram_path))
@@ -1208,7 +1406,7 @@ int main(int argc, char **argv) {
                     double fill = ((double)target - (double)audio_out_queued(g_audio)) / (double)target;
                     if (fill < -1.0) fill = -1.0;
                     if (fill > 1.0) fill = 1.0;
-                    glue_set_audio_rate_scale(1.0 + 0.005 * fill);
+                    glue_set_audio_rate_scale(1.0 + 0.015 * fill);
                 }
             }
             size_t samples = glue_get_audio_samples(audio_buffer, 4096, 0);
@@ -1229,8 +1427,37 @@ int main(int argc, char **argv) {
         next_tick += (Uint64)(frequency * frame_seconds);
         Uint64 now = SDL_GetPerformanceCounter();
         if (next_tick > now) {
-            Uint64 delay_ms = (next_tick - now) * 1000u / frequency;
-            if (delay_ms > 0) SDL_Delay((Uint32)delay_ms);
+            /* Sleep in one short call, then spin to the exact tick.
+             * SDL_Delay oversleeps by a fraction of a millisecond on every
+             * call; slept naively, that bias lands on every frame, the loop
+             * runs ~1% slow, and the audio tempo corrector sustains a
+             * matching stretch to keep the queue full -- everything sounds
+             * flat. Measuring each sleep against what was requested learns
+             * the overshoot, so the average frame lands exactly on the tick
+             * on any timer granularity. Spinning is bounded to ~1 ms. */
+            for (;;) {
+                now = SDL_GetPerformanceCounter();
+                if (now >= next_tick) break;
+                double remaining_ms =
+                    (double)(next_tick - now) * 1000.0 / (double)frequency;
+                double sleep_ms = remaining_ms - 1.0 - g_sleep_bias_ms;
+                if (sleep_ms < 1.0) break; /* spin the tail */
+                Uint64 before = SDL_GetPerformanceCounter();
+                Uint32 requested = (Uint32)sleep_ms;
+                if (requested < 1) requested = 1;
+                SDL_Delay(requested);
+                double slept_ms = (double)(SDL_GetPerformanceCounter() - before) *
+                                  1000.0 / (double)frequency;
+                double err = slept_ms - (double)requested;
+                if (err > -0.5 && err < 8.0) {
+                    g_sleep_bias_ms += 0.05 * (err - g_sleep_bias_ms);
+                    if (g_sleep_bias_ms < 0.0) g_sleep_bias_ms = 0.0;
+                    if (g_sleep_bias_ms > 4.0) g_sleep_bias_ms = 4.0;
+                }
+            }
+            while (SDL_GetPerformanceCounter() < next_tick) {
+                /* exact wakeup; at most ~1 ms of spin plus learned bias */
+            }
         } else if (now - next_tick > frequency / 30u) {
             next_tick = now;
         }

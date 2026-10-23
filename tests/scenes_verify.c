@@ -26,7 +26,10 @@ static int verify_native_scene(uint16_t address,uint8_t value){
    * differ from the machine's picture, and the picture pastes that layer, not
    * the raw frame. */
   int staged=y>=layer_top&&y<=bar_anchor;
-  if(!staged&&memcmp(hud+y*256,native+y*256,256*sizeof(uint32_t)))valid=0;
+  /* Unstaged rows match from column 8: the layer deliberately deviates
+   * from the hardware's left-column clip and draws the bar's content
+   * in columns 0-7, which no display path shows. */
+  if(!staged&&memcmp(hud+y*256+8,native+y*256+8,248*sizeof(uint32_t)))valid=0;
   if(memcmp(out+y*426+97,hud+y*256+12,232*sizeof(uint32_t)))valid=0;
   for(int x=0;x<97;x++)if(out[y*426+x]!=0xff000000u||out[y*426+329+x]!=0xff000000u)valid=0;
  }
@@ -144,10 +147,11 @@ int main(int argc,char **argv){
    }
    if(f==1140){
     if(!verify_wide_end_scene(0x559,1)||!verify_wide_end_scene(0x7974,1)||
-       !verify_end_spawn_blocked(0x559,1)||!verify_end_spawn_blocked(0x7974,1)||
-       !verify_native_scene(0x100,0x40)||!verify_native_scene(0x101,0x60)||
-       !verify_native_scene(0x14,1))return 5;
-    puts("Level-end card/run-off: wide frame, composed margins and no late spawns; raster and exit scenes: native pixels and clean black margins verified");
+     !verify_end_spawn_blocked(0x559,1)||!verify_end_spawn_blocked(0x7974,1)||
+     !verify_native_scene(0x728,0)||!verify_native_scene(0x3ef,1)||
+     !verify_wide_end_scene(0x14,1)||!verify_wide_end_scene(0x561,1)||
+     !verify_wide_end_scene(0x100,0)||!verify_wide_end_scene(0x101,0x60))return 5;
+   puts("Level-end card/run-off: wide frame, composed margins and no late spawns; exit/end/loading/raster transients stay wide; non-level and vertical scenes: native pixels and clean black margins verified");
    }
   }
  }

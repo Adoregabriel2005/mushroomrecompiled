@@ -71,8 +71,10 @@ int main(int argc,char **argv){
   if(bar_first>=0&&cyc_frame_split_line()>=240){fprintf(stderr,"Bar without a split IRQ at %d\n",f);return 18;}
   /* Every row below the anchor is the bar's own captured state, so the layer
    * rebuilding it has to reproduce the machine's pixels exactly - that is the
-   * port reproducing the PPU (palette, banking, scroll, sprites, greyscale). */
-  for(int y=bar_anchor+1;y>0&&y<240;y++)if(memcmp(hud+y*256,native+y*256,256*sizeof(uint32_t))){
+   * port reproducing the PPU (palette, banking, scroll, sprites, greyscale).
+   * Columns 0-7 are exempt: the layer deliberately deviates from the NES
+   * left-column clip and draws the bar's content there. */
+  for(int y=bar_anchor+1;y>0&&y<240;y++)if(memcmp(hud+y*256+8,native+y*256+8,248*sizeof(uint32_t))){
    fprintf(stderr,"Bar row %d is not the PPU's at %d\n",y,f);return 19;}
   uint32_t bar_bg=0;int bar_best=-1;
   for(int x=0;bar_anchor>=0&&x<256;x++){

@@ -245,9 +245,9 @@ static void draw_row(uint32_t *out, int y, int row_i, unsigned bar_fine_x, unsig
 
     const unsigned bg_base = (row->ctrl & 0x10) ? 0x1000u : 0x0000u;
     const int bg_on = (row->mask & 0x08) != 0;
-    const int bg_left_on = (row->mask & 0x02) != 0;
     const int spr_on = (row->mask & 0x10) != 0;
-    const int spr_left_on = (row->mask & 0x04) != 0;
+    /* No left-column clip: the NES hides screen columns 0-7 and the port
+     * deliberately deviates, drawing the bar's full content there. */
 
     uint32_t *line = out + y * BAR_W;
 
@@ -286,7 +286,7 @@ static void draw_row(uint32_t *out, int y, int row_i, unsigned bar_fine_x, unsig
         const unsigned bit = 7u - fx;
         const unsigned pat = (((hi >> bit) & 1u) << 1) | ((lo >> bit) & 1u);
         bg_pat[x] = (uint8_t)pat;
-        const int visible = bg_on && !(x < 8 && !bg_left_on);
+        const int visible = bg_on;
         const unsigned entry = (visible && pat) ? ((pal2 << 2) | pat) : 0u;
         line[x] = cyc_render_line_color(row_i, (int)entry);
         wx = (wx + 1) & 511u;
@@ -339,7 +339,6 @@ static void draw_row(uint32_t *out, int y, int row_i, unsigned bar_fine_x, unsig
         const int x1 = sp->x + 8 < BAR_W ? sp->x + 8 : BAR_W;
         for (int x = x0; x < x1; x++) {
             if (x < 0 || claimed[x]) continue;
-            if (x < 8 && !spr_left_on) continue;
             const unsigned off = (unsigned)(x - sp->x);
             const unsigned shift = 7u - off;
             const unsigned pat = (((sp->hi >> shift) & 1u) << 1) | ((sp->lo >> shift) & 1u);
@@ -378,8 +377,14 @@ static void hud_build(void)
     if (anchor_i > rows - 1) anchor_i = rows - 1;
 
     for (int i = 0; i < rows; i++) {
-        if (!s->row[i].on) continue; /* rendering was off: the per-dot pass drew this row */
         const int y = s->top + i;
+        /* Rows at or below the bar's first row are always the bar's: the
+         * split's staged writes can straddle the dot-1 capture, so the
+         * rendering flag flickers there frame to frame and skipping would
+         * flash the transition garbage (sky/sprite slivers) through the
+         * layer. Above the bar, a rendering-off row still belongs to the
+         * per-dot pass. */
+        if (!s->row[i].on && y < s->first) continue;
         s_on[y] = 1;
         /* The two layers meet at s.first: above it the rows continue the
          * playfield - the split's staged writes have not landed yet - and are

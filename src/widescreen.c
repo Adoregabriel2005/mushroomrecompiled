@@ -81,7 +81,11 @@ uint32_t smb3_wide_terrain_argb(int x,int y){return colors[terrain_pixel(x,y,ram
 static bool repaired_column(int x,int x0) {
  return x<x0+WIDE_CROP || x>=x0+WIDE_CROP+WIDE_VISIBLE;
 }
-static void sprite_edges(int x0) {
+/* Rows at or below the bar belong to the bar layer (black beside it, by the
+ * fixed-HUD contract), never to margin sprites: the per-dot picture there is
+ * mid-transition while the game rewrites scroll and banking, and the composed
+ * bar must not be overpainted with playfield sprites. */
+static void sprite_edges(int x0,int bar_top) {
  memset(sprite_claimed,0,sizeof sprite_claimed);
  /* Slots owned by managed enemy layers are skipped: the margin pass draws
   * them from the re-run pieces. Painting both sources side-by-side is what
@@ -90,12 +94,12 @@ static void sprite_edges(int x0) {
  uint64_t owned=smb3_enemies_claimed_oam();
  for(int slot=0;slot<64;slot++){
   const uint8_t *s=oam+slot*4;int y=s[0]+1,x=x0+s[3];
-  if(y>=192||(s[3]>=WIDE_CROP&&s[3]+8<=256-WIDE_CROP))continue;
+  if(y>=bar_top||(s[3]>=WIDE_CROP&&s[3]+8<=256-WIDE_CROP))continue;
   if((owned>>slot)&1u)continue;
   unsigned tile=s[1],attr=s[2],base=(tile&1)*4096+(tile&0xfe)*16;
   for(int dy=0;dy<16;dy++)for(int dx=0;dx<8;dx++){
    int px=x+dx,py=y+dy;
-   if(px<0||px>=426||py>=192||!repaired_column(px,x0)||!(cyc_render_line_mask(py)&0x10))continue;
+   if(px<0||px>=426||py>=bar_top||!repaired_column(px,x0)||!(cyc_render_line_mask(py)&0x10))continue;
    /* Preserve the hardware's first-eight-sprites selection on each row. */
    int prior=0;for(int i=0;i<slot;i++)if(py>=oam[i*4]+1&&py<oam[i*4]+17)prior++;
    if(prior>=8)continue;
@@ -112,11 +116,19 @@ static void sprite_edges(int x0) {
 const uint32_t *smb3_wide_present(const uint32_t *native) {
  for(unsigned i=0;i<426*240;i++)canvas[i]=0xff000000u;
  active=false;origin=85;
- int set=ram[0x70a],screens=ram[0x372]+1;
- /* Menus, map, bonus games, vertical rooms and raster effects stay stock.
-  * Horizontal multi-screen levels have a fully expanded block map in SRAM. */
- bool playable=tables_ok&&captured&&smb3_enemies_scene(ram)&&
-  (cyc_render_line_mask(8)&0x08);
+ /* Level_Width (0x22), not SizeOrig (0x372): the width is already live while
+  * the size record is still loading, so the entry prelude stays wide. */
+ int set=ram[0x70a],screens=ram[0x22]+1;
+ /* Presentation window: the frame is presenting a side-view level
+  * (Player_State 0x728 == 3). Unlike the object-model gate
+  * (smb3_enemies_scene), this ignores the mode, raster, exit, junction and
+  * level-end transients: during the entry card, death and pipe/junction
+  * reloads the machine still presents the level picture, so the wide canvas
+  * presents it too, with terrain-fallback margins while the game settles.
+  * Menus, map, bonus games and vertical rooms stay stock. Horizontal
+  * multi-screen levels have a fully expanded block map in SRAM. */
+ bool playable=tables_ok&&captured&&set>=1&&set<=14&&set!=7&&!ram[0x3ef]&&
+  screens>=2&&screens<=15&&ram[0x728]==3&&(cyc_render_line_mask(8)&0x08);
  /* The status bar as its own layer (hud.c): the frame
   * is the layer's picture, the rows from the split down rebuilt from the
   * frame's own captures, so no stripe of playfield backdrop or card colour
@@ -149,7 +161,7 @@ const uint32_t *smb3_wide_present(const uint32_t *native) {
    /* Capture first: the edge repair needs the claimed-slot mask so no
     * sprite is painted from both sources. */
    smb3_enemies_capture();
-   sprite_edges(origin);
+   sprite_edges(origin,bar_top);
    /* Enemy re-runs happen here, on settled end-of-frame RAM: at the
     * scanline-8 snapshot the game logic is still mid-update, so a re-run
     * there sees a mix of old and new positions while the DMA'd OAM is a
@@ -190,7 +202,7 @@ const uint32_t *smb3_wide_present(const uint32_t *native) {
      unsigned tile=pc->tile,attr=pc->attr,base=(tile&1)*4096+(tile&0xfe)*16;
      for(int dy=0;dy<16;dy++)for(int dx=0;dx<8;dx++){
       int px=x+dx,py=y+dy;
-      if(px<0||px>=426||py<0||py>=192)continue;
+      if(px<0||px>=426||py<0||py>=bar_top)continue;
       /* Pasted frame wins: only the columns outside it are composed.
        * Edge bands belong to managed objects now (their frame slots are
        * skipped by the repair), so straddling sprites continue seamlessly

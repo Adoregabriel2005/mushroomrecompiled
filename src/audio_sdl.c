@@ -7,18 +7,29 @@ struct AudioOut {
     SDL_AudioDeviceID device;
     int sample_rate;
     int volume;
-    bool muted;
     int16_t *stereo;
     size_t stereo_capacity; /* int16 samples */
 };
 
-AudioOut *audio_out_create(int sample_rate, int volume, bool muted) {
+/* Queue a short cushion of silence. The game produces samples once per
+ * emulated frame while the device drains steadily; without a cushion the
+ * device can run dry before the first frames land and the stream clicks
+ * at startup or after a menu/reset clear. */
+static void audio_prefill(AudioOut *a) {
+    if (!a || !a->device) return;
+    /* 50 ms stereo S16. Zero-initialised: silence. */
+    static int16_t silence[4800 * 2];
+    size_t bytes = (size_t)a->sample_rate / 20u * 2u * sizeof(int16_t);
+    if (bytes > sizeof(silence)) bytes = sizeof(silence);
+    SDL_QueueAudio(a->device, silence, (Uint32)bytes);
+}
+
+AudioOut *audio_out_create(int sample_rate, int volume) {
     if (sample_rate < 8000 || sample_rate > 192000) return NULL;
     AudioOut *a = calloc(1, sizeof(*a));
     if (!a) return NULL;
     a->sample_rate = sample_rate;
     a->volume = volume < 0 ? 0 : volume > 100 ? 100 : volume;
-    a->muted = muted;
 
     SDL_AudioSpec want, have;
     SDL_zero(want);
@@ -48,6 +59,7 @@ AudioOut *audio_out_create(int sample_rate, int volume, bool muted) {
         free(a);
         return NULL;
     }
+    audio_prefill(a);
     SDL_PauseAudioDevice(a->device, 0);
     return a;
 }
@@ -71,7 +83,7 @@ void audio_out_push(AudioOut *a, const int16_t *mono, size_t count) {
         a->stereo = grown;
         a->stereo_capacity = cap;
     }
-    int volume = a->muted ? 0 : a->volume;
+    int volume = a->volume;
     for (size_t i = 0; i < count; i++) {
         int16_t s = (int16_t)((int32_t)mono[i] * volume / 100);
         a->stereo[i * 2] = s;
@@ -87,16 +99,15 @@ void audio_out_set_volume(AudioOut *a, int volume) {
     a->volume = volume;
 }
 
-void audio_out_set_muted(AudioOut *a, bool muted) {
-    if (a) a->muted = muted;
-}
-
 void audio_out_pause(AudioOut *a, bool paused) {
     if (a && a->device) SDL_PauseAudioDevice(a->device, paused ? 1 : 0);
 }
 
 void audio_out_clear(AudioOut *a) {
-    if (a && a->device) SDL_ClearQueuedAudio(a->device);
+    if (a && a->device) {
+        SDL_ClearQueuedAudio(a->device);
+        audio_prefill(a);
+    }
 }
 
 int audio_out_sample_rate(const AudioOut *a) {
@@ -108,6 +119,8 @@ size_t audio_out_queued(const AudioOut *a) {
 }
 
 size_t audio_out_target(const AudioOut *a) {
-    /* 40 ms stereo S16 queue target. */
-    return a ? (size_t)(a->sample_rate / 25) * 2u * sizeof(int16_t) : 0;
+    /* 150 ms stereo S16 queue target: enough cushion for display/vsync
+     * jitter and the occasional slow frame so the device never runs dry
+     * mid-frame and crackles. Costs ~50 ms of extra latency vs 100 ms. */
+    return a ? (size_t)(a->sample_rate * 3 / 20) * 2u * sizeof(int16_t) : 0;
 }

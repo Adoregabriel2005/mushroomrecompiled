@@ -1,8 +1,9 @@
 // Vulkan presenter for SDL2. The 4:3 picture is the
 // 256x240 compose buffer shown cropped to 240 columns (8 pixels of overscan
 // hidden on each side); widescreen is the whole 426x240 compose buffer.
-// Both use the same nearest-filtered fullscreen triangle, FIFO presentation,
-// and one render-finished semaphore per swapchain image.
+// Both use the same nearest-filtered fullscreen triangle, a present mode
+// chosen from the window's vsync setting, and one render-finished semaphore
+// per swapchain image.
 #include "video_internal.h"
 
 #include <cstdio>
@@ -44,9 +45,11 @@ bool ok(VkResult r, const char *what) {
 
 class Presenter {
 public:
-    bool init(SDL_Window *window) {
+    bool init(SDL_Window *window, bool vsync) {
         window_ = window;
+        vsync_ = vsync;
         if (!create_instance_and_device()) return false;
+        if (!choose_present_mode()) return false;
         if (!create_static_objects()) return false;
         return create_swapchain();
     }
@@ -405,6 +408,42 @@ private:
         return ok(vkCreatePipelineLayout(dev_, &pl, nullptr, &pipe_layout_), "vkCreatePipelineLayout");
     }
 
+    /* The guest clock is fixed at the NES rate (60.0988 Hz), not the panel's.
+     * FIFO would pin the whole loop to the panel, and a panel a fraction of a
+     * hertz slow then stretches the audio to keep its queue full, flattening
+     * every note. MAILBOX keeps tear-free vblank presentation without making
+     * the producer wait for it; IMMEDIATE does the same for --no-vsync. FIFO
+     * remains the fallback when neither is advertised. */
+    bool choose_present_mode() {
+        uint32_t count = 0;
+        VkResult r = vkGetPhysicalDeviceSurfacePresentModesKHR(phys_, surface_, &count, nullptr);
+        std::vector<VkPresentModeKHR> modes;
+        if (r == VK_SUCCESS && count > 0) {
+            modes.resize(count);
+            if (vkGetPhysicalDeviceSurfacePresentModesKHR(phys_, surface_, &count, modes.data()) != VK_SUCCESS)
+                modes.clear();
+        }
+        auto has = [&](VkPresentModeKHR mode) {
+            return std::find(modes.begin(), modes.end(), mode) != modes.end();
+        };
+        if (vsync_) {
+            present_mode_ = has(VK_PRESENT_MODE_MAILBOX_KHR) ? VK_PRESENT_MODE_MAILBOX_KHR
+                                                             : VK_PRESENT_MODE_FIFO_KHR;
+        } else if (has(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
+            present_mode_ = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        } else if (has(VK_PRESENT_MODE_MAILBOX_KHR)) {
+            present_mode_ = VK_PRESENT_MODE_MAILBOX_KHR;
+        } else {
+            present_mode_ = VK_PRESENT_MODE_FIFO_KHR;
+        }
+        const char *name = present_mode_ == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX"
+                         : present_mode_ == VK_PRESENT_MODE_IMMEDIATE_KHR ? "IMMEDIATE"
+                         : "FIFO";
+        std::fprintf(stderr, "video: Vulkan present mode %s (%s)\n", name,
+                     vsync_ ? "vsync" : "no vsync");
+        return true;
+    }
+
     bool create_swapchain() {
         VkSurfaceCapabilitiesKHR caps;
         vkGetPhysicalDeviceSurfaceCapabilitiesKHR(phys_, surface_, &caps);
@@ -450,7 +489,7 @@ private:
         sc.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         sc.preTransform = caps.currentTransform;
         sc.compositeAlpha = comp;
-        sc.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        sc.presentMode = present_mode_;
         sc.clipped = VK_TRUE;
         if (!ok(vkCreateSwapchainKHR(dev_, &sc, nullptr, &swapchain_), "vkCreateSwapchainKHR")) return false;
         swap_format_ = chosen.format;
@@ -600,6 +639,8 @@ private:
     }
 
     SDL_Window *window_ = nullptr;
+    bool vsync_ = true;
+    VkPresentModeKHR present_mode_ = VK_PRESENT_MODE_FIFO_KHR;
     VkInstance instance_ = VK_NULL_HANDLE;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkPhysicalDevice phys_ = VK_NULL_HANDLE;
@@ -656,11 +697,10 @@ const VideoOps kOps = {vulkan_destroy, vulkan_present, vulkan_name};
 }  // namespace
 
 Video *video_vulkan_create(SDL_Window *window, bool vsync) {
-    (void)vsync;  // FIFO is always vsynced.
     auto *v = new (std::nothrow) VulkanVideo();
     if (!v) return nullptr;
     v->base.ops = &kOps;
-    if (!v->presenter.init(window)) {
+    if (!v->presenter.init(window, vsync)) {
         v->presenter.shutdown();
         delete v;
         return nullptr;

@@ -11,17 +11,20 @@ struct AudioOut {
     size_t stereo_capacity; /* int16 samples */
 };
 
-/* Queue a short cushion of silence. The game produces samples once per
- * emulated frame while the device drains steadily; without a cushion the
- * device can run dry before the first frames land and the stream clicks
- * at startup or after a menu/reset clear. */
+/* Queue a cushion of silence. The game produces samples once per emulated
+ * frame while the device drains steadily; without a cushion the device can
+ * run dry before the first frames land and the stream clicks at startup or
+ * after a menu/reset clear. Fill the whole target so the pitch controller
+ * starts at unity instead of speeding the music up while the queue fills. */
 static void audio_prefill(AudioOut *a) {
     if (!a || !a->device) return;
-    /* 50 ms stereo S16. Zero-initialised: silence. */
-    static int16_t silence[4800 * 2];
-    size_t bytes = (size_t)a->sample_rate / 20u * 2u * sizeof(int16_t);
-    if (bytes > sizeof(silence)) bytes = sizeof(silence);
-    SDL_QueueAudio(a->device, silence, (Uint32)bytes);
+    static const int16_t silence[4800 * 2];
+    size_t bytes = audio_out_target(a);
+    while (bytes) {
+        size_t chunk = bytes < sizeof(silence) ? bytes : sizeof(silence);
+        if (SDL_QueueAudio(a->device, silence, (Uint32)chunk) != 0) break;
+        bytes -= chunk;
+    }
 }
 
 AudioOut *audio_out_create(int sample_rate, int volume) {

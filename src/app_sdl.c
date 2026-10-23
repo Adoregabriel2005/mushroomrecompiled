@@ -79,6 +79,10 @@ static uint32_t g_notice_until;
 /* Learned SDL_Delay overshoot in milliseconds. Every sleep runs slightly
  * long; the pacer subtracts this so the average frame lands on the tick. */
 static double g_sleep_bias_ms = 0.0;
+/* Audio resample ratio. The queue controller only leaves unity when the
+ * cushion drifts well outside its target, and moves it slowly so a stretch
+ * never becomes audible pitch wobble. */
+static double g_audio_rate_scale = 1.0;
 /* Emulated frames per second, updated every half second. */
 static int g_fps_shown;
 static int g_fps_frames;
@@ -1400,17 +1404,35 @@ int main(int argc, char **argv) {
                 if (!glue_sram_save(g_sram_path))
                     fprintf(stderr, "save: cannot write %s\n", g_sram_path);
             }
+            size_t samples = glue_get_audio_samples(audio_buffer, 4096, 0);
+            if (samples && g_audio) audio_out_push(g_audio, audio_buffer, samples);
+            /* Measure after this frame's samples are queued, then pick the
+             * ratio for the next frame. That removes the one-frame feedback
+             * delay that otherwise keeps a healthy queue just outside the
+             * deadband and makes the controller resample forever. */
             if (g_audio) {
                 const size_t target = audio_out_target(g_audio);
                 if (target) {
                     double fill = ((double)target - (double)audio_out_queued(g_audio)) / (double)target;
                     if (fill < -1.0) fill = -1.0;
                     if (fill > 1.0) fill = 1.0;
-                    glue_set_audio_rate_scale(1.0 + 0.015 * fill);
+                    /* Deadband: a correctly paced guest and device leave the
+                     * queue near its target forever, so do not resample for
+                     * ordinary frame jitter. Outside it, trim by at most 0.5%
+                     * and slew slowly so the correction cannot become audible
+                     * pitch wobble. */
+                    const double deadband = 0.10;
+                    double want = 1.0;
+                    if (fill > deadband) want += 0.005 * (fill - deadband);
+                    else if (fill < -deadband) want += 0.005 * (fill + deadband);
+                    double delta = want - g_audio_rate_scale;
+                    const double max_step = 0.00005;
+                    if (delta > max_step) delta = max_step;
+                    if (delta < -max_step) delta = -max_step;
+                    g_audio_rate_scale += delta;
+                    glue_set_audio_rate_scale(g_audio_rate_scale);
                 }
             }
-            size_t samples = glue_get_audio_samples(audio_buffer, 4096, 0);
-            if (samples && g_audio) audio_out_push(g_audio, audio_buffer, samples);
             }
         }
         if (!present_frame()) {
